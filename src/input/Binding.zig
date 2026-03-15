@@ -757,6 +757,22 @@ pub const Action = union(enum) {
     /// version can be found by running `ghostty +version`.
     toggle_command_palette,
 
+    /// Detach the currently attached Ghostty remote session.
+    ///
+    /// This only has an effect when the surface command is `+session-proxy`.
+    /// The remote session continues running on the SSH target and can later
+    /// be rediscovered with `ghostty +session-list` and reattached with
+    /// `ghostty +session-attach`.
+    session_detach,
+
+    /// Reconnect the current Ghostty remote session after a transport loss.
+    ///
+    /// This only has an effect when the surface command is `+session-proxy`.
+    /// Use this when the current attached surface is disconnected but the
+    /// remote session is still alive. To open a detached session from a new
+    /// window later, use `ghostty +session-attach`.
+    session_reconnect,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1361,6 +1377,8 @@ pub const Action = union(enum) {
             .toggle_secure_input,
             .toggle_mouse_reporting,
             .toggle_command_palette,
+            .session_detach,
+            .session_reconnect,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

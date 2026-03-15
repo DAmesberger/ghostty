@@ -561,6 +561,18 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show the on-screen keyboard if present.",
         }},
 
+        .session_detach => comptime &.{.{
+            .action = .session_detach,
+            .title = "Detach Remote Session",
+            .description = "Detach the current Ghostty remote session without killing it.",
+        }},
+
+        .session_reconnect => comptime &.{.{
+            .action = .session_reconnect,
+            .title = "Reconnect Remote Session",
+            .description = "Reconnect the current Ghostty remote session after a disconnect.",
+        }},
+
         .open_config => comptime &.{.{
             .action = .open_config,
             .title = "Open Config",

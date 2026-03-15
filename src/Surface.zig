@@ -28,6 +28,7 @@ const rendererpkg = @import("renderer.zig");
 const termio = @import("termio.zig");
 const font = @import("font/main.zig");
 const Command = @import("Command.zig");
+const session = @import("session.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
 const Duration = configpkg.Config.Duration;
@@ -858,6 +859,20 @@ fn queueIo(
     }
 
     self.io.queueMessage(msg, mutex);
+}
+
+fn isSessionProxySurface(self: *const Surface) bool {
+    return switch (self.io.backend) {
+        .exec => |*exec| for (exec.subprocess.args) |arg| {
+            if (std.mem.eql(u8, arg, "+session-proxy")) return true;
+        } else false,
+    };
+}
+
+fn sendSessionControl(self: *Surface, comptime cmd: session.shared.ControlCommand) bool {
+    if (!isSessionProxySurface(self)) return false;
+    self.queueIo(.{ .write_stable = session.shared.controlSequence(cmd) }, .unlocked);
+    return true;
 }
 
 /// Forces the surface to render. This is useful for when the surface
@@ -5769,6 +5784,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .toggle_command_palette,
             {},
         ),
+
+        .session_detach => return sendSessionControl(self, .detach),
+
+        .session_reconnect => return sendSessionControl(self, .reconnect),
 
         .toggle_background_opacity => return try self.rt_app.performAction(
             .{ .surface = self },
