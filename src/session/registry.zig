@@ -52,12 +52,12 @@ pub const Entry = struct {
 
     pub fn format(self: Entry, writer: anytype) !void {
         try writer.print(
-            "{s}|{s}|{s}|{t}|{d}|{d}\n",
+            "{s}|{s}|{s}|{s}|{d}|{d}\n",
             .{
                 self.ssh_target,
                 self.session_id,
                 self.label,
-                self.status,
+                @tagName(self.status),
                 self.created_at,
                 self.last_seen_at,
             },

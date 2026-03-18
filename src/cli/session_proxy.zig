@@ -1,12 +1,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const args = @import("args.zig");
 const Action = @import("ghostty.zig").Action;
 const proxy = @import("../session/proxy.zig");
 
 pub const Options = struct {
+    _arena: ?ArenaAllocator = null,
+
     /// SSH destination that owns the remote session.
-    ssh: []const u8,
+    ssh: []const u8 = "",
+
+    /// Optional SSH jump host (ProxyJump). Routes the connection through
+    /// an intermediate SSH host.
+    jump: ?[]const u8 = null,
 
     /// Existing remote session identifier to attach to. If omitted, a fresh
     /// session is created.
@@ -16,7 +23,8 @@ pub const Options = struct {
     label: ?[]const u8 = null,
 
     pub fn deinit(self: *Options) void {
-        _ = self;
+        if (self._arena) |a| a.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -32,11 +40,17 @@ pub const Options = struct {
 /// This is not intended for direct interactive use and may change without
 /// notice.
 pub fn run(alloc: Allocator) !u8 {
-    var opts: Options = undefined;
+    var opts: Options = .{};
     {
         var iter = try args.argsIterator(alloc);
         defer iter.deinit();
-        try args.parse(Options, alloc, &opts, &iter);
+        args.parse(Options, alloc, &opts, &iter) catch |err| switch (err) {
+            error.ActionHelpRequested => return err,
+            else => {
+                std.debug.print("error parsing args: {}\n", .{err});
+                return 1;
+            },
+        };
     }
     defer opts.deinit();
 
@@ -46,6 +60,7 @@ pub fn run(alloc: Allocator) !u8 {
 
     const rc = try proxy.run(alloc, .{
         .ssh = opts.ssh,
+        .jump = opts.jump,
         .session = opts.session,
         .label = opts.label,
     }, stderr);

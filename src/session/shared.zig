@@ -40,16 +40,17 @@ pub fn socketPath(alloc: Allocator) ![]const u8 {
     return try std.fs.path.join(alloc, &.{ dir, "daemon.sock" });
 }
 
+/// Fixed remote install paths under /tmp. This avoids depending on any
+/// particular remote user's home directory or XDG configuration.
+pub const remote_dir = "/tmp/ghostty-remote-session/bin";
+pub const remote_path = remote_dir ++ "/" ++ helper_binary_name;
+
 pub fn remoteInstallDir(alloc: Allocator) ![]const u8 {
-    const dir = try stateDir(alloc);
-    defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, "bin" });
+    return try alloc.dupe(u8, remote_dir);
 }
 
 pub fn remoteInstallPath(alloc: Allocator) ![]const u8 {
-    const dir = try remoteInstallDir(alloc);
-    defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, helper_binary_name });
+    return try alloc.dupe(u8, remote_path);
 }
 
 pub fn sanitizeLabelAlloc(alloc: Allocator, raw: []const u8) ![]u8 {

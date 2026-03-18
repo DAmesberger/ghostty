@@ -57,6 +57,8 @@
   spirv-cross,
   simdutf,
   zlib,
+  libssh2,
+  mbedtls,
   alejandra,
   jq,
   minisign,
@@ -169,6 +171,8 @@ in
         oniguruma
         simdutf
         zlib
+        libssh2
+        mbedtls
 
         glslang
         spirv-cross

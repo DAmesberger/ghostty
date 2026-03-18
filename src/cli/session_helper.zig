@@ -1,10 +1,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const args = @import("args.zig");
 const Action = @import("ghostty.zig").Action;
 const helper = @import("../session/helper.zig");
 
 pub const Options = struct {
+    _arena: ?ArenaAllocator = null,
+
     /// Start the remote helper as a background daemon and return immediately.
     daemonize: bool = false,
 
@@ -30,7 +33,8 @@ pub const Options = struct {
     label: ?[]const u8 = null,
 
     pub fn deinit(self: *Options) void {
-        _ = self;
+        if (self._arena) |a| a.deinit();
+        self.* = undefined;
     }
 
     /// Enables `-h` and `--help` to work.
@@ -51,7 +55,13 @@ pub fn run(alloc: Allocator) !u8 {
     {
         var iter = try args.argsIterator(alloc);
         defer iter.deinit();
-        try args.parse(Options, alloc, &opts, &iter);
+        args.parse(Options, alloc, &opts, &iter) catch |err| switch (err) {
+            error.ActionHelpRequested => return err,
+            else => {
+                std.debug.print("error parsing args: {}\n", .{err});
+                return 1;
+            },
+        };
     }
     defer opts.deinit();
 

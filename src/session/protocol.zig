@@ -3,6 +3,12 @@ const Allocator = std.mem.Allocator;
 
 pub const max_payload = 128 * 1024;
 
+/// Protocol version for the session wire format. Increment this when
+/// making incompatible changes to the protocol. The remote helper
+/// reports this via `+session-helper --version` so the client knows
+/// whether to re-upload.
+pub const protocol_version: u16 = 1;
+
 pub const Kind = enum(u8) {
     stdin = 1,
     stdout = 2,
@@ -119,4 +125,9 @@ test "protocol roundtrip" {
     const payload = try readPayloadAlloc(testing.allocator, stream.reader(), header);
     defer testing.allocator.free(payload);
     try testing.expectEqualStrings("hello", payload);
+}
+
+test "protocol version is defined and positive" {
+    const testing = std.testing;
+    try testing.expect(protocol_version >= 1);
 }

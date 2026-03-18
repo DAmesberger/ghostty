@@ -240,6 +240,38 @@ pub fn add(
         }
     }
 
+    // libssh2 (with mbedTLS backend) — used for native SSH transport
+    // in remote sessions via @cImport. Only needed on non-Windows platforms.
+    if (step.rootModuleTarget().os.tag != .windows) {
+        _ = b.systemIntegrationOption("libssh2", .{}); // Shows it in help
+        if (b.systemIntegrationOption("libssh2", .{})) {
+            step.linkSystemLibrary2("libssh2", dynamic_link_opts);
+        } else {
+            if (b.lazyDependency("libssh2", .{
+                .target = target,
+                .optimize = optimize,
+            })) |libssh2_dep| {
+                step.linkLibrary(libssh2_dep.artifact("ssh2"));
+                try static_libs.append(
+                    b.allocator,
+                    libssh2_dep.artifact("ssh2").getEmittedBin(),
+                );
+            }
+
+            // Also need mbedTLS static lib (libssh2's crypto backend)
+            if (b.lazyDependency("mbedtls", .{
+                .target = target,
+                .optimize = optimize,
+            })) |mbedtls_dep| {
+                step.linkLibrary(mbedtls_dep.artifact("mbedtls"));
+                try static_libs.append(
+                    b.allocator,
+                    mbedtls_dep.artifact("mbedtls").getEmittedBin(),
+                );
+            }
+        }
+    }
+
     // Oniguruma
     if (b.lazyDependency("oniguruma", .{
         .target = target,

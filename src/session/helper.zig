@@ -9,11 +9,13 @@ const session = @import("../session.zig");
 
 const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("errno.h");
+    @cInclude("fcntl.h");
     @cInclude("poll.h");
     @cInclude("signal.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/socket.h");
     @cInclude("sys/un.h");
+    @cInclude("sys/wait.h");
     @cInclude("termios.h");
     @cInclude("unistd.h");
 });
@@ -24,6 +26,7 @@ pub const Options = struct {
     daemonize: bool = false,
     daemon: bool = false,
     list: bool = false,
+    version: bool = false,
     @"stdio-attach": bool = false,
     kill: ?[]const u8 = null,
     session: ?[]const u8 = null,
@@ -40,6 +43,12 @@ pub fn run(
     if (comptime builtin.os.tag == .windows) {
         try stderr.writeAll("remote sessions are only implemented on POSIX platforms.\n");
         return 1;
+    }
+
+    if (opts.version) {
+        try stdout.print("GHOSTTY_SESSION_PROTOCOL {d}\n", .{session.protocol.protocol_version});
+        try stdout.flush();
+        return 0;
     }
 
     if (opts.daemonize) {
@@ -75,23 +84,68 @@ fn daemonize(alloc: Allocator) !void {
     defer alloc.free(socket_path);
     if (try canConnect(socket_path)) return;
 
-    const exe_path = try std.fs.selfExePathAlloc(alloc);
-    defer alloc.free(exe_path);
-    const shell = try std.fmt.allocPrint(
-        alloc,
-        "nohup '{s}' +session-helper --daemon >/dev/null 2>&1 </dev/null &",
-        .{exe_path},
-    );
-    defer alloc.free(shell);
+    // Classic POSIX double-fork to fully detach the daemon process.
+    // This ensures the daemon has no inherited FDs from the parent
+    // (important when launched via SSH, where inherited channel FDs
+    // keep the SSH connection open forever).
+    const pid1 = c.fork();
+    if (pid1 < 0) return error.ForkFailed;
+    if (pid1 > 0) {
+        // Parent: wait for first child to exit, then poll for readiness.
+        _ = c.waitpid(pid1, null, 0);
+        var attempts: u32 = 0;
+        while (attempts < 50) : (attempts += 1) {
+            if (try canConnect(socket_path)) return;
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        return;
+    }
 
-    var child = std.process.Child.init(
-        &.{ "sh", "-lc", shell },
-        alloc,
-    );
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    // First child: create new session and fork again.
+    _ = c.setsid();
+    const pid2 = c.fork();
+    if (pid2 < 0) c._exit(1);
+    if (pid2 > 0) c._exit(0);
+
+    // Grandchild: the actual daemon process.
+    closeAllFds();
+    reopenStdFds();
+    _ = c.chdir("/");
+    daemonMain(alloc) catch {
+        c._exit(1);
+    };
+    c._exit(0);
+}
+
+/// Close all file descriptors >= 3 to prevent inheriting FDs from the parent
+/// (especially important when launched via SSH).
+fn closeAllFds() void {
+    // Try /proc/self/fd first (Linux).
+    if (std.fs.openDirAbsolute("/proc/self/fd", .{ .iterate = true })) |dir_| {
+        var dir = dir_;
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| {
+            const fd = std.fmt.parseInt(posix.fd_t, entry.name, 10) catch continue;
+            if (fd >= 3 and fd != dir.fd) posix.close(fd);
+        }
+    } else |_| {
+        // Fallback: brute-force close FDs 3..1023.
+        var fd: posix.fd_t = 3;
+        while (fd < 1024) : (fd += 1) {
+            posix.close(fd);
+        }
+    }
+}
+
+/// Reopen stdin/stdout/stderr as /dev/null.
+fn reopenStdFds() void {
+    const devnull = c.open("/dev/null", c.O_RDWR);
+    if (devnull < 0) return;
+    _ = c.dup2(devnull, 0);
+    _ = c.dup2(devnull, 1);
+    _ = c.dup2(devnull, 2);
+    if (devnull > 2) _ = c.close(devnull);
 }
 
 fn daemonMain(alloc: Allocator) !void {
@@ -223,12 +277,12 @@ const Daemon = struct {
 
     fn handleKill(self: *Daemon, id: []const u8, writer: *std.Io.Writer) !void {
         self.mutex.lock();
+        defer self.mutex.unlock();
+
         const sess = self.sessions.get(id) orelse {
-            self.mutex.unlock();
             try writer.writeAll("ERR not-found\n");
             return;
         };
-        self.mutex.unlock();
 
         sess.kill();
         try writer.writeAll("OK\n");
@@ -561,8 +615,8 @@ fn stdioAttach(
     }
 
     const stdin_thread = try std.Thread.spawn(.{}, proxyLocalToSocket, .{fd});
-    stdin_thread.detach();
-    try proxySocketToLocal(fd);
+    defer stdin_thread.join();
+    try proxySocketToLocal(alloc, fd);
     return 0;
 }
 
@@ -684,7 +738,7 @@ fn proxyLocalToSocket(fd: posix.fd_t) void {
     }
 }
 
-fn proxySocketToLocal(fd: posix.fd_t) !void {
+fn proxySocketToLocal(alloc: Allocator, fd: posix.fd_t) !void {
     var socket_file: std.fs.File = .{ .handle = fd };
     var socket_reader_buf: [1024]u8 = undefined;
     var socket_reader_ = socket_file.reader(&socket_reader_buf);
@@ -697,8 +751,8 @@ fn proxySocketToLocal(fd: posix.fd_t) !void {
 
     while (true) {
         const header = session.protocol.readHeader(socket_reader) catch break;
-        const payload = try session.protocol.readPayloadAlloc(std.heap.page_allocator, socket_reader, header);
-        defer std.heap.page_allocator.free(payload);
+        const payload = try session.protocol.readPayloadAlloc(alloc, socket_reader, header);
+        defer alloc.free(payload);
         switch (header.kind) {
             .stdout => try stdout.writeAll(payload),
             .err => try std.fs.File.stderr().writeAll(payload),
@@ -729,12 +783,15 @@ fn readLineAlloc(alloc: Allocator, fd: posix.fd_t, max_bytes: usize) ![]u8 {
     errdefer bytes.deinit(alloc);
 
     var file: std.fs.File = .{ .handle = fd };
-    var buf: [1]u8 = undefined;
+    var reader_buf: [1024]u8 = undefined;
+    var reader_ = file.reader(&reader_buf);
+    const reader = &reader_.interface;
+
     while (bytes.items.len < max_bytes) {
-        const n = try file.read(&buf);
-        if (n == 0) break;
-        if (buf[0] == '\n') break;
-        try bytes.append(alloc, buf[0]);
+        var byte: [1]u8 = undefined;
+        reader.readSliceAll(&byte) catch break;
+        if (byte[0] == '\n') break;
+        try bytes.append(alloc, byte[0]);
     }
 
     return try bytes.toOwnedSlice(alloc);
