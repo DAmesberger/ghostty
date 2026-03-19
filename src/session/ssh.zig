@@ -536,6 +536,16 @@ pub const SshSession = struct {
 
     /// Disconnect and free all resources.
     pub fn close(self: *SshSession) void {
+        // Free the TunnelState stored in the inner session's abstract pointer
+        // (allocated by tunnel() for custom send/recv callbacks).
+        if (self.jump != null) {
+            const abstract = ssh2.libssh2_session_abstract(self.session);
+            if (abstract.*) |ptr| {
+                const state: *TunnelState = @ptrCast(@alignCast(ptr));
+                self.alloc.destroy(state);
+            }
+        }
+
         _ = ssh2.libssh2_session_disconnect(self.session, "Normal shutdown");
         _ = ssh2.libssh2_session_free(self.session);
         posix.close(self.sock);
