@@ -6,6 +6,7 @@ const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const session = @import("../session.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -29,6 +30,10 @@ preedit: ?Preedit = null,
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.
 mouse: Mouse = .{},
+
+/// Connection overlay state for SSH remote sessions.
+/// When non-null, the renderer draws a connection status overlay.
+connection_state: ?session.protocol.ConnectionState = null,
 
 pub const Mouse = struct {
     /// The point on the viewport where the mouse currently is. We use

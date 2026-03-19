@@ -1177,6 +1177,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .connection_state => |state| {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.connection_state = switch (state) {
+                .connected => null, // dismiss overlay
+                else => state,
+            };
+        },
     }
 }
 
@@ -1230,6 +1239,13 @@ fn selectionScrollTick(self: *Surface) !void {
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
     self.child_exited = true;
+
+    // Remote sessions that exit cleanly should close immediately —
+    // no "press any key" behavior needed.
+    if (isRemoteSurface(self) and info.exit_code == 0) {
+        self.close();
+        return;
+    }
 
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.

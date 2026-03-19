@@ -683,6 +683,19 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.processOutputLocked(buf);
 }
 
+/// Apply a state_delta or state_full frame from the SSH remote session.
+/// This directly updates the terminal state with pre-processed cell data.
+pub fn applyStateDelta(self: *Termio, payload: []const u8) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const terminal_mod = @import("../terminal/main.zig");
+    try terminal_mod.state_sync.applyDelta(self.alloc, &self.terminal, payload);
+
+    // Schedule a render
+    self.terminal_stream.handler.queueRender() catch {};
+}
+
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.

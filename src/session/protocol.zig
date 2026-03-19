@@ -3,11 +3,48 @@ const Allocator = std.mem.Allocator;
 
 pub const max_payload = 128 * 1024;
 
+/// Keepalive interval: how often each side sends a keepalive frame.
+pub const keepalive_interval_ns: i128 = 15 * std.time.ns_per_s;
+
+/// Client considers connection stale if no keepalive received within this window.
+pub const keepalive_stale_ns: i128 = 45 * std.time.ns_per_s;
+
+/// Server closes connection if no keepalive received within this window.
+pub const keepalive_server_timeout_ns: i128 = 60 * std.time.ns_per_s;
+
+/// Connection state reported to surfaces for overlay display.
+pub const ConnectionState = union(enum) {
+    connecting,
+    uploading: UploadProgress,
+    setup,
+    connected,
+    reconnecting: ReconnectInfo,
+    stale,
+    failed: FailReason,
+
+    pub const UploadProgress = struct {
+        bytes_sent: u64,
+        total_bytes: u64,
+    };
+
+    pub const ReconnectInfo = struct {
+        attempt: u32,
+        elapsed_ns: i128,
+    };
+
+    pub const FailReason = enum(u8) {
+        unknown,
+        auth_failed,
+        timeout,
+        helper_failed,
+    };
+};
+
 /// Protocol version for the session wire format. Increment this when
 /// making incompatible changes to the protocol. The remote helper
 /// reports this via `+session-helper --version` so the client knows
 /// whether to re-upload.
-pub const protocol_version: u16 = 2;
+pub const protocol_version: u16 = 3;
 
 /// Size of a frame header in bytes.
 pub const header_size: usize = 8;
@@ -23,6 +60,10 @@ pub const Kind = enum(u8) {
     session_open = 8,
     session_opened = 9,
     session_close = 10,
+    keepalive = 11,
+    state_full = 12,
+    state_delta = 13,
+    state_ack = 14,
 };
 
 pub const Header = struct {
@@ -32,24 +73,41 @@ pub const Header = struct {
     len: u32,
 };
 
-/// Payload for session_open: 8-byte resize data + label string.
+pub const RenderMode = enum(u8) {
+    raw = 0,
+    state_sync = 1,
+};
+
+/// Payload for session_open: 8-byte resize + 1-byte render_mode + label string.
+/// For backward compatibility, if payload is exactly 8 + label (no render_mode byte),
+/// we default to .raw.
 pub const SessionOpen = struct {
     resize: Resize,
+    render_mode: RenderMode = .raw,
     label: []const u8,
 
     pub fn encode(self: SessionOpen, alloc: Allocator) ![]u8 {
         const resize_bytes = self.resize.bytes();
-        var buf = try alloc.alloc(u8, 8 + self.label.len);
+        var buf = try alloc.alloc(u8, 9 + self.label.len);
         @memcpy(buf[0..8], &resize_bytes);
-        @memcpy(buf[8..], self.label);
+        buf[8] = @intFromEnum(self.render_mode);
+        @memcpy(buf[9..], self.label);
         return buf;
     }
 
     pub fn parse(payload: []const u8) !SessionOpen {
         if (payload.len < 8) return error.InvalidSessionOpenPayload;
+        // Backward compat: old clients send 8-byte resize + label (no render_mode)
+        if (payload.len == 8 or payload[8] > 1) {
+            return .{
+                .resize = try Resize.parse(payload[0..8]),
+                .label = payload[8..],
+            };
+        }
         return .{
             .resize = try Resize.parse(payload[0..8]),
-            .label = payload[8..],
+            .render_mode = std.meta.intToEnum(RenderMode, payload[8]) catch .raw,
+            .label = payload[9..],
         };
     }
 };
@@ -165,15 +223,16 @@ test "protocol roundtrip" {
     try testing.expectEqualStrings("hello", payload);
 }
 
-test "protocol version is 2" {
+test "protocol version is 3" {
     const testing = std.testing;
-    try testing.expectEqual(@as(u16, 2), protocol_version);
+    try testing.expectEqual(@as(u16, 3), protocol_version);
 }
 
 test "session open encode/parse" {
     const testing = std.testing;
     const so = SessionOpen{
         .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
+        .render_mode = .state_sync,
         .label = "test-session",
     };
     const encoded = try so.encode(testing.allocator);
@@ -182,5 +241,21 @@ test "session open encode/parse" {
     const parsed = try SessionOpen.parse(encoded);
     try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
     try testing.expectEqual(@as(u16, 80), parsed.resize.cols);
+    try testing.expectEqual(RenderMode.state_sync, parsed.render_mode);
     try testing.expectEqualStrings("test-session", parsed.label);
+}
+
+test "session open backward compat parse" {
+    const testing = std.testing;
+    // Simulate old-format payload: 8-byte resize + label (no render_mode)
+    const resize = Resize{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 };
+    const resize_bytes = resize.bytes();
+    var old_payload: [8 + 7]u8 = undefined;
+    @memcpy(old_payload[0..8], &resize_bytes);
+    @memcpy(old_payload[8..], "session");
+
+    const parsed = try SessionOpen.parse(&old_payload);
+    try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
+    try testing.expectEqual(RenderMode.raw, parsed.render_mode);
+    try testing.expectEqualStrings("session", parsed.label);
 }

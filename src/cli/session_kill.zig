@@ -80,7 +80,7 @@ pub fn run(alloc: Allocator) !u8 {
     };
     defer ctx.deinit();
 
-    const helper_path = try session.client.ensureRemoteHelper(alloc, &ctx, stderr);
+    const helper_path = try session.client.ensureRemoteHelper(alloc, &ctx, stderr, null);
     defer alloc.free(helper_path);
     try session.client.ensureRemoteDaemon(alloc, &ctx, helper_path);
 

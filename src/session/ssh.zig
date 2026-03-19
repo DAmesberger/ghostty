@@ -386,6 +386,7 @@ pub const SshSession = struct {
         local_path: []const u8,
         remote_path: []const u8,
         mode: u32,
+        progress_ctx: anytype,
     ) !void {
         const file = try std.fs.openFileAbsolute(local_path, .{});
         defer file.close();
@@ -443,6 +444,11 @@ pub const SshSession = struct {
                 total_written += @intCast(rc);
             }
             remaining -= n;
+
+            // Report progress if callback provided
+            if (comptime @typeInfo(@TypeOf(progress_ctx)) == .@"struct") {
+                progress_ctx.onProgress(total_written);
+            }
         }
 
         // Send EOF and wait for close (handle EAGAIN)

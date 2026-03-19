@@ -582,14 +582,25 @@ const Session = struct {
 
 const MAX_MUX_SESSIONS = 64;
 
+const terminal = @import("../terminal/main.zig");
+
 const MuxSession = struct {
     target: u16,
     daemon_fd: posix.fd_t,
     read_buf: std.ArrayList(u8),
+    render_mode: session.protocol.RenderMode = .raw,
+    /// Terminal instance for state_sync mode. Processes raw PTY output
+    /// and produces delta frames instead of forwarding raw bytes.
+    sync_terminal: ?*terminal.Terminal = null,
 
     fn deinit(self: *MuxSession, alloc: Allocator) void {
         closeFd(self.daemon_fd);
         self.read_buf.deinit(alloc);
+        if (self.sync_terminal) |t| {
+            t.deinit(alloc);
+            alloc.destroy(t);
+            self.sync_terminal = null;
+        }
     }
 };
 
@@ -604,6 +615,11 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     var sessions: [MAX_MUX_SESSIONS]?MuxSession = .{null} ** MAX_MUX_SESSIONS;
     var stdin_buf = std.ArrayList(u8).empty;
     defer stdin_buf.deinit(alloc);
+
+    // Keepalive state
+    const now_init = std.time.nanoTimestamp();
+    var last_keepalive_sent: i128 = now_init;
+    var last_keepalive_received: i128 = now_init;
 
     defer {
         for (&sessions) |*slot| {
@@ -677,6 +693,9 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
             const payload = stdin_buf.items[session.protocol.header_size..total];
 
             switch (kind) {
+                .keepalive => {
+                    last_keepalive_received = std.time.nanoTimestamp();
+                },
                 .session_open => {
                     handleSessionOpen(
                         alloc,
@@ -769,6 +788,13 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                     };
                     const dpayload = s.read_buf.items[session.protocol.header_size..dtotal];
 
+                    // For state_sync sessions with a terminal, process stdout
+                    // through the Terminal and send deltas.
+                    // NOTE: Full VT processing requires a Stream handler which
+                    // is complex to set up in the helper context. For now,
+                    // state_sync mode falls back to raw forwarding. The protocol
+                    // negotiation and frame types are in place for when the
+                    // full Stream integration is added.
                     sendFrameFile(stdout_file, dkind, s.target, dpayload) catch {};
 
                     if (dkind == .eof) {
@@ -780,6 +806,25 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
                     shiftBuffer(&s.read_buf, dtotal);
                 }
+            }
+        }
+
+        // Keepalive: send if interval elapsed
+        {
+            const ka_now = std.time.nanoTimestamp();
+            if (ka_now - last_keepalive_sent >= session.protocol.keepalive_interval_ns) {
+                var ts_buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &ts_buf, @intCast(@as(u128, @bitCast(ka_now)) & 0xFFFFFFFFFFFFFFFF), .little);
+                sendFrameFile(stdout_file, .keepalive, 0, &ts_buf) catch {};
+                last_keepalive_sent = ka_now;
+            }
+
+            // Server timeout: close if no keepalive from client for 60s
+            if (ka_now - last_keepalive_received > session.protocol.keepalive_server_timeout_ns) {
+                log.warn("no keepalive from client for {d}s, closing", .{
+                    @as(i64, @intCast(@divFloor(ka_now - last_keepalive_received, std.time.ns_per_s))),
+                });
+                break;
             }
         }
 
@@ -845,10 +890,28 @@ fn handleSessionOpen(
 
     const session_id = trimmed["OK ".len..];
 
+    // Initialize terminal for state_sync mode
+    var sync_term: ?*terminal.Terminal = null;
+    if (open_data.render_mode == .state_sync) {
+        if (alloc.create(terminal.Terminal)) |tp| {
+            if (terminal.Terminal.init(alloc, .{
+                .cols = open_data.resize.cols,
+                .rows = open_data.resize.rows,
+            })) |t_val| {
+                tp.* = t_val;
+                sync_term = tp;
+            } else |_| {
+                alloc.destroy(tp);
+            }
+        } else |_| {}
+    }
+
     sessions[idx] = .{
         .target = target,
         .daemon_fd = daemon_fd,
         .read_buf = std.ArrayList(u8).empty,
+        .render_mode = open_data.render_mode,
+        .sync_terminal = sync_term,
     };
 
     sendFrameFile(stdout_file, .session_opened, target, session_id) catch {};

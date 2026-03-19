@@ -16,6 +16,7 @@ const posix = std.posix;
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
+const apprt = @import("../apprt.zig");
 const session = @import("../session.zig");
 const ssh = session.ssh;
 const SshConnectionManager = @import("SshConnectionManager.zig");
@@ -104,10 +105,8 @@ pub fn threadEnter(
     io: *termio.Termio,
     td: *termio.Termio.ThreadData,
 ) !void {
-    // Show connecting message in terminal
-    termio.Termio.processOutput(io, "Connecting to ");
-    termio.Termio.processOutput(io, self.ssh_target);
-    termio.Termio.processOutput(io, "...\r\n");
+    // Show overlay
+    _ = td.surface_mailbox.push(.{ .connection_state = .connecting }, .{ .forever = {} });
 
     // Acquire a connection from the pool
     const entry = try self.connection_manager.acquire(self.ssh_target, self.jump);
@@ -123,7 +122,7 @@ pub fn threadEnter(
     const prev = entry.conn_state.cmpxchgStrong(.uninitialized, .connecting, .seq_cst, .seq_cst);
     if (prev == null) {
         // We are the first surface — establish the SSH connection
-        self.setupConnection(alloc, io, entry) catch |err| {
+        self.setupConnection(alloc, &td.surface_mailbox, entry) catch |err| {
             entry.conn_state.store(.failed, .seq_cst);
             return err;
         };
@@ -146,7 +145,7 @@ pub fn threadEnter(
     SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox);
     errdefer SshConnectionManager.unregisterSurface(entry, self.target_id);
 
-    termio.Termio.processOutput(io, "Opening remote session...\r\n");
+    _ = td.surface_mailbox.push(.{ .connection_state = .setup }, .{ .forever = {} });
 
     // Send session_open frame via write queue
     {
@@ -158,13 +157,13 @@ pub fn threadEnter(
                 .height_px = @intCast(self.screen_size.height),
             },
             .label = self.label orelse "session",
-        }).encode(alloc) catch |err| {
-            termio.Termio.processOutput(io, "Failed to encode session_open.\r\n");
-            return err;
-        };
+        }).encode(alloc) catch return error.OutOfMemory;
         defer alloc.free(open_payload);
         SshConnectionManager.enqueueWrite(entry, .session_open, self.target_id, open_payload);
     }
+
+    // Dismiss the connection overlay
+    _ = td.surface_mailbox.push(.{ .connection_state = .connected }, .{ .forever = {} });
 
     // Store minimal thread data — no poll timer, the SSH thread handles reads
     td.backend = .{ .remote = .{
@@ -178,7 +177,7 @@ pub fn threadEnter(
 fn setupConnection(
     self: *Remote,
     alloc: Allocator,
-    io: *termio.Termio,
+    mailbox: *apprt.surface.Mailbox,
     entry: *SshConnectionManager.Entry,
 ) !void {
     var stderr_buf: [1024]u8 = undefined;
@@ -186,21 +185,18 @@ fn setupConnection(
     const stderr = &stderr_writer_.interface;
 
     entry.ctx.connect(stderr) catch |err| {
-        const msg = std.fmt.allocPrint(alloc, "SSH connection failed: {}\r\n", .{err}) catch "SSH connection failed\r\n";
-        termio.Termio.processOutput(io, msg);
+        _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
         return err;
     };
 
-    termio.Termio.processOutput(io, "Connected. Setting up remote helper...\r\n");
-
-    const helper_path = session.client.ensureRemoteHelper(alloc, &entry.ctx, stderr) catch |err| {
-        termio.Termio.processOutput(io, "Failed to set up remote helper.\r\n");
+    const helper_path = session.client.ensureRemoteHelper(alloc, &entry.ctx, stderr, mailbox) catch |err| {
+        _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;
     };
 
     session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path) catch |err| {
         alloc.free(helper_path);
-        termio.Termio.processOutput(io, "Failed to start remote daemon.\r\n");
+        _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;
     };
 
@@ -209,14 +205,12 @@ fn setupConnection(
     entry.helper_path = helper_path;
     self.connection_manager.mutex.unlock();
 
-    termio.Termio.processOutput(io, "Opening multiplexed channel...\r\n");
-
     const channel = session.client.openMultiplexChannel(
         alloc,
         &entry.ctx,
         entry.helper_path,
     ) catch |err| {
-        termio.Termio.processOutput(io, "Failed to open multiplexed channel.\r\n");
+        _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
         return err;
     };
 

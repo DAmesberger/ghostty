@@ -65,6 +65,17 @@ pub const Entry = struct {
 
     // Connection state for race prevention between surfaces
     conn_state: std.atomic.Value(ConnState) = .{ .raw = .uninitialized },
+
+    // Keepalive tracking (written/read only by the SSH thread)
+    last_keepalive_received: i128 = 0,
+    /// Set to true after receiving the first keepalive from the remote.
+    /// Stale detection is only active when this is true, ensuring backward
+    /// compatibility with old helpers that don't support keepalive.
+    keepalive_active: bool = false,
+
+    // Reconnect state
+    reconnect_count: u32 = 0,
+    max_reconnect_time_ns: i128 = 5 * 60 * std.time.ns_per_s, // 5 minutes
 };
 
 pub fn init(alloc: Allocator) SshConnectionManager {
@@ -259,6 +270,15 @@ pub fn sshThreadMain(entry: *Entry) void {
 
     var read_buf: [4096]u8 = undefined;
 
+    // Keepalive state.
+    // Stale detection only activates after receiving the first keepalive
+    // from the remote (entry.keepalive_active). This ensures backward
+    // compatibility with old helpers that don't support keepalive.
+    const now_init = std.time.nanoTimestamp();
+    var last_keepalive_sent: i128 = now_init;
+    entry.last_keepalive_received = now_init;
+    entry.keepalive_active = false;
+
     while (true) {
         // 1. Process SSH transport (needed for tunneled sessions)
         sess.pollTransport(1);
@@ -281,7 +301,7 @@ pub fn sshThreadMain(entry: *Entry) void {
             return;
         }
 
-        // Process complete protocol frames
+        // Process complete protocol frames (updates entry.last_keepalive_received)
         processFrames(&frame_buf, entry);
 
         // 3. Drain write queue
@@ -300,17 +320,64 @@ pub fn sshThreadMain(entry: *Entry) void {
         // Drain write pipe notification bytes
         drainPipe(entry.write_pipe[0]);
 
-        // 4. Compute poll events based on libssh2 block directions
+        // 4. Keepalive: send if interval elapsed, detect stale
+        const now = std.time.nanoTimestamp();
+        if (now - last_keepalive_sent >= session.protocol.keepalive_interval_ns) {
+            var ts_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &ts_buf, @intCast(@as(u128, @bitCast(now)) & 0xFFFFFFFFFFFFFFFF), .little);
+            sendFrame(channel, .keepalive, 0, &ts_buf) catch |err| {
+                log.warn("keepalive send failed: {}", .{err});
+            };
+            last_keepalive_sent = now;
+        }
+
+        if (entry.keepalive_active and
+            now - entry.last_keepalive_received > session.protocol.keepalive_stale_ns)
+        {
+            log.warn("ssh connection stale (no keepalive for {d}s)", .{
+                @as(i64, @intCast(@divFloor(now - entry.last_keepalive_received, std.time.ns_per_s))),
+            });
+            // Attempt reconnection
+            if (attemptReconnect(entry)) {
+                // Reconnected — reset keepalive state and continue
+                const reconnect_now = std.time.nanoTimestamp();
+                last_keepalive_sent = reconnect_now;
+                entry.last_keepalive_received = reconnect_now;
+                entry.reconnect_count = 0;
+
+                // Update local references (session/channel may have changed)
+                sess = &entry.ctx.session.?;
+                channel = &entry.channel.?;
+
+                // Notify surfaces that we're back
+                broadcastConnectionState(entry, .connected);
+                continue;
+            } else {
+                // Reconnect failed — give up
+                notifyAllSurfaces(entry);
+                return;
+            }
+        }
+
+        // 5. Compute poll events based on libssh2 block directions
         pollfds[0].events = posix.POLL.IN;
         if (sess.needsWrite()) pollfds[0].events |= posix.POLL.OUT;
 
-        // 5. Block in poll until next event
-        _ = posix.poll(&pollfds, -1) catch |err| {
+        // 6. Compute poll timeout: wake up in time to send the next keepalive
+        const elapsed_since_send = now - last_keepalive_sent;
+        const remaining_ns = session.protocol.keepalive_interval_ns - elapsed_since_send;
+        const timeout_ms: i32 = if (remaining_ns <= 0)
+            1
+        else
+            @intCast(@min(@as(i128, 15000), @divFloor(remaining_ns, std.time.ns_per_ms)));
+
+        // 7. Block in poll until next event or timeout
+        _ = posix.poll(&pollfds, timeout_ms) catch |err| {
             log.warn("ssh thread poll failed: {}", .{err});
             return;
         };
 
-        // 6. Check quit pipe
+        // 8. Check quit pipe
         if (pollfds[1].revents & posix.POLL.IN != 0) {
             log.info("ssh thread got quit signal", .{});
             return;
@@ -330,6 +397,126 @@ fn notifyAllSurfaces(entry: *Entry) void {
     }
 }
 
+fn broadcastConnectionState(entry: *Entry, state: session.protocol.ConnectionState) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    for (entry.surfaces) |slot| {
+        if (slot) |s| {
+            _ = s.surface_mailbox.push(.{ .connection_state = state }, .{ .forever = {} });
+        }
+    }
+}
+
+/// Attempt to reconnect the SSH connection with exponential backoff.
+/// Returns true if reconnection succeeded, false if we should give up.
+fn attemptReconnect(entry: *Entry) bool {
+    const reconnect_start = std.time.nanoTimestamp();
+    var backoff_ms: u64 = 1000; // Start at 1s
+
+    broadcastConnectionState(entry, .{ .reconnecting = .{
+        .attempt = 0,
+        .elapsed_ns = 0,
+    } });
+
+    // Close old channel
+    if (entry.channel) |*ch| {
+        ch.close();
+        entry.channel = null;
+    }
+
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        const elapsed = std.time.nanoTimestamp() - reconnect_start;
+
+        // Check timeout
+        if (elapsed > entry.max_reconnect_time_ns) {
+            log.warn("reconnect timeout after {d} attempts", .{attempt});
+            broadcastConnectionState(entry, .{ .failed = .timeout });
+            return false;
+        }
+
+        broadcastConnectionState(entry, .{ .reconnecting = .{
+            .attempt = attempt,
+            .elapsed_ns = elapsed,
+        } });
+
+        log.info("reconnect attempt {d} (backoff {d}ms)", .{ attempt, backoff_ms });
+
+        // Close old session state
+        entry.ctx.deinit();
+        entry.ctx.session = null;
+        entry.ctx.jump_session = null;
+
+        // Try to reconnect
+        var stderr_buf: [256]u8 = undefined;
+        var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
+        const stderr = &stderr_writer_.interface;
+
+        entry.ctx.connect(stderr) catch {
+            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            backoff_ms = @min(backoff_ms * 2, 30_000);
+            continue;
+        };
+
+        // Try to open multiplexed channel (with daemon restart fallback)
+        const new_channel = tryOpenChannel(entry) orelse {
+            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            backoff_ms = @min(backoff_ms * 2, 30_000);
+            continue;
+        };
+
+        // Switch to non-blocking
+        var sess = &entry.ctx.session.?;
+        sess.setBlocking(0);
+        entry.channel = new_channel;
+
+        // Re-open sessions for all registered surfaces
+        entry.surfaces_mutex.lock();
+        for (entry.surfaces) |slot| {
+            if (slot) |s| {
+                const open_payload = (session.protocol.SessionOpen{
+                    .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
+                    .label = "reconnected",
+                }).encode(std.heap.page_allocator) catch continue;
+                defer std.heap.page_allocator.free(open_payload);
+                sendFrame(&entry.channel.?, .session_open, s.target_id, open_payload) catch {};
+            }
+        }
+        entry.surfaces_mutex.unlock();
+
+        log.info("reconnected after {d} attempts", .{attempt});
+        return true;
+    }
+}
+
+/// Try to open a multiplexed channel, restarting the daemon if needed.
+fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
+    const alloc = std.heap.page_allocator;
+
+    // First attempt
+    if (session.client.openMultiplexChannel(alloc, &entry.ctx, entry.helper_path)) |ch| {
+        return ch;
+    } else |_| {}
+
+    // Helper might be dead — restart daemon and retry
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, entry.helper_path) catch return null;
+
+    return session.client.openMultiplexChannel(alloc, &entry.ctx, entry.helper_path) catch null;
+}
+
+fn notifyAllSurfacesStale(entry: *Entry) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    for (entry.surfaces) |slot| {
+        if (slot) |s| {
+            _ = s.surface_mailbox.push(.{
+                .connection_state = .stale,
+            }, .{ .forever = {} });
+        }
+    }
+}
+
 fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
     while (frame_buf.items.len >= session.protocol.header_size) {
         const kind_byte = frame_buf.items[0];
@@ -343,6 +530,14 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
             continue;
         };
         const payload = frame_buf.items[session.protocol.header_size..total];
+
+        // Handle keepalive: update timestamp, don't dispatch to surfaces
+        if (kind == .keepalive) {
+            entry.last_keepalive_received = std.time.nanoTimestamp();
+            entry.keepalive_active = true;
+            shiftBuffer(frame_buf, total);
+            continue;
+        }
 
         // Hold surfaces_mutex during dispatch to prevent use-after-free
         // on surface io pointers (unregisterSurface acquires the same lock).
@@ -366,6 +561,13 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
 fn dispatchFrame(kind: session.protocol.Kind, slot: SurfaceSlot, payload: []const u8) void {
     switch (kind) {
         .stdout => @call(.always_inline, termio.Termio.processOutput, .{ slot.io, payload }),
+        .state_delta, .state_full => {
+            // Apply terminal state delta/snapshot to the surface's terminal.
+            // This is the client-side of the state sync protocol.
+            slot.io.applyStateDelta(payload) catch |err| {
+                log.warn("state delta apply failed: {}", .{err});
+            };
+        },
         .session_opened => log.info("remote session opened id={s}", .{payload}),
         .info => log.info("remote info: {s}", .{payload}),
         .err => log.err("remote error: {s}", .{payload}),

@@ -7,6 +7,7 @@ const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const session = @import("../session.zig");
 const Config = @import("../config.zig").Config;
 const MessageData = @import("../datastruct/main.zig").MessageData;
 
@@ -101,6 +102,9 @@ pub const Message = union(enum) {
 
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
+
+    /// SSH connection state change for overlay display.
+    connection_state: session.protocol.ConnectionState,
 
     /// Search progress update
     search_total: ?usize,

@@ -143,12 +143,15 @@ pub const SshContext = struct {
     }
 };
 
+pub const Mailbox = @import("../apprt.zig").surface.Mailbox;
+
 /// Ensure the remote helper binary exists on the target host with a
 /// compatible protocol version.
 pub fn ensureRemoteHelper(
     alloc: Allocator,
     ctx: *SshContext,
     stderr: *std.Io.Writer,
+    mailbox: ?*Mailbox,
 ) ![]const u8 {
     const helper_path = try shared.remoteInstallPath(alloc);
     errdefer alloc.free(helper_path);
@@ -167,14 +170,14 @@ pub fn ensureRemoteHelper(
     defer alloc.free(version_cmd);
 
     const result = sess.exec(version_cmd) catch {
-        try uploadHelper(alloc, sess, helper_path, stderr);
+        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
         return helper_path;
     };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
     if (result.exit_code != 0) {
-        try uploadHelper(alloc, sess, helper_path, stderr);
+        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
         return helper_path;
     }
 
@@ -184,20 +187,20 @@ pub fn ensureRemoteHelper(
     if (!std.mem.startsWith(u8, trimmed, prefix)) {
         try stderr.writeAll("Remote helper version unrecognized, re-uploading...\n");
         try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, stderr);
+        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
         return helper_path;
     }
 
     const ver_str = trimmed[prefix.len..];
     const remote_version = std.fmt.parseInt(u16, ver_str, 10) catch {
-        try uploadHelper(alloc, sess, helper_path, stderr);
+        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
         return helper_path;
     };
 
     if (remote_version != protocol.protocol_version) {
         try stderr.writeAll("Remote helper protocol version mismatch, re-uploading...\n");
         try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, stderr);
+        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
     }
 
     return helper_path;
@@ -292,6 +295,7 @@ fn uploadHelper(
     sess: *ssh.SshSession,
     helper_path: []const u8,
     stderr: *std.Io.Writer,
+    mailbox: ?*Mailbox,
 ) !void {
     try stderr.writeAll("\nSetting up Ghostty helper on remote host...\n");
     try stderr.flush();
@@ -335,11 +339,26 @@ fn uploadHelper(
     const file = try std.fs.openFileAbsolute(exe_path, .{});
     defer file.close();
     const stat = try file.stat();
+    const total_bytes: u64 = stat.size;
 
-    try stderr.print("Uploading binary ({d} KB)... ", .{stat.size / 1024});
+    try stderr.print("Uploading binary ({d} KB)... ", .{total_bytes / 1024});
     try stderr.flush();
 
-    try sess.upload(exe_path, tmp_path, 0o700);
+    // Notify via mailbox of upload start
+    pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes } });
+
+    const ProgressCtx = struct {
+        mbox: ?*Mailbox,
+        total: u64,
+
+        pub fn onProgress(ctx: @This(), bytes_sent: u64) void {
+            pushConnectionState(ctx.mbox, .{ .uploading = .{
+                .bytes_sent = bytes_sent,
+                .total_bytes = ctx.total,
+            } });
+        }
+    };
+    try sess.upload(exe_path, tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes });
 
     try stderr.writeAll("Done.\n");
     try stderr.flush();
@@ -363,6 +382,12 @@ fn uploadHelper(
 
     try stderr.writeAll("Helper installed successfully.\n");
     try stderr.flush();
+}
+
+fn pushConnectionState(mailbox: ?*Mailbox, state: protocol.ConnectionState) void {
+    if (mailbox) |m| {
+        _ = m.push(.{ .connection_state = state }, .{ .forever = {} });
+    }
 }
 
 fn platformMatches(local_os: []const u8, remote_os: []const u8) bool {
