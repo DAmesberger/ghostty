@@ -1,21 +1,70 @@
 //! Shared SSH connection pool keyed by (ssh_target, jump).
-//! Multiple surfaces (tabs/splits) to the same host share one TCP connection
-//! and SSH session, each getting their own SSH channel.
+//! Multiple surfaces (tabs/splits) to the same host share one SSH connection,
+//! one SSH channel to the helper process, and multiplexed sessions via target IDs.
+//! A dedicated SSH thread per connection exclusively owns all libssh2 calls,
+//! since libssh2 is NOT thread-safe. Surfaces communicate via a thread-safe
+//! write queue and receive frames via direct processOutput calls.
 const SshConnectionManager = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const posix = std.posix;
 const session = @import("../session.zig");
 const ssh = session.ssh;
+const termio = @import("../termio.zig");
+const apprt = @import("../apprt.zig");
+
+const log = std.log.scoped(.ssh_connection_manager);
+
+pub const MAX_SURFACES: usize = 64;
 
 mutex: std.Thread.Mutex = .{},
 connections: std.StringArrayHashMap(Entry),
 alloc: Allocator,
 
+pub const SurfaceSlot = struct {
+    target_id: u16,
+    io: *termio.Termio,
+    surface_mailbox: *apprt.surface.Mailbox,
+};
+
+pub const WriteRequest = struct {
+    kind: session.protocol.Kind,
+    target_id: u16,
+    data: []const u8, // owned by page_allocator, freed after send
+};
+
+pub const ConnState = enum(u8) {
+    uninitialized,
+    connecting,
+    ready,
+    failed,
+};
+
 pub const Entry = struct {
     ctx: session.client.SshContext,
     helper_path: []const u8,
     ref_count: u32,
+    /// Shared SSH channel to the multiplexed helper process (one per host).
+    channel: ?ssh.Channel = null,
+    /// Next target ID to assign for multiplexing.
+    next_target: u16 = 1,
+
+    // -- SSH thread fields --
+    ssh_thread: ?std.Thread = null,
+    quit_pipe: [2]posix.fd_t = .{ -1, -1 },
+    write_pipe: [2]posix.fd_t = .{ -1, -1 },
+
+    // Registered surfaces for frame dispatch
+    surfaces: [MAX_SURFACES]?SurfaceSlot = [_]?SurfaceSlot{null} ** MAX_SURFACES,
+    surfaces_mutex: std.Thread.Mutex = .{},
+
+    // Write queue (thread-safe)
+    write_queue_mu: std.Thread.Mutex = .{},
+    write_queue: std.ArrayList(WriteRequest) = .empty,
+
+    // Connection state for race prevention between surfaces
+    conn_state: std.atomic.Value(ConnState) = .{ .raw = .uninitialized },
 };
 
 pub fn init(alloc: Allocator) SshConnectionManager {
@@ -29,7 +78,12 @@ pub fn deinit(self: *SshConnectionManager) void {
     var it = self.connections.iterator();
     while (it.next()) |entry| {
         self.alloc.free(entry.key_ptr.*);
-        self.alloc.free(entry.value_ptr.helper_path);
+        if (entry.value_ptr.helper_path.len > 0) self.alloc.free(entry.value_ptr.helper_path);
+        if (entry.value_ptr.channel) |*ch| ch.close();
+        for (entry.value_ptr.write_queue.items) |req| {
+            std.heap.page_allocator.free(req.data);
+        }
+        entry.value_ptr.write_queue.deinit(std.heap.page_allocator);
         entry.value_ptr.ctx.deinit();
     }
     self.connections.deinit();
@@ -43,9 +97,8 @@ fn makeKey(alloc: Allocator, ssh_target: []const u8, jump: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, ssh_target);
 }
 
-/// Acquire a connection entry. If one already exists for this target+jump,
-/// increments the ref count and returns it. Otherwise creates a new entry
-/// with ref_count=1. The SSH connection itself is lazily established.
+/// Acquire a connection entry. If the entry already exists its ref_count
+/// is incremented; otherwise a new entry is created.
 pub fn acquire(
     self: *SshConnectionManager,
     ssh_target: []const u8,
@@ -75,7 +128,72 @@ pub fn acquire(
     return self.connections.getPtr(key).?;
 }
 
-/// Release a reference. When ref_count reaches 0, clean up the connection.
+/// Allocate the next target ID for a session on this entry.
+pub fn allocateTarget(self: *SshConnectionManager, entry: *Entry) u16 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const target = entry.next_target;
+    entry.next_target +%= 1;
+    if (entry.next_target == 0) entry.next_target = 1; // skip 0
+    return target;
+}
+
+/// Register a surface for frame dispatch from the SSH thread.
+pub fn registerSurface(entry: *Entry, target_id: u16, io: *termio.Termio, mailbox: *apprt.surface.Mailbox) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    for (&entry.surfaces) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{
+                .target_id = target_id,
+                .io = io,
+                .surface_mailbox = mailbox,
+            };
+            return;
+        }
+    }
+    log.err("max surfaces ({d}) exceeded for SSH connection", .{MAX_SURFACES});
+}
+
+/// Unregister a surface. After this returns, the SSH thread will not
+/// access the surface's io pointer (surfaces_mutex acts as barrier).
+pub fn unregisterSurface(entry: *Entry, target_id: u16) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    for (&entry.surfaces) |*slot| {
+        if (slot.*) |s| {
+            if (s.target_id == target_id) {
+                slot.* = null;
+                return;
+            }
+        }
+    }
+}
+
+/// Enqueue a write request for the SSH thread to send.
+/// The data is duplicated internally; the caller retains ownership of the input.
+pub fn enqueueWrite(entry: *Entry, kind: session.protocol.Kind, target_id: u16, data: []const u8) void {
+    const alloc = std.heap.page_allocator;
+    const owned_data = alloc.dupe(u8, data) catch return;
+
+    entry.write_queue_mu.lock();
+    entry.write_queue.append(alloc, .{
+        .kind = kind,
+        .target_id = target_id,
+        .data = owned_data,
+    }) catch {
+        entry.write_queue_mu.unlock();
+        alloc.free(owned_data);
+        return;
+    };
+    entry.write_queue_mu.unlock();
+
+    // Wake the SSH thread
+    _ = posix.write(entry.write_pipe[1], "w") catch {};
+}
+
+/// Release a reference. When ref_count reaches 0, shut down the SSH thread
+/// and clean up the connection.
 pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]const u8) void {
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -88,11 +206,217 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
             entry.ref_count -= 1;
             return;
         }
-        // Last reference — clean up
+
+        // Last reference — shut down SSH thread and clean up.
+        if (entry.ssh_thread) |thread| {
+            _ = posix.write(entry.quit_pipe[1], "q") catch {};
+            thread.join();
+            // Close write ends (read ends are closed by the thread)
+            posix.close(entry.quit_pipe[1]);
+            posix.close(entry.write_pipe[1]);
+        }
+
+        // Clean up remaining write queue
+        for (entry.write_queue.items) |req| {
+            std.heap.page_allocator.free(req.data);
+        }
+        entry.write_queue.deinit(std.heap.page_allocator);
+
         if (entry.helper_path.len > 0) self.alloc.free(entry.helper_path);
+        if (entry.channel) |*ch| ch.close();
         entry.ctx.deinit();
-        // Remove the entry and free the stored key
+
         const removed = self.connections.fetchOrderedRemove(key);
         if (removed) |r| self.alloc.free(r.key);
+    }
+}
+
+// =========================================================================
+// SSH thread — exclusively owns all libssh2 calls for one connection.
+// Modeled after Exec.ReadThread: blocks in posix.poll when idle, zero CPU.
+// =========================================================================
+
+pub fn sshThreadMain(entry: *Entry) void {
+    // Close read ends of pipes on exit
+    defer posix.close(entry.quit_pipe[0]);
+    defer posix.close(entry.write_pipe[0]);
+
+    var sess = &entry.ctx.session.?;
+    var channel = &entry.channel.?;
+    const ssh_sock = sess.getPollSocket();
+
+    // Set write_pipe read end to non-blocking for drain
+    setNonBlocking(entry.write_pipe[0]);
+
+    var pollfds: [3]posix.pollfd = .{
+        .{ .fd = ssh_sock, .events = posix.POLL.IN, .revents = undefined },
+        .{ .fd = entry.quit_pipe[0], .events = posix.POLL.IN, .revents = undefined },
+        .{ .fd = entry.write_pipe[0], .events = posix.POLL.IN, .revents = undefined },
+    };
+
+    var frame_buf: std.ArrayList(u8) = .empty;
+    defer frame_buf.deinit(std.heap.page_allocator);
+
+    var read_buf: [4096]u8 = undefined;
+
+    while (true) {
+        // 1. Process SSH transport (needed for tunneled sessions)
+        sess.pollTransport(1);
+
+        // 2. Drain reads (non-blocking tight loop)
+        while (true) {
+            const rc = channel.readNonBlock(&read_buf);
+            if (rc > 0) {
+                frame_buf.appendSlice(
+                    std.heap.page_allocator,
+                    read_buf[0..@intCast(rc)],
+                ) catch break;
+            } else break;
+        }
+
+        // Check channel EOF (helper process exited — all sessions dead)
+        if (channel.eof()) {
+            log.info("ssh channel EOF", .{});
+            notifyAllSurfaces(entry);
+            return;
+        }
+
+        // Process complete protocol frames
+        processFrames(&frame_buf, entry);
+
+        // 3. Drain write queue
+        {
+            entry.write_queue_mu.lock();
+            for (entry.write_queue.items) |req| {
+                sendFrame(channel, req.kind, req.target_id, req.data) catch |err| {
+                    log.warn("ssh write failed: {}", .{err});
+                };
+                std.heap.page_allocator.free(req.data);
+            }
+            entry.write_queue.clearRetainingCapacity();
+            entry.write_queue_mu.unlock();
+        }
+
+        // Drain write pipe notification bytes
+        drainPipe(entry.write_pipe[0]);
+
+        // 4. Compute poll events based on libssh2 block directions
+        pollfds[0].events = posix.POLL.IN;
+        if (sess.needsWrite()) pollfds[0].events |= posix.POLL.OUT;
+
+        // 5. Block in poll until next event
+        _ = posix.poll(&pollfds, -1) catch |err| {
+            log.warn("ssh thread poll failed: {}", .{err});
+            return;
+        };
+
+        // 6. Check quit pipe
+        if (pollfds[1].revents & posix.POLL.IN != 0) {
+            log.info("ssh thread got quit signal", .{});
+            return;
+        }
+    }
+}
+
+fn notifyAllSurfaces(entry: *Entry) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    for (entry.surfaces) |slot| {
+        if (slot) |s| {
+            _ = s.surface_mailbox.push(.{
+                .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
+            }, .{ .forever = {} });
+        }
+    }
+}
+
+fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
+    while (frame_buf.items.len >= session.protocol.header_size) {
+        const kind_byte = frame_buf.items[0];
+        const frame_target = std.mem.readInt(u16, frame_buf.items[2..4], .little);
+        const payload_len = std.mem.readInt(u32, frame_buf.items[4..8], .little);
+        const total = session.protocol.header_size + payload_len;
+        if (frame_buf.items.len < total) break;
+
+        const kind = std.meta.intToEnum(session.protocol.Kind, kind_byte) catch {
+            shiftBuffer(frame_buf, total);
+            continue;
+        };
+        const payload = frame_buf.items[session.protocol.header_size..total];
+
+        // Hold surfaces_mutex during dispatch to prevent use-after-free
+        // on surface io pointers (unregisterSurface acquires the same lock).
+        entry.surfaces_mutex.lock();
+        if (frame_target == 0) {
+            // Broadcast to all surfaces
+            for (entry.surfaces) |slot| {
+                if (slot) |s| dispatchFrame(kind, s, payload);
+            }
+        } else {
+            if (findSurface(entry, frame_target)) |s| {
+                dispatchFrame(kind, s, payload);
+            }
+        }
+        entry.surfaces_mutex.unlock();
+
+        shiftBuffer(frame_buf, total);
+    }
+}
+
+fn dispatchFrame(kind: session.protocol.Kind, slot: SurfaceSlot, payload: []const u8) void {
+    switch (kind) {
+        .stdout => @call(.always_inline, termio.Termio.processOutput, .{ slot.io, payload }),
+        .session_opened => log.info("remote session opened id={s}", .{payload}),
+        .info => log.info("remote info: {s}", .{payload}),
+        .err => log.err("remote error: {s}", .{payload}),
+        .eof => {
+            log.info("remote session EOF target={d}", .{slot.target_id});
+            _ = slot.surface_mailbox.push(.{
+                .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
+            }, .{ .forever = {} });
+        },
+        else => {},
+    }
+}
+
+fn findSurface(entry: *const Entry, target_id: u16) ?SurfaceSlot {
+    for (entry.surfaces) |slot| {
+        if (slot) |s| {
+            if (s.target_id == target_id) return s;
+        }
+    }
+    return null;
+}
+
+// -- Protocol helpers --
+
+fn sendFrame(channel: *ssh.Channel, kind: session.protocol.Kind, target: u16, data: []const u8) !void {
+    var header: [session.protocol.header_size]u8 = undefined;
+    header[0] = @intFromEnum(kind);
+    header[1] = 0; // reserved
+    std.mem.writeInt(u16, header[2..4], target, .little);
+    std.mem.writeInt(u32, header[4..8], @intCast(data.len), .little);
+    try channel.write(&header);
+    if (data.len > 0) try channel.write(data);
+}
+
+fn shiftBuffer(buf: *std.ArrayList(u8), amount: usize) void {
+    if (amount >= buf.items.len) {
+        buf.shrinkRetainingCapacity(0);
+    } else {
+        std.mem.copyForwards(u8, buf.items, buf.items[amount..]);
+        buf.shrinkRetainingCapacity(buf.items.len - amount);
+    }
+}
+
+fn setNonBlocking(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, @as(u32, @bitCast(posix.O{ .NONBLOCK = true })))) catch {};
+}
+
+fn drainPipe(fd: posix.fd_t) void {
+    var buf: [64]u8 = undefined;
+    while (true) {
+        _ = posix.read(fd, &buf) catch return;
     }
 }

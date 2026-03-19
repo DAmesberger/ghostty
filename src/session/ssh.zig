@@ -507,6 +507,14 @@ pub const SshSession = struct {
         return self.sock;
     }
 
+    /// Returns true if libssh2 needs to send data to the network.
+    /// Useful for setting POLLOUT on the SSH socket after a non-blocking
+    /// operation returns EAGAIN.
+    pub fn needsWrite(self: *SshSession) bool {
+        const sess_handle = if (self.jump) |j| j.jump_session else self.session;
+        const dir = ssh2.libssh2_session_block_directions(sess_handle);
+        return (dir & ssh2.LIBSSH2_SESSION_BLOCK_OUTBOUND) != 0;
+    }
 
     /// Set session blocking mode. 0 = non-blocking, 1 = blocking.
     pub fn setBlocking(self: *SshSession, blocking: c_int) void {
