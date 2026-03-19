@@ -728,38 +728,29 @@ fn drainFdToWriter(fd: posix.fd_t, writer: *std.Io.Writer) !void {
     try writer.flush();
 }
 
+/// Transparent relay: stdin (SSH channel) → daemon socket.
+/// Forwards raw bytes directly so the daemon receives protocol frames
+/// (.stdin, .resize, .detach) from the client without re-framing.
 fn proxyLocalToSocket(fd: posix.fd_t) void {
     var stdin_file: std.fs.File = .stdin();
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = stdin_file.read(&buf) catch break;
         if (n == 0) break;
-        sendFrameFd(fd, .stdin, buf[0..n]) catch break;
+        writeAllFd(fd, buf[0..n]) catch break;
     }
 }
 
+/// Transparent relay: daemon socket → stdout (SSH channel).
+/// Forwards raw bytes directly so the client receives protocol frames
+/// (.stdout, .eof, .err) from the daemon without stripping.
 fn proxySocketToLocal(alloc: Allocator, fd: posix.fd_t) !void {
-    var socket_file: std.fs.File = .{ .handle = fd };
-    var socket_reader_buf: [1024]u8 = undefined;
-    var socket_reader_ = socket_file.reader(&socket_reader_buf);
-    const socket_reader = &socket_reader_.interface;
-
-    var stdout_file: std.fs.File = .stdout();
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer_ = stdout_file.writer(&stdout_buf);
-    const stdout = &stdout_writer_.interface;
-
+    _ = alloc;
+    var buf: [4096]u8 = undefined;
     while (true) {
-        const header = session.protocol.readHeader(socket_reader) catch break;
-        const payload = try session.protocol.readPayloadAlloc(alloc, socket_reader, header);
-        defer alloc.free(payload);
-        switch (header.kind) {
-            .stdout => try stdout.writeAll(payload),
-            .err => try std.fs.File.stderr().writeAll(payload),
-            .eof => break,
-            else => {},
-        }
-        try stdout.flush();
+        const n = posix.read(fd, &buf) catch break;
+        if (n == 0) break;
+        std.fs.File.stdout().writeAll(buf[0..n]) catch break;
     }
 }
 

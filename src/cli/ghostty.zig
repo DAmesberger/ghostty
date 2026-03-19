@@ -19,11 +19,8 @@ const crash_report = @import("crash_report.zig");
 const show_face = @import("show_face.zig");
 const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
-const session_connect = @import("session_connect.zig");
-const session_attach = @import("session_attach.zig");
 const session_list = @import("session_list.zig");
 const session_kill = @import("session_kill.zig");
-const session_proxy = @import("session_proxy.zig");
 const session_helper = @import("session_helper.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
@@ -75,20 +72,11 @@ pub const Action = enum {
     // Use IPC to tell the running Ghostty to open a new window.
     @"new-window",
 
-    // Connect to a remote Ghostty-owned SSH session.
-    @"session-connect",
-
-    // Attach to an existing remote Ghostty-owned SSH session.
-    @"session-attach",
-
     // List remote sessions on an SSH target.
     @"session-list",
 
     // Kill a remote session on an SSH target.
     @"session-kill",
-
-    // Internal helper used as the local proxy child for remote sessions.
-    @"session-proxy",
 
     // Internal helper used on the remote host for remote sessions.
     @"session-helper",
@@ -171,11 +159,8 @@ pub const Action = enum {
             .@"show-face" => try show_face.run(alloc),
             .boo => try boo.run(alloc),
             .@"new-window" => try new_window.run(alloc),
-            .@"session-connect" => try session_connect.run(alloc),
-            .@"session-attach" => try session_attach.run(alloc),
             .@"session-list" => try session_list.run(alloc),
             .@"session-kill" => try session_kill.run(alloc),
-            .@"session-proxy" => try session_proxy.run(alloc),
             .@"session-helper" => try session_helper.run(alloc),
         };
     }
@@ -216,11 +201,8 @@ pub const Action = enum {
                 .@"show-face" => show_face.Options,
                 .boo => boo.Options,
                 .@"new-window" => new_window.Options,
-                .@"session-connect" => session_connect.Options,
-                .@"session-attach" => session_attach.Options,
                 .@"session-list" => session_list.Options,
                 .@"session-kill" => session_kill.Options,
-                .@"session-proxy" => session_proxy.Options,
                 .@"session-helper" => session_helper.Options,
             };
         }

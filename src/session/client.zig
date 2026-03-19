@@ -60,7 +60,11 @@ pub const SshContext = struct {
                 try stderr.flush();
                 return error.RemoteAuthRequired;
             };
-            errdefer jump_sess.close();
+            // Once tunnel() succeeds, target_sess.close() owns the jump
+            // resources (session, socket, channel). Only close independently
+            // if we fail before that point.
+            var jump_needs_close = true;
+            errdefer if (jump_needs_close) jump_sess.close();
 
             jump_sess.authAuto(jump.user) catch {
                 try stderr.print("Password for {s}: ", .{jump_str});
@@ -89,6 +93,7 @@ pub const SshContext = struct {
                 try stderr.flush();
                 return error.RemoteAuthRequired;
             };
+            jump_needs_close = false; // target_sess now owns jump resources
             errdefer target_sess.close();
 
             target_sess.authAuto(target.user) catch {
@@ -297,6 +302,10 @@ pub fn openRemoteAttach(
     }
     const cmd_str = try cmd.toOwnedSlice(alloc);
     defer alloc.free(cmd_str);
+
+    dbg.writeAll("[openRemoteAttach] cmd: ") catch {};
+    dbg.writeAll(cmd_str) catch {};
+    dbg.writeAll("\n") catch {};
 
     try channel.exec(cmd_str);
     return channel;

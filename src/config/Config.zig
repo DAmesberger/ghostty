@@ -1195,6 +1195,19 @@ command: ?Command = null,
 ///     manually.
 @"initial-command": ?Command = null,
 
+/// SSH target for remote sessions. When set, the surface connects to
+/// the remote host via SSH instead of running a local command. The
+/// format is `user@host` or `user@host:port`.
+///
+/// Multiple tabs and splits connecting to the same target share
+/// one underlying SSH connection.
+@"ssh-target": ?[]const u8 = null,
+
+/// Optional SSH jump host for remote sessions. Used to tunnel through
+/// an intermediate host to reach the target. Format is `user@host`
+/// or `user@host:port`.
+@"ssh-jump": ?[]const u8 = null,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///

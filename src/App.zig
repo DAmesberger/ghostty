@@ -15,6 +15,7 @@ const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
 const font = @import("font/main.zig");
+const termio = @import("termio.zig");
 
 const log = std.log.scoped(.app);
 
@@ -69,6 +70,9 @@ config_conditional_state: configpkg.ConditionalState,
 /// if they are the first surface.
 first: bool = true,
 
+/// Shared SSH connection manager for remote sessions.
+ssh_connection_manager: termio.SshConnectionManager,
+
 pub const CreateError = Allocator.Error || font.SharedGridSet.InitError;
 
 /// Create a new app instance. This returns a stable pointer to the app
@@ -99,6 +103,7 @@ pub fn init(
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
+        .ssh_connection_manager = termio.SshConnectionManager.init(alloc),
     };
 }
 
@@ -113,6 +118,9 @@ pub fn deinit(self: *App) void {
     // should gracefully close all surfaces.
     assert(self.font_grid_set.count() == 0);
     self.font_grid_set.deinit();
+
+    // Clean up SSH connections
+    self.ssh_connection_manager.deinit();
 }
 
 pub fn destroy(self: *App) void {

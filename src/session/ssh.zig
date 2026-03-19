@@ -420,7 +420,6 @@ pub const SshSession = struct {
         };
         defer _ = ssh2.libssh2_channel_free(scp_channel);
 
-        const dbg = std.fs.File.stderr();
         var remaining: usize = file_size;
         var total_written: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
@@ -430,28 +429,16 @@ pub const SshSession = struct {
             if (n == 0) break;
 
             var written: usize = 0;
-            var eagain_count: u32 = 0;
             while (written < n) {
                 const rc = channelWrite(scp_channel, buf[written..n].ptr, n - written);
                 if (rc == ssh2.LIBSSH2_ERROR_EAGAIN or rc == 0) {
-                    eagain_count += 1;
-                    if (eagain_count % 500 == 0) {
-                        const dir = ssh2.libssh2_session_block_directions(self.session);
-                        var db: [120]u8 = undefined;
-                        const dm = std.fmt.bufPrint(&db, "[upload] EAGAIN cnt={d} rc={d} dir={d} written={d}/{d} total={d}/{d}\n", .{ eagain_count, rc, dir, written, n, total_written, file_size }) catch "";
-                        dbg.writeAll(dm) catch {};
-                    }
                     waitsocket(self.session, self.getPollSocket());
                     continue;
                 }
                 if (rc < 0) {
-                    var eb: [80]u8 = undefined;
-                    const em = std.fmt.bufPrint(&eb, "[upload] write error rc={d}\n", .{rc}) catch "";
-                    dbg.writeAll(em) catch {};
                     ssh2.libssh2_session_set_blocking(self.session, was_blocking);
                     return error.SshDisconnected;
                 }
-                eagain_count = 0;
                 written += @intCast(rc);
                 total_written += @intCast(rc);
             }
@@ -524,6 +511,19 @@ pub const SshSession = struct {
     /// Set session blocking mode. 0 = non-blocking, 1 = blocking.
     pub fn setBlocking(self: *SshSession, blocking: c_int) void {
         ssh2.libssh2_session_set_blocking(self.session, blocking);
+    }
+
+    /// Poll the SSH transport with a short timeout to process pending
+    /// network data. For tunneled sessions this polls the jump host's
+    /// real socket. Call this before non-blocking reads to ensure
+    /// libssh2 has processed incoming packets.
+    pub fn pollTransport(self: *SshSession, timeout_ms: c_int) void {
+        // For tunneled sessions, poll the jump session's transport
+        if (self.jump) |j| {
+            waitsocketTimeout(j.jump_session, j.jump_sock, timeout_ms);
+        } else {
+            waitsocketTimeout(self.session, self.sock, timeout_ms);
+        }
     }
 
     /// Disconnect and free all resources.
@@ -608,6 +608,12 @@ pub const Channel = struct {
         const rc = channelReadStderr(self.inner, buf.ptr, buf.len);
         if (rc < 0) return error.SshDisconnected;
         return @intCast(rc);
+    }
+
+    /// Non-blocking read from stderr. Returns bytes read, 0 if no data
+    /// available (EAGAIN), or negative on error.
+    pub fn readStderrNonBlock(self: *Channel, buf: []u8) isize {
+        return channelReadStderr(self.inner, buf.ptr, buf.len);
     }
 
     /// Write data to the channel. Handles EAGAIN by retrying.
@@ -736,13 +742,17 @@ fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
 /// EAGAIN (TCP needs POLLIN) and BLOCK_OUTBOUND when tunnelSend got
 /// EAGAIN (TCP needs POLLOUT).
 fn waitsocket(sess: *ssh2.LIBSSH2_SESSION, sock: posix.fd_t) void {
+    waitsocketTimeout(sess, sock, 100);
+}
+
+fn waitsocketTimeout(sess: *ssh2.LIBSSH2_SESSION, sock: posix.fd_t, timeout_ms: c_int) void {
     const dir = ssh2.libssh2_session_block_directions(sess);
     var events: c_short = 0;
     if (dir & ssh2.LIBSSH2_SESSION_BLOCK_INBOUND != 0) events |= c.POLLIN;
     if (dir & ssh2.LIBSSH2_SESSION_BLOCK_OUTBOUND != 0) events |= c.POLLOUT;
     if (events == 0) events = c.POLLIN | c.POLLOUT;
     var fds = [1]c.struct_pollfd{.{ .fd = sock, .events = events, .revents = 0 }};
-    _ = c.poll(&fds, 1, 100);
+    _ = c.poll(&fds, 1, timeout_ms);
 }
 
 fn allocSentinel(alloc: Allocator, data: []const u8) ![:0]const u8 {

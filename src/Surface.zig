@@ -621,32 +621,47 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Determine the IO backend based on config
+        const io_backend: termio.Backend = backend: {
+            if (config.@"ssh-target") |ssh_target| {
+                // Remote SSH backend
+                var io_remote = try termio.Remote.init(alloc, .{
+                    .ssh_target = ssh_target,
+                    .jump = config.@"ssh-jump",
+                    .connection_manager = &app.ssh_connection_manager,
+                });
+                errdefer io_remote.deinit();
+                break :backend .{ .remote = io_remote };
+            } else {
+                // Standard exec backend
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env internal_os.getEnvMap(alloc) catch
+                        std.process.EnvMap.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                env.remove("GHOSTTY_LOG");
+
+                var io_exec = try termio.Exec.init(alloc, .{
+                    .command = command,
+                    .env = env,
+                    .env_override = config.env,
+                    .shell_integration = config.@"shell-integration",
+                    .shell_integration_features = config.@"shell-integration-features",
+                    .cursor_blink = config.@"cursor-style-blink",
+                    .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                    .resources_dir = global_state.resources_dir.host(),
+                    .term = config.term,
+                    .rt_pre_exec_info = .init(config),
+                    .rt_post_fork_info = .init(config),
+                });
+                errdefer io_exec.deinit();
+                break :backend .{ .exec = io_exec };
+            }
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -656,7 +671,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -861,18 +876,16 @@ fn queueIo(
     self.io.queueMessage(msg, mutex);
 }
 
-fn isSessionProxySurface(self: *const Surface) bool {
-    return switch (self.io.backend) {
-        .exec => |*exec| for (exec.subprocess.args) |arg| {
-            if (std.mem.eql(u8, arg, "+session-proxy")) return true;
-        } else false,
-    };
+fn isRemoteSurface(self: *const Surface) bool {
+    return self.io.backend == .remote;
 }
 
 fn sendSessionControl(self: *Surface, comptime cmd: session.shared.ControlCommand) bool {
-    if (!isSessionProxySurface(self)) return false;
-    self.queueIo(.{ .write_stable = session.shared.controlSequence(cmd) }, .unlocked);
-    return true;
+    if (!isRemoteSurface(self)) return false;
+    // For remote surfaces, we send detach/reconnect through the protocol
+    _ = cmd;
+    // TODO: implement detach/reconnect for Remote backend
+    return false;
 }
 
 /// Forces the surface to render. This is useful for when the surface
@@ -1306,6 +1319,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        .remote => |*remote| &.{remote.ssh_target},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
