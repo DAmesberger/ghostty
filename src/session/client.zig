@@ -161,7 +161,7 @@ pub fn ensureRemoteHelper(
     // wrong arch, or a different protocol version, we re-upload.
     const version_cmd = try std.fmt.allocPrint(
         alloc,
-        "{s} +session-helper --version",
+        "{s} +session-helper --protocol-version",
         .{helper_path},
     );
     defer alloc.free(version_cmd);
@@ -266,48 +266,22 @@ pub fn buildRemoteCommand(
     return try cmd.toOwnedSlice(alloc);
 }
 
-/// Open a channel to the remote helper's stdio-attach mode.
-/// Returns a Channel that provides read/write directly — no subprocess.
-pub fn openRemoteAttach(
+/// Open a multiplexed channel to the remote helper's stdio-attach mode.
+/// Returns a Channel shared by all sessions to this host. Session creation
+/// happens via session_open frames, not CLI args.
+pub fn openMultiplexChannel(
     alloc: Allocator,
     ctx: *const SshContext,
     helper_path: []const u8,
-    session_id: ?[]const u8,
-    label: ?[]const u8,
 ) !ssh.Channel {
     var sess = ctx.session orelse return error.RemoteCommandFailed;
-    const dbg = std.fs.File.stderr();
-    {
-        var b: [120]u8 = undefined;
-        const m = std.fmt.bufPrint(&b, "[openRemoteAttach] sock={d} session_ptr={d}\n", .{ sess.sock, @intFromPtr(sess.session) }) catch "";
-        dbg.writeAll(m) catch {};
-    }
     var channel = try sess.openChannel();
     errdefer channel.close();
 
-    // Build the command
-    var cmd = std.ArrayList(u8).empty;
-    defer cmd.deinit(alloc);
-    try cmd.appendSlice(alloc, helper_path);
-    try cmd.appendSlice(alloc, " +session-helper --stdio-attach");
-    if (session_id) |id| {
-        try cmd.appendSlice(alloc, " --session=");
-        try cmd.appendSlice(alloc, id);
-    } else {
-        try cmd.appendSlice(alloc, " --new");
-    }
-    if (label) |value| {
-        try cmd.appendSlice(alloc, " --label=");
-        try cmd.appendSlice(alloc, value);
-    }
-    const cmd_str = try cmd.toOwnedSlice(alloc);
-    defer alloc.free(cmd_str);
+    const cmd = try std.fmt.allocPrint(alloc, "{s} +session-helper --stdio-attach", .{helper_path});
+    defer alloc.free(cmd);
 
-    dbg.writeAll("[openRemoteAttach] cmd: ") catch {};
-    dbg.writeAll(cmd_str) catch {};
-    dbg.writeAll("\n") catch {};
-
-    try channel.exec(cmd_str);
+    try channel.exec(cmd);
     return channel;
 }
 

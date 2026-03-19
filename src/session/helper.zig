@@ -26,7 +26,7 @@ pub const Options = struct {
     daemonize: bool = false,
     daemon: bool = false,
     list: bool = false,
-    version: bool = false,
+    @"protocol-version": bool = false,
     @"stdio-attach": bool = false,
     kill: ?[]const u8 = null,
     session: ?[]const u8 = null,
@@ -45,7 +45,7 @@ pub fn run(
         return 1;
     }
 
-    if (opts.version) {
+    if (opts.@"protocol-version") {
         try stdout.print("GHOSTTY_SESSION_PROTOCOL {d}\n", .{session.protocol.protocol_version});
         try stdout.flush();
         return 0;
@@ -72,7 +72,7 @@ pub fn run(
     }
 
     if (opts.@"stdio-attach") {
-        return try stdioAttach(alloc, opts, stderr);
+        return try multiplex(alloc, stderr);
     }
 
     try stderr.writeAll("missing helper mode\n");
@@ -111,7 +111,10 @@ fn daemonize(alloc: Allocator) !void {
     closeAllFds();
     reopenStdFds();
     _ = c.chdir("/");
-    daemonMain(alloc) catch {
+    // Use page_allocator instead of the inherited GPA — the GPA captures
+    // stack traces in debug builds, which requires debug info infrastructure
+    // (opening the ELF binary) that breaks after closeAllFds.
+    daemonMain(std.heap.page_allocator) catch {
         c._exit(1);
     };
     c._exit(0);
@@ -197,15 +200,26 @@ const ClientThread = struct {
     }
 
     fn main_(self: *ClientThread) !void {
+        // Read command using raw posix.read — Zig 0.15's buffered reader
+        // panics on socket fds after closeAllFds due to positional-read
+        // fallback bugs in the I/O infrastructure.
+        var cmd: [4096]u8 = undefined;
+        var pos: usize = 0;
+        while (pos < cmd.len) {
+            var byte: [1]u8 = undefined;
+            const n = posix.read(self.fd, &byte) catch break;
+            if (n == 0) break;
+            if (byte[0] == '\n') break;
+            cmd[pos] = byte[0];
+            pos += 1;
+        }
+        const trimmed = std.mem.trim(u8, cmd[0..pos], " \t\r\n");
+        if (trimmed.len == 0) return;
+
         var writer_buf: [1024]u8 = undefined;
         var file: std.fs.File = .{ .handle = self.fd };
-        var writer_ = file.writer(&writer_buf);
+        var writer_ = file.writerStreaming(&writer_buf);
         const writer = &writer_.interface;
-
-        const line = try readLineAlloc(self.daemon.alloc, self.fd, 4096);
-        defer self.daemon.alloc.free(line);
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) return;
 
         if (std.mem.eql(u8, trimmed, "LIST")) {
             try self.daemon.handleList(writer);
@@ -467,7 +481,7 @@ const Session = struct {
             self.mutex.lock();
             self.log_size += n;
             if (self.attached_fd) |fd| {
-                if (!self.replaying) sendFrameFd(fd, .stdout, buf[0..n]) catch |err| {
+                if (!self.replaying) sendFrameFd(fd, .stdout, 0, buf[0..n]) catch |err| {
                     log.warn("attached client write failed id={s} err={}", .{ self.id, err });
                     self.attached_fd = null;
                 };
@@ -477,7 +491,7 @@ const Session = struct {
 
         self.mutex.lock();
         self.alive = false;
-        if (self.attached_fd) |fd| _ = sendFrameFd(fd, .eof, "") catch {};
+        if (self.attached_fd) |fd| _ = sendFrameFd(fd, .eof, 0, "") catch {};
         self.mutex.unlock();
         _ = self.command.wait(false) catch {};
     }
@@ -518,7 +532,7 @@ const Session = struct {
 
         var file: std.fs.File = .{ .handle = fd };
         var reader_buf: [1024]u8 = undefined;
-        var reader_ = file.reader(&reader_buf);
+        var reader_ = file.readerStreaming(&reader_buf);
         const reader = &reader_.interface;
 
         while (true) {
@@ -559,65 +573,306 @@ const Session = struct {
         while (true) {
             const n = try file.read(&buf);
             if (n == 0) return try file.getPos();
-            try sendFrameFd(fd, .stdout, buf[0..n]);
+            try sendFrameFd(fd, .stdout, 0, buf[0..n]);
         }
     }
 };
 
-fn stdioAttach(
-    alloc: Allocator,
-    opts: Options,
-    stderr: *std.Io.Writer,
-) !u8 {
+// -- Multiplexed helper --
+
+const MAX_MUX_SESSIONS = 64;
+
+const MuxSession = struct {
+    target: u16,
+    daemon_fd: posix.fd_t,
+    read_buf: std.ArrayList(u8),
+
+    fn deinit(self: *MuxSession, alloc: Allocator) void {
+        closeFd(self.daemon_fd);
+        self.read_buf.deinit(alloc);
+    }
+};
+
+/// Multiplexed stdio-attach mode. Reads frames from stdin (SSH channel),
+/// dispatches to per-session daemon Unix sockets. Reads frames from daemon
+/// sockets, rewrites with the correct target, and writes to stdout.
+fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
+    _ = stderr;
     const socket_path = try session.shared.socketPath(alloc);
     defer alloc.free(socket_path);
 
-    const fd = try connectUnixSocket(socket_path);
-    defer closeFd(fd);
+    var sessions: [MAX_MUX_SESSIONS]?MuxSession = .{null} ** MAX_MUX_SESSIONS;
+    var stdin_buf = std.ArrayList(u8).empty;
+    defer stdin_buf.deinit(alloc);
 
-    var file: std.fs.File = .{ .handle = fd };
-    var writer_buf: [1024]u8 = undefined;
-    var writer_ = file.writer(&writer_buf);
-    const writer = &writer_.interface;
-
-    const label = opts.label orelse "session";
-    const resize = localResize();
-    if (opts.new or opts.session == null) {
-        const safe = try session.shared.sanitizeLabelAlloc(alloc, label);
-        defer alloc.free(safe);
-        try writer.print(
-            "ATTACH NEW {d} {d} {d} {d} {s}\n",
-            .{ resize.rows, resize.cols, resize.width_px, resize.height_px, safe },
-        );
-    } else {
-        try writer.print(
-            "ATTACH EXISTING {d} {d} {d} {d} {s}\n",
-            .{ resize.rows, resize.cols, resize.width_px, resize.height_px, opts.session.? },
-        );
-    }
-    try writer.flush();
-
-    const line = try readLineAlloc(alloc, fd, 4096);
-    defer alloc.free(line);
-    const response = std.mem.trim(u8, line, " \t\r\n");
-    if (!std.mem.startsWith(u8, response, "OK ")) {
-        try stderr.print("{s}\n", .{response});
-        return 1;
+    defer {
+        for (&sessions) |*slot| {
+            if (slot.*) |*s| {
+                s.deinit(alloc);
+                slot.* = null;
+            }
+        }
     }
 
-    const session_id = response["OK ".len..];
-    {
-        var out_buf: [1024]u8 = undefined;
-        var stdout_writer_ = std.fs.File.stdout().writer(&out_buf);
-        const stdout = &stdout_writer_.interface;
-        try session.protocol.writeFrame(stdout, .info, session_id);
-        try stdout.flush();
+    const stdout_file = std.fs.File.stdout();
+    const stdin_fd = posix.STDIN_FILENO;
+
+    while (true) {
+        // Build poll fds: [0] = stdin, [1..] = daemon sockets
+        var pollfds: [1 + MAX_MUX_SESSIONS]c.struct_pollfd = undefined;
+        pollfds[0] = .{
+            .fd = stdin_fd,
+            .events = c.POLLIN,
+            .revents = 0,
+        };
+
+        var poll_session_idx: [MAX_MUX_SESSIONS]usize = undefined;
+        var n_fds: usize = 1;
+        for (&sessions, 0..) |*slot, i| {
+            if (slot.* != null) {
+                pollfds[n_fds] = .{
+                    .fd = slot.*.?.daemon_fd,
+                    .events = c.POLLIN,
+                    .revents = 0,
+                };
+                poll_session_idx[n_fds - 1] = i;
+                n_fds += 1;
+            }
+        }
+
+        const poll_rc = c.poll(&pollfds, @intCast(n_fds), 50);
+
+        if (poll_rc < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return error.PollFailed;
+        }
+
+        // Check stdin for frames from client
+        if (pollfds[0].revents & c.POLLIN != 0) {
+            var raw_buf: [8192]u8 = undefined;
+            const n = posix.read(stdin_fd, &raw_buf) catch break;
+            if (n == 0) break;
+            try stdin_buf.appendSlice(alloc, raw_buf[0..n]);
+        }
+
+        if (pollfds[0].revents & (c.POLLHUP | c.POLLERR) != 0 and
+            pollfds[0].revents & c.POLLIN == 0)
+        {
+            break;
+        }
+
+        // Process complete frames from stdin buffer
+        while (stdin_buf.items.len >= session.protocol.header_size) {
+            const kind_byte = stdin_buf.items[0];
+            const target = std.mem.readInt(u16, stdin_buf.items[2..4], .little);
+            const payload_len = std.mem.readInt(u32, stdin_buf.items[4..8], .little);
+            const total = session.protocol.header_size + payload_len;
+            if (stdin_buf.items.len < total) break;
+
+            const kind = std.meta.intToEnum(session.protocol.Kind, kind_byte) catch {
+                shiftBuffer(&stdin_buf, total);
+                continue;
+            };
+
+            const payload = stdin_buf.items[session.protocol.header_size..total];
+
+            switch (kind) {
+                .session_open => {
+                    handleSessionOpen(
+                        alloc,
+                        &sessions,
+                        target,
+                        payload,
+                        socket_path,
+                        stdout_file,
+                    ) catch |err| {
+                        log.warn("session_open failed target={d} err={}", .{ target, err });
+                        const msg = std.fmt.allocPrint(alloc, "session open failed: {}", .{err}) catch {
+                            sendFrameFile(stdout_file, .err, target, "session open failed") catch {};
+                            shiftBuffer(&stdin_buf, total);
+                            continue;
+                        };
+                        defer alloc.free(msg);
+                        sendFrameFile(stdout_file, .err, target, msg) catch {};
+                    };
+                },
+                .session_close => {
+                    closeMuxSession(&sessions, alloc, target);
+                },
+                .detach => {
+                    if (findMuxSession(&sessions, target)) |s| {
+                        sendFrameFd(s.daemon_fd, .detach, 0, "") catch {};
+                    }
+                    closeMuxSession(&sessions, alloc, target);
+                },
+                .stdin => {
+                    if (findMuxSession(&sessions, target)) |s| {
+                        sendFrameFd(s.daemon_fd, .stdin, 0, payload) catch {
+                            sendFrameFile(stdout_file, .eof, target, "") catch {};
+                            closeMuxSession(&sessions, alloc, target);
+                        };
+                    }
+                },
+                .resize => {
+                    if (findMuxSession(&sessions, target)) |s| {
+                        sendFrameFd(s.daemon_fd, .resize, 0, payload) catch {};
+                    }
+                },
+                else => {},
+            }
+
+            shiftBuffer(&stdin_buf, total);
+        }
+
+        // Check daemon sockets for frames
+        var pidx: usize = 1;
+        while (pidx < n_fds) : (pidx += 1) {
+            const sess_idx = poll_session_idx[pidx - 1];
+            const slot = &sessions[sess_idx];
+            if (slot.*) |*s| {
+                if (pollfds[pidx].revents & c.POLLIN != 0) {
+                    var daemon_buf: [8192]u8 = undefined;
+                    const n = posix.read(s.daemon_fd, &daemon_buf) catch {
+                        sendFrameFile(stdout_file, .eof, s.target, "") catch {};
+                        s.deinit(alloc);
+                        slot.* = null;
+                        continue;
+                    };
+                    if (n == 0) {
+                        sendFrameFile(stdout_file, .eof, s.target, "") catch {};
+                        s.deinit(alloc);
+                        slot.* = null;
+                        continue;
+                    }
+                    try s.read_buf.appendSlice(alloc, daemon_buf[0..n]);
+                }
+
+                if (pollfds[pidx].revents & (c.POLLHUP | c.POLLERR) != 0 and
+                    pollfds[pidx].revents & c.POLLIN == 0)
+                {
+                    sendFrameFile(stdout_file, .eof, s.target, "") catch {};
+                    s.deinit(alloc);
+                    slot.* = null;
+                    continue;
+                }
+
+                // Process complete frames from this daemon's buffer
+                while (s.read_buf.items.len >= session.protocol.header_size) {
+                    const dk = s.read_buf.items[0];
+                    const dplen = std.mem.readInt(u32, s.read_buf.items[4..8], .little);
+                    const dtotal = session.protocol.header_size + dplen;
+                    if (s.read_buf.items.len < dtotal) break;
+
+                    const dkind = std.meta.intToEnum(session.protocol.Kind, dk) catch {
+                        shiftBuffer(&s.read_buf, dtotal);
+                        continue;
+                    };
+                    const dpayload = s.read_buf.items[session.protocol.header_size..dtotal];
+
+                    sendFrameFile(stdout_file, dkind, s.target, dpayload) catch {};
+
+                    if (dkind == .eof) {
+                        shiftBuffer(&s.read_buf, dtotal);
+                        s.deinit(alloc);
+                        slot.* = null;
+                        break;
+                    }
+
+                    shiftBuffer(&s.read_buf, dtotal);
+                }
+            }
+        }
+
+        // Exit if all sessions closed and stdin is gone
+        var any_active = false;
+        for (&sessions) |slot| {
+            if (slot != null) {
+                any_active = true;
+                break;
+            }
+        }
+        if (!any_active and stdin_buf.items.len == 0 and
+            pollfds[0].revents & (c.POLLHUP | c.POLLERR) != 0)
+        {
+            break;
+        }
     }
 
-    const stdin_thread = try std.Thread.spawn(.{}, proxyLocalToSocket, .{fd});
-    defer stdin_thread.join();
-    try proxySocketToLocal(alloc, fd);
     return 0;
+}
+
+fn handleSessionOpen(
+    alloc: Allocator,
+    sessions: *[MAX_MUX_SESSIONS]?MuxSession,
+    target: u16,
+    payload: []const u8,
+    socket_path: []const u8,
+    stdout_file: std.fs.File,
+) !void {
+    const open_data = try session.protocol.SessionOpen.parse(payload);
+
+    var free_idx: ?usize = null;
+    for (0..MAX_MUX_SESSIONS) |i| {
+        if (sessions[i] == null) {
+            free_idx = i;
+            break;
+        }
+    }
+    const idx = free_idx orelse return error.TooManySessions;
+
+    const daemon_fd = try connectUnixSocket(socket_path);
+    errdefer closeFd(daemon_fd);
+
+    var cmd_buf: [512]u8 = undefined;
+    const safe_label = if (open_data.label.len > 0) open_data.label else "session";
+    const cmd = std.fmt.bufPrint(&cmd_buf, "ATTACH NEW {d} {d} {d} {d} {s}\n", .{
+        open_data.resize.rows,
+        open_data.resize.cols,
+        open_data.resize.width_px,
+        open_data.resize.height_px,
+        safe_label,
+    }) catch return error.CommandTooLong;
+    try writeAllFd(daemon_fd, cmd);
+
+    // Read the OK response byte-by-byte (unbuffered) to avoid consuming
+    // any subsequent frame data that the daemon may have already sent.
+    const response = try readLineRawAlloc(alloc, daemon_fd, 4096);
+    defer alloc.free(response);
+    const trimmed = std.mem.trim(u8, response, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "OK ")) {
+        return error.DaemonAttachFailed;
+    }
+
+    const session_id = trimmed["OK ".len..];
+
+    sessions[idx] = .{
+        .target = target,
+        .daemon_fd = daemon_fd,
+        .read_buf = std.ArrayList(u8).empty,
+    };
+
+    sendFrameFile(stdout_file, .session_opened, target, session_id) catch {};
+}
+
+fn findMuxSession(sessions: *[MAX_MUX_SESSIONS]?MuxSession, target: u16) ?*MuxSession {
+    for (sessions) |*slot| {
+        if (slot.*) |*s| {
+            if (s.target == target) return s;
+        }
+    }
+    return null;
+}
+
+fn closeMuxSession(sessions: *[MAX_MUX_SESSIONS]?MuxSession, alloc: Allocator, target: u16) void {
+    for (sessions) |*slot| {
+        if (slot.*) |*s| {
+            if (s.target == target) {
+                s.deinit(alloc);
+                slot.* = null;
+                return;
+            }
+        }
+    }
 }
 
 fn listSessions(
@@ -700,13 +955,23 @@ fn connectUnixSocket(path: []const u8) !posix.fd_t {
     return fd;
 }
 
-fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, payload: []const u8) !void {
+fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
     var file: std.fs.File = .{ .handle = fd };
     var buf: [1024]u8 = undefined;
-    var writer_ = file.writer(&buf);
+    var writer_ = file.writerStreaming(&buf);
     const writer = &writer_.interface;
-    try session.protocol.writeFrame(writer, kind, payload);
+    try session.protocol.writeFrame(writer, kind, target, payload);
     try writer.flush();
+}
+
+fn sendFrameFile(file: std.fs.File, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
+    var header: [session.protocol.header_size]u8 = undefined;
+    header[0] = @intFromEnum(kind);
+    header[1] = 0;
+    std.mem.writeInt(u16, header[2..4], target, .little);
+    std.mem.writeInt(u32, header[4..8], @intCast(payload.len), .little);
+    try file.writeAll(&header);
+    try file.writeAll(payload);
 }
 
 fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
@@ -728,41 +993,13 @@ fn drainFdToWriter(fd: posix.fd_t, writer: *std.Io.Writer) !void {
     try writer.flush();
 }
 
-/// Transparent relay: stdin (SSH channel) → daemon socket.
-/// Forwards raw bytes directly so the daemon receives protocol frames
-/// (.stdin, .resize, .detach) from the client without re-framing.
-fn proxyLocalToSocket(fd: posix.fd_t) void {
-    var stdin_file: std.fs.File = .stdin();
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = stdin_file.read(&buf) catch break;
-        if (n == 0) break;
-        writeAllFd(fd, buf[0..n]) catch break;
+fn shiftBuffer(buf: *std.ArrayList(u8), amount: usize) void {
+    if (amount >= buf.items.len) {
+        buf.shrinkRetainingCapacity(0);
+    } else {
+        std.mem.copyForwards(u8, buf.items, buf.items[amount..]);
+        buf.shrinkRetainingCapacity(buf.items.len - amount);
     }
-}
-
-/// Transparent relay: daemon socket → stdout (SSH channel).
-/// Forwards raw bytes directly so the client receives protocol frames
-/// (.stdout, .eof, .err) from the daemon without stripping.
-fn proxySocketToLocal(alloc: Allocator, fd: posix.fd_t) !void {
-    _ = alloc;
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = posix.read(fd, &buf) catch break;
-        if (n == 0) break;
-        std.fs.File.stdout().writeAll(buf[0..n]) catch break;
-    }
-}
-
-fn localResize() session.protocol.Resize {
-    var ws: ptypkg.winsize = .{};
-    _ = c.ioctl(posix.STDIN_FILENO, c.TIOCGWINSZ, @intFromPtr(&ws));
-    return .{
-        .rows = ws.ws_row,
-        .cols = ws.ws_col,
-        .width_px = ws.ws_xpixel,
-        .height_px = ws.ws_ypixel,
-    };
 }
 
 fn closeFd(fd: posix.fd_t) void {
@@ -775,12 +1012,32 @@ fn readLineAlloc(alloc: Allocator, fd: posix.fd_t, max_bytes: usize) ![]u8 {
 
     var file: std.fs.File = .{ .handle = fd };
     var reader_buf: [1024]u8 = undefined;
-    var reader_ = file.reader(&reader_buf);
+    // Use readerStreaming for sockets — file.reader() defaults to positional
+    // mode (preadv) which panics on non-seekable fds in Zig 0.15.
+    var reader_ = file.readerStreaming(&reader_buf);
     const reader = &reader_.interface;
 
     while (bytes.items.len < max_bytes) {
         var byte: [1]u8 = undefined;
         reader.readSliceAll(&byte) catch break;
+        if (byte[0] == '\n') break;
+        try bytes.append(alloc, byte[0]);
+    }
+
+    return try bytes.toOwnedSlice(alloc);
+}
+
+/// Read a line from fd byte-by-byte using raw posix.read (no buffering).
+/// This ensures we never consume data beyond the newline, which is critical
+/// for the multiplex helper where subsequent bytes are binary frame data.
+fn readLineRawAlloc(alloc: Allocator, fd: posix.fd_t, max_bytes: usize) ![]u8 {
+    var bytes = std.ArrayList(u8).empty;
+    errdefer bytes.deinit(alloc);
+
+    while (bytes.items.len < max_bytes) {
+        var byte: [1]u8 = undefined;
+        const n = posix.read(fd, &byte) catch break;
+        if (n == 0) break;
         if (byte[0] == '\n') break;
         try bytes.append(alloc, byte[0]);
     }

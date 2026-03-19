@@ -8,6 +8,9 @@ const helper = @import("../session/helper.zig");
 pub const Options = struct {
     _arena: ?ArenaAllocator = null,
 
+    /// Print the session protocol version and exit.
+    @"protocol-version": bool = false,
+
     /// Start the remote helper as a background daemon and return immediately.
     daemonize: bool = false,
 
@@ -73,6 +76,7 @@ pub fn run(alloc: Allocator) !u8 {
     const stderr = &stderr_writer_.interface;
 
     const rc = try helper.run(alloc, .{
+        .@"protocol-version" = opts.@"protocol-version",
         .daemonize = opts.daemonize,
         .daemon = opts.daemon,
         .list = opts.list,
