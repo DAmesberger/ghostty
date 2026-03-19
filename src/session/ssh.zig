@@ -18,6 +18,11 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
 
 const log = std.log.scoped(.session_ssh);
 
+/// POSIX EAGAIN as a negative value — this is what libssh2's transport layer
+/// expects custom send/recv callbacks to return for "try again".
+/// (-11 on Linux, -35 on macOS)
+const posix_EAGAIN: isize = -@as(isize, @intFromEnum(std.posix.E.AGAIN));
+
 pub const Error = error{
     SshInitFailed,
     SshHandshakeFailed,
@@ -129,7 +134,7 @@ pub const SshSession = struct {
                     const hm = std.fmt.bufPrint(&hb, "[tunnel] handshake EAGAIN iter={d}\n", .{handshake_iters}) catch "";
                     dbg.writeAll(hm) catch {};
                 }
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                waitsocket(self.session, self.sock);
                 continue;
             }
             {
@@ -141,6 +146,12 @@ pub const SshSession = struct {
             _ = c.close(dummy_fd);
             return error.SshHandshakeFailed;
         }
+
+        // Restore blocking mode for the inner session. Subsequent
+        // operations (auth, exec) expect blocking semantics. In
+        // blocking mode, libssh2 handles EAGAIN from our custom
+        // callbacks internally by retrying.
+        ssh2.libssh2_session_set_blocking(inner, 1);
 
         return .{
             .alloc = self.alloc,
@@ -162,7 +173,18 @@ pub const SshSession = struct {
         const agent = ssh2.libssh2_agent_init(self.session) orelse return error.SshAgentFailed;
         defer ssh2.libssh2_agent_free(agent);
 
-        if (ssh2.libssh2_agent_connect(agent) != 0) return error.SshAgentFailed;
+        if (ssh2.libssh2_agent_connect(agent) != 0) {
+            const dbg = std.fs.File.stderr();
+            var errmsg: [*c]u8 = null;
+            var errmsg_len: c_int = 0;
+            _ = ssh2.libssh2_session_last_error(self.session, &errmsg, &errmsg_len, 0);
+            if (errmsg != null and errmsg_len > 0) {
+                dbg.writeAll("[auth] agent connect error: ") catch {};
+                dbg.writeAll(errmsg[0..@intCast(errmsg_len)]) catch {};
+                dbg.writeAll("\n") catch {};
+            }
+            return error.SshAgentFailed;
+        }
         defer _ = ssh2.libssh2_agent_disconnect(agent);
 
         if (ssh2.libssh2_agent_list_identities(agent) != 0) return error.SshAgentFailed;
@@ -218,13 +240,26 @@ pub const SshSession = struct {
         defer if (pass_z) |p| self.alloc.free(p);
         if (passphrase) |p| pass_z = try allocSentinel(self.alloc, p);
 
-        if (ssh2.libssh2_userauth_publickey_fromfile(
+        const rc = ssh2.libssh2_userauth_publickey_fromfile(
             self.session,
             user_z.ptr,
             if (pub_z) |p| p.ptr else null,
             priv_z.ptr,
             if (pass_z) |p| p.ptr else null,
-        ) != 0) {
+        );
+        if (rc != 0) {
+            const dbg = std.fs.File.stderr();
+            var errmsg: [*c]u8 = null;
+            var errmsg_len: c_int = 0;
+            _ = ssh2.libssh2_session_last_error(self.session, &errmsg, &errmsg_len, 0);
+            if (errmsg != null and errmsg_len > 0) {
+                dbg.writeAll("[auth] pubkey error: ") catch {};
+                dbg.writeAll(errmsg[0..@intCast(errmsg_len)]) catch {};
+                dbg.writeAll("\n") catch {};
+            }
+            var b: [60]u8 = undefined;
+            const m = std.fmt.bufPrint(&b, "[auth] pubkey rc={d}\n", .{rc}) catch "";
+            dbg.writeAll(m) catch {};
             return error.SshAuthFailed;
         }
     }
@@ -328,7 +363,7 @@ pub const SshSession = struct {
 
             if (ssh2.libssh2_channel_eof(channel.inner) != 0) break;
 
-            if (!did_work) std.Thread.sleep(1 * std.time.ns_per_ms);
+            if (!did_work) waitsocket(self.session, self.getPollSocket());
         }
 
         // Restore original blocking mode
@@ -344,6 +379,8 @@ pub const SshSession = struct {
     }
 
     /// Upload a local file to the remote host via SCP.
+    /// Uses non-blocking mode with proper polling so it works through
+    /// tunneled connections without busy-spinning.
     pub fn upload(
         self: *SshSession,
         local_path: []const u8,
@@ -359,17 +396,33 @@ pub const SshSession = struct {
         const remote_z = try allocSentinel(self.alloc, remote_path);
         defer self.alloc.free(remote_z);
 
-        const scp_channel = ssh2.libssh2_scp_send64(
-            self.session,
-            remote_z.ptr,
-            @intCast(mode),
-            @intCast(file_size),
-            0,
-            0,
-        ) orelse return error.SshScpSendFailed;
+        const was_blocking = ssh2.libssh2_session_get_blocking(self.session);
+        ssh2.libssh2_session_set_blocking(self.session, 0);
+
+        // Open SCP channel (may return EAGAIN through tunnel)
+        const scp_channel = while (true) {
+            const ch = ssh2.libssh2_scp_send64(
+                self.session,
+                remote_z.ptr,
+                @intCast(mode),
+                @intCast(file_size),
+                0,
+                0,
+            );
+            if (ch) |channel| break channel;
+            const err = ssh2.libssh2_session_last_errno(self.session);
+            if (err == ssh2.LIBSSH2_ERROR_EAGAIN) {
+                waitsocket(self.session, self.getPollSocket());
+                continue;
+            }
+            ssh2.libssh2_session_set_blocking(self.session, was_blocking);
+            return error.SshScpSendFailed;
+        };
         defer _ = ssh2.libssh2_channel_free(scp_channel);
 
+        const dbg = std.fs.File.stderr();
         var remaining: usize = file_size;
+        var total_written: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
         while (remaining > 0) {
             const to_read = @min(remaining, buf.len);
@@ -377,17 +430,43 @@ pub const SshSession = struct {
             if (n == 0) break;
 
             var written: usize = 0;
+            var eagain_count: u32 = 0;
             while (written < n) {
                 const rc = channelWrite(scp_channel, buf[written..n].ptr, n - written);
-                if (rc < 0) return error.SshDisconnected;
+                if (rc == ssh2.LIBSSH2_ERROR_EAGAIN or rc == 0) {
+                    eagain_count += 1;
+                    if (eagain_count % 500 == 0) {
+                        const dir = ssh2.libssh2_session_block_directions(self.session);
+                        var db: [120]u8 = undefined;
+                        const dm = std.fmt.bufPrint(&db, "[upload] EAGAIN cnt={d} rc={d} dir={d} written={d}/{d} total={d}/{d}\n", .{ eagain_count, rc, dir, written, n, total_written, file_size }) catch "";
+                        dbg.writeAll(dm) catch {};
+                    }
+                    waitsocket(self.session, self.getPollSocket());
+                    continue;
+                }
+                if (rc < 0) {
+                    var eb: [80]u8 = undefined;
+                    const em = std.fmt.bufPrint(&eb, "[upload] write error rc={d}\n", .{rc}) catch "";
+                    dbg.writeAll(em) catch {};
+                    ssh2.libssh2_session_set_blocking(self.session, was_blocking);
+                    return error.SshDisconnected;
+                }
+                eagain_count = 0;
                 written += @intCast(rc);
+                total_written += @intCast(rc);
             }
             remaining -= n;
         }
 
-        _ = ssh2.libssh2_channel_send_eof(scp_channel);
-        _ = ssh2.libssh2_channel_wait_eof(scp_channel);
-        _ = ssh2.libssh2_channel_wait_closed(scp_channel);
+        // Send EOF and wait for close (handle EAGAIN)
+        while (ssh2.libssh2_channel_send_eof(scp_channel) == ssh2.LIBSSH2_ERROR_EAGAIN)
+            waitsocket(self.session, self.getPollSocket());
+        while (ssh2.libssh2_channel_wait_eof(scp_channel) == ssh2.LIBSSH2_ERROR_EAGAIN)
+            waitsocket(self.session, self.getPollSocket());
+        while (ssh2.libssh2_channel_wait_closed(scp_channel) == ssh2.LIBSSH2_ERROR_EAGAIN)
+            waitsocket(self.session, self.getPollSocket());
+
+        ssh2.libssh2_session_set_blocking(self.session, was_blocking);
     }
 
     /// Open a new SSH channel. Uses non-blocking polling internally
@@ -406,7 +485,7 @@ pub const SshSession = struct {
                 var b2: [80]u8 = undefined;
                 const m2 = std.fmt.bufPrint(&b2, "[ssh] openChannel OK after {d} iters\n", .{iterations}) catch "";
                 dbg.writeAll(m2) catch {};
-                return .{ .inner = channel, .alloc = self.alloc, .ssh_session = self.session, .sock = self.sock };
+                return .{ .inner = channel, .alloc = self.alloc, .ssh_session = self.session, .sock = self.getPollSocket() };
             }
             const err = ssh2.libssh2_session_last_errno(self.session);
             if (err == ssh2.LIBSSH2_ERROR_EAGAIN) {
@@ -416,7 +495,7 @@ pub const SshSession = struct {
                     const m3 = std.fmt.bufPrint(&b3, "[ssh] openChannel EAGAIN iter={d} dir={d}\n", .{ iterations, dir }) catch "";
                     dbg.writeAll(m3) catch {};
                 }
-                waitsocket(self.session, self.sock);
+                waitsocket(self.session, self.getPollSocket());
                 continue;
             }
             var b4: [80]u8 = undefined;
@@ -426,10 +505,21 @@ pub const SshSession = struct {
         }
     }
 
-    /// Get the underlying socket fd (for polling).
+    /// Get the underlying socket fd. For tunneled sessions this returns
+    /// the dummy fd (used by libssh2 for setsockopt/fcntl). Use
+    /// `getPollSocket()` for the fd you should actually poll on.
     pub fn getSocket(self: *const SshSession) posix.fd_t {
         return self.sock;
     }
+
+    /// Get the socket fd suitable for polling. For tunneled sessions
+    /// this returns the jump host's real TCP socket; for direct
+    /// sessions it returns `self.sock`.
+    pub fn getPollSocket(self: *const SshSession) posix.fd_t {
+        if (self.jump) |j| return j.jump_sock;
+        return self.sock;
+    }
+
 
     /// Set session blocking mode. 0 = non-blocking, 1 = blocking.
     pub fn setBlocking(self: *SshSession, blocking: c_int) void {
@@ -567,7 +657,8 @@ fn tunnelRecv(
     };
     const state: *TunnelState = @ptrCast(@alignCast(ptr));
     const rc = channelRead(state.channel, @ptrCast(buffer), length);
-    if (rc != ssh2.LIBSSH2_ERROR_EAGAIN and rc <= 0) {
+    if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) return posix_EAGAIN;
+    if (rc <= 0) {
         const dbg = std.fs.File.stderr();
         var b: [60]u8 = undefined;
         const m = std.fmt.bufPrint(&b, "[tunnelRecv] rc={d} len={d}\n", .{ rc, length }) catch "";
@@ -590,7 +681,8 @@ fn tunnelSend(
     };
     const state: *TunnelState = @ptrCast(@alignCast(ptr));
     const rc = channelWrite(state.channel, @ptrCast(buffer), length);
-    if (rc != ssh2.LIBSSH2_ERROR_EAGAIN and rc < 0) {
+    if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) return posix_EAGAIN;
+    if (rc < 0) {
         const dbg = std.fs.File.stderr();
         var b: [60]u8 = undefined;
         const m = std.fmt.bufPrint(&b, "[tunnelSend] rc={d} len={d}\n", .{ rc, length }) catch "";
@@ -637,17 +729,18 @@ fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
 }
 
 /// Wait for the socket to become ready in the direction libssh2 needs.
-/// This is the correct way to handle EAGAIN — poll for the exact condition
-/// that libssh2 is waiting on instead of blind sleep-and-retry.
+/// Uses `libssh2_session_block_directions` on the given session to poll
+/// the exact condition. For tunneled sessions, callers should pass the
+/// *inner* session — its block directions correctly reflect the TCP
+/// socket's needs because BLOCK_INBOUND is set when tunnelRecv got
+/// EAGAIN (TCP needs POLLIN) and BLOCK_OUTBOUND when tunnelSend got
+/// EAGAIN (TCP needs POLLOUT).
 fn waitsocket(sess: *ssh2.LIBSSH2_SESSION, sock: posix.fd_t) void {
     const dir = ssh2.libssh2_session_block_directions(sess);
     var events: c_short = 0;
     if (dir & ssh2.LIBSSH2_SESSION_BLOCK_INBOUND != 0) events |= c.POLLIN;
     if (dir & ssh2.LIBSSH2_SESSION_BLOCK_OUTBOUND != 0) events |= c.POLLOUT;
-    if (events == 0) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-        return;
-    }
+    if (events == 0) events = c.POLLIN | c.POLLOUT;
     var fds = [1]c.struct_pollfd{.{ .fd = sock, .events = events, .revents = 0 }};
     _ = c.poll(&fds, 1, 100);
 }
