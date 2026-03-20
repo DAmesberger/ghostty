@@ -106,11 +106,30 @@ pub const Message = union(enum) {
     /// SSH connection state change for overlay display.
     connection_state: session.protocol.ConnectionState,
 
+    /// Layout restore from remote daemon — the client should recreate
+    /// its split tree from this blob. The blob is heap-allocated via
+    /// page_allocator and must be freed by the receiver.
+    layout_restore: LayoutRestore,
+
     /// Search progress update
     search_total: ?usize,
 
     /// Selected search index change
     search_selected: ?usize,
+
+    pub const LayoutRestore = struct {
+        /// Heap-allocated layout blob (via page_allocator). Receiver frees.
+        blob: [*]const u8,
+        len: u32,
+
+        pub fn slice(self: LayoutRestore) []const u8 {
+            return self.blob[0..self.len];
+        }
+
+        pub fn deinit(self: LayoutRestore) void {
+            std.heap.page_allocator.free(self.blob[0..self.len]);
+        }
+    };
 
     pub const ReportTitleStyle = enum {
         csi_21_t,
@@ -193,6 +212,20 @@ pub fn newConfig(
         if (shouldInheritWorkingDirectory(context, config)) {
             if (try p.pwd(alloc)) |pwd| {
                 copy.@"working-directory" = .{ .path = pwd };
+            }
+        }
+
+        // For splits from remote surfaces: propagate the group_id so the
+        // new surface joins the same session group on the daemon.
+        if (context == .split and config.@"ssh-target" != null) {
+            switch (p.io.backend) {
+                .remote => |remote| {
+                    if (!session.shared.isZeroUuid(remote.group_id)) {
+                        const hex = session.shared.formatUuid(remote.group_id);
+                        copy.@"ssh-group-id" = try alloc.dupe(u8, &hex);
+                    }
+                },
+                else => {},
             }
         }
     }

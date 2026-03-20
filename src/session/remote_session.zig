@@ -30,14 +30,22 @@ const Command = @import("../Command.zig");
 
 const log = std.log.scoped(.remote_session);
 
+pub const Uuid = session.shared.Uuid;
+
 pub const RemoteSession = struct {
     alloc: Allocator,
     id: []u8,
     label: []u8,
+    surface_id: Uuid,
     pty: Pty,
     command: Command,
     terminal_instance: Terminal,
     stream: HeadlessHandler.Stream,
+
+    /// Optional back-reference to the owning SessionGroup.
+    /// Set when the session belongs to a multi-surface group.
+    /// Used by attachAndServe to store layout_update blobs.
+    group: ?*SessionGroup = null,
 
     /// Protects: terminal_instance, attached_fd, attached_target, alive.
     /// Both readerMain and attachAndServe must hold this when accessing
@@ -48,7 +56,11 @@ pub const RemoteSession = struct {
 
     created_at: i64,
     alive: bool = true,
+    /// Set to true when the client sends surface_close (permanent close, not detach).
+    closed: bool = false,
     reader_thread: std.Thread = undefined,
+
+    pub const SessionGroup = @import("helper.zig").SessionGroup;
 
     pub fn deinit(self: *RemoteSession) void {
         self.stream.handler.deinit();
@@ -167,6 +179,16 @@ pub const RemoteSession = struct {
                         .ws_xpixel = parsed.width_px,
                         .ws_ypixel = parsed.height_px,
                     }) catch {};
+                },
+                .layout_update => {
+                    // Store layout blob in the owning group (opaque, for reconnect)
+                    if (self.group) |group| {
+                        group.updateLayout(self.alloc, payload);
+                    }
+                },
+                .surface_close => {
+                    self.closed = true;
+                    break;
                 },
                 .detach => break,
                 else => {},

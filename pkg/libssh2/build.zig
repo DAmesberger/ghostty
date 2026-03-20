@@ -19,13 +19,12 @@ pub fn build(b: *std.Build) !void {
         try apple_sdk.addPaths(b, lib);
     }
 
-    // Link mbedTLS
-    if (b.lazyDependency(
-        "mbedtls",
-        .{ .target = target, .optimize = optimize },
-    )) |mbedtls_dep| {
-        lib.linkLibrary(mbedtls_dep.artifact("mbedtls"));
-    }
+    // Link system OpenSSL (libcrypto + libssl)
+    lib.linkSystemLibrary("libcrypto");
+    lib.linkSystemLibrary("libssl");
+
+    // Link zlib for SSH compression (zlib@openssh.com)
+    lib.linkSystemLibrary("zlib");
 
     // Add our generated config header
     lib.addIncludePath(b.path(""));
@@ -43,7 +42,7 @@ pub fn build(b: *std.Build) !void {
         defer flags.deinit(b.allocator);
         try flags.appendSlice(b.allocator, &.{
             "-DHAVE_CONFIG_H",
-            "-DLIBSSH2_MBEDTLS",
+            "-DLIBSSH2_OPENSSL",
         });
 
         lib.addCSourceFiles(.{
@@ -56,8 +55,8 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(lib);
 }
 
-/// libssh2 source files for the mbedTLS backend.
-/// Excludes backend-specific files for other backends (openssl, libgcrypt,
+/// libssh2 source files for the OpenSSL backend.
+/// Excludes backend-specific files for other backends (mbedtls, libgcrypt,
 /// wincng, os400qc3) and platform-specific files (agent_win).
 const srcs: []const []const u8 = &.{
     "agent.c",
@@ -75,8 +74,8 @@ const srcs: []const []const u8 = &.{
     "kex.c",
     "knownhost.c",
     "mac.c",
-    "mbedtls.c",
     "misc.c",
+    "openssl.c",
     "packet.c",
     "pem.c",
     "poly1305.c",

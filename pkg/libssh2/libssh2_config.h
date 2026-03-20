@@ -1,4 +1,4 @@
-/* Generated configuration for libssh2 with mbedTLS backend */
+/* Generated configuration for libssh2 with OpenSSL backend */
 
 /* Headers */
 #define HAVE_UNISTD_H 1
@@ -24,5 +24,8 @@
 #define HAVE_O_NONBLOCK 1
 #define HAVE_FIONBIO 1
 
-/* Use mbedTLS as the crypto backend */
-#define LIBSSH2_MBEDTLS 1
+/* Use OpenSSL as the crypto backend */
+#define LIBSSH2_OPENSSL 1
+
+/* Enable zlib compression (zlib@openssh.com) */
+#define LIBSSH2_HAVE_ZLIB 1

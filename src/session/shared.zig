@@ -85,6 +85,74 @@ pub fn generateSessionId(alloc: Allocator) ![]u8 {
     );
 }
 
+/// 128-bit UUID used for group_id and surface_id in multi-surface sessions.
+/// Transmitted as 16 raw bytes on the wire for efficiency.
+pub const Uuid = [16]u8;
+
+/// Generate a random v4 UUID.
+pub fn generateUuid() Uuid {
+    var uuid: Uuid = undefined;
+    std.crypto.random.bytes(&uuid);
+    // Set version 4 (bits 48-51)
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    // Set variant 1 (bits 64-65)
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    return uuid;
+}
+
+/// Format a UUID as a hex string (32 lowercase hex chars, no dashes).
+pub fn formatUuid(uuid: Uuid) [32]u8 {
+    return std.fmt.bytesToHex(uuid, .lower);
+}
+
+/// Format a UUID as a standard dashed string (36 chars: 8-4-4-4-12).
+pub fn formatUuidDashed(uuid: Uuid) [36]u8 {
+    const hex = std.fmt.bytesToHex(uuid, .lower);
+    var out: [36]u8 = undefined;
+    @memcpy(out[0..8], hex[0..8]);
+    out[8] = '-';
+    @memcpy(out[9..13], hex[8..12]);
+    out[13] = '-';
+    @memcpy(out[14..18], hex[12..16]);
+    out[18] = '-';
+    @memcpy(out[19..23], hex[16..20]);
+    out[23] = '-';
+    @memcpy(out[24..36], hex[20..32]);
+    return out;
+}
+
+/// Parse a UUID from a 32-char hex string (no dashes).
+pub fn parseUuid(hex: []const u8) !Uuid {
+    if (hex.len != 32) return error.InvalidUuid;
+    var uuid: Uuid = undefined;
+    for (0..16) |i| {
+        uuid[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return error.InvalidUuid;
+    }
+    return uuid;
+}
+
+/// Parse a UUID from a 36-char dashed string (8-4-4-4-12).
+pub fn parseUuidDashed(s: []const u8) !Uuid {
+    if (s.len != 36) return error.InvalidUuid;
+    if (s[8] != '-' or s[13] != '-' or s[18] != '-' or s[23] != '-') return error.InvalidUuid;
+    // Strip dashes and parse as hex
+    var hex: [32]u8 = undefined;
+    @memcpy(hex[0..8], s[0..8]);
+    @memcpy(hex[8..12], s[9..13]);
+    @memcpy(hex[12..16], s[14..18]);
+    @memcpy(hex[16..20], s[19..23]);
+    @memcpy(hex[20..32], s[24..36]);
+    return parseUuid(&hex);
+}
+
+/// The zero UUID, used as a sentinel for "no ID".
+pub const zero_uuid: Uuid = .{0} ** 16;
+
+/// Check if a UUID is the zero sentinel.
+pub fn isZeroUuid(uuid: Uuid) bool {
+    return std.mem.eql(u8, &uuid, &zero_uuid);
+}
+
 pub const Platform = struct {
     os: []const u8,
     arch: []const u8,

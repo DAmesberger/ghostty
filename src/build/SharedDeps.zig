@@ -240,8 +240,10 @@ pub fn add(
         }
     }
 
-    // libssh2 (with mbedTLS backend) — used for native SSH transport
+    // libssh2 (with OpenSSL backend) — used for native SSH transport
     // in remote sessions via @cImport. Only needed on non-Windows platforms.
+    // Links system OpenSSL (libcrypto + libssl) for Ed25519 and other
+    // modern key type support.
     if (step.rootModuleTarget().os.tag != .windows) {
         _ = b.systemIntegrationOption("libssh2", .{}); // Shows it in help
         if (b.systemIntegrationOption("libssh2", .{})) {
@@ -255,18 +257,6 @@ pub fn add(
                 try static_libs.append(
                     b.allocator,
                     libssh2_dep.artifact("ssh2").getEmittedBin(),
-                );
-            }
-
-            // Also need mbedTLS static lib (libssh2's crypto backend)
-            if (b.lazyDependency("mbedtls", .{
-                .target = target,
-                .optimize = optimize,
-            })) |mbedtls_dep| {
-                step.linkLibrary(mbedtls_dep.artifact("mbedtls"));
-                try static_libs.append(
-                    b.allocator,
-                    mbedtls_dep.artifact("mbedtls").getEmittedBin(),
                 );
             }
         }
