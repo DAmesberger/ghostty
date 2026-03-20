@@ -763,7 +763,7 @@ pub const Action = union(enum) {
     /// The remote session continues running on the SSH target and can later
     /// be rediscovered with `ghostty +session-list` and reattached with
     /// `ghostty +session-attach`.
-    session_detach,
+    ssh_session_detach,
 
     /// Reconnect the current Ghostty remote session after a transport loss.
     ///
@@ -771,7 +771,24 @@ pub const Action = union(enum) {
     /// Use this when the current attached surface is disconnected but the
     /// remote session is still alive. To open a detached session from a new
     /// window later, use `ghostty +session-attach`.
-    session_reconnect,
+    ssh_session_reconnect,
+
+    /// Open the SSH connection picker to connect to a saved SSH host or
+    /// enter an ad-hoc SSH target (e.g. user@hostname).
+    ///
+    /// Shows a dialog listing hosts parsed from ~/.ssh/config. Selecting
+    /// a host opens a new Ghostty window with an SSH remote session to
+    /// that host. You can also type an arbitrary user@host target in the
+    /// search field and press Enter to connect directly. This requires
+    /// the ssh-session feature.
+    open_ssh_connection,
+
+    /// Attach to a detached Ghostty remote session.
+    ///
+    /// Opens the SSH connection picker, then shows a list of available
+    /// sessions on the selected host. Selecting a session opens a new
+    /// Ghostty window attached to that remote session.
+    ssh_session_attach,
 
     /// Toggle the quick terminal.
     ///
@@ -1377,8 +1394,10 @@ pub const Action = union(enum) {
             .toggle_secure_input,
             .toggle_mouse_reporting,
             .toggle_command_palette,
-            .session_detach,
-            .session_reconnect,
+            .ssh_session_detach,
+            .ssh_session_reconnect,
+            .open_ssh_connection,
+            .ssh_session_attach,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

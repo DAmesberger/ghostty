@@ -1,9 +1,11 @@
 pub const shared = @import("session/shared.zig");
 pub const protocol = @import("session/protocol.zig");
+pub const layout = @import("session/layout.zig");
 pub const registry = @import("session/registry.zig");
 pub const client = @import("session/client.zig");
 pub const helper = @import("session/helper.zig");
 pub const ssh = @import("session/ssh.zig");
+pub const ssh_config = @import("session/ssh_config.zig");
 pub const remote_session = @import("session/remote_session.zig");
 
 test {

@@ -18,7 +18,6 @@ const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
-const ConnectionOverlay = @import("ConnectionOverlay.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -231,9 +230,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
-
-        /// Connection status overlay, if any.
-        connection_overlay: ?ConnectionOverlay = null,
 
         const HighlightTag = enum(u8) {
             search_match,
@@ -802,7 +798,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.connection_overlay) |*co| co.deinit(self.alloc);
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
@@ -1362,13 +1357,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             };
 
-            // Rebuild connection overlay if we have connection state.
-            self.rebuildConnectionOverlay(
-                critical.connection_state,
-            ) catch |err| {
-                log.warn("error rebuilding connection overlay err={}", .{err});
-            };
-
             // Acquire the draw mutex for all remaining state updates.
             {
                 self.draw_mutex.lock();
@@ -1426,14 +1414,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.overlay,
                 ) catch |err| {
                     log.warn("error updating overlay images err={}", .{err});
-                };
-
-                // Prepare connection overlay image for upload.
-                self.images.connectionOverlayUpdate(
-                    self.alloc,
-                    self.connection_overlay,
-                ) catch |err| {
-                    log.warn("error updating connection overlay images err={}", .{err});
                 };
 
                 // Update custom shader uniforms that depend on terminal state.
@@ -1710,13 +1690,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay,
                 );
 
-                // Connection status overlay (SSH remote sessions).
-                if (self.connection_overlay != null) self.images.draw(
-                    &self.api,
-                    self.shaders.pipelines.image,
-                    &pass,
-                    .connection_overlay,
-                );
             }
 
             // If we have custom shaders, then we render them.
@@ -2322,42 +2295,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Build the connection overlay if there's an active connection state.
-        fn rebuildConnectionOverlay(
-            self: *Self,
-            connection_state: ?@import("../session.zig").protocol.ConnectionState,
-        ) ConnectionOverlay.InitError!void {
-            const alloc = self.alloc;
-
-            if (connection_state == null) {
-                if (self.connection_overlay) |*old| {
-                    old.deinit(alloc);
-                    self.connection_overlay = null;
-                }
-                return;
-            }
-
-            const co: *ConnectionOverlay = co: {
-                if (self.connection_overlay) |*v| existing: {
-                    const width: u32 = @intCast(v.surface.getWidth());
-                    const height: u32 = @intCast(v.surface.getHeight());
-                    const term_size = self.size.terminal();
-                    if (width != term_size.width or height != term_size.height)
-                        break :existing;
-                    break :co v;
-                }
-
-                if (self.connection_overlay) |*v| {
-                    v.deinit(alloc);
-                    self.connection_overlay = null;
-                }
-
-                const new: ConnectionOverlay = try .init(alloc, self.size);
-                self.connection_overlay = new;
-                break :co &self.connection_overlay.?;
-            };
-            co.draw(alloc, connection_state.?);
-        }
-
         const PreeditRange = struct {
             y: terminal.size.CellCountInt,
             x: [2]terminal.size.CellCountInt,

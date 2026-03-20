@@ -22,10 +22,16 @@ mutex: std.Thread.Mutex = .{},
 connections: std.StringArrayHashMap(Entry),
 alloc: Allocator,
 
+pub const Uuid = session.shared.Uuid;
+
 pub const SurfaceSlot = struct {
     target_id: u16,
     io: *termio.Termio,
     surface_mailbox: *apprt.surface.Mailbox,
+    /// Stable surface UUID for reconnect (survives target_id changes).
+    surface_id: Uuid = session.shared.zero_uuid,
+    /// Group UUID this surface belongs to (for reconnect).
+    group_id: Uuid = session.shared.zero_uuid,
 };
 
 pub const WriteRequest = struct {
@@ -76,6 +82,18 @@ pub const Entry = struct {
     // Reconnect state
     reconnect_count: u32 = 0,
     max_reconnect_time_ns: i128 = 5 * 60 * std.time.ns_per_s, // 5 minutes
+
+    // Authentication state (for password prompts)
+    auth_state: AuthState = .{},
+
+    pub const AuthState = struct {
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        /// Password provided by the GTK thread. null = not yet provided.
+        password: ?[]const u8 = null,
+        /// True if the user cancelled the password prompt.
+        cancelled: bool = false,
+    };
 };
 
 pub fn init(alloc: Allocator) SshConnectionManager {
@@ -150,7 +168,16 @@ pub fn allocateTarget(self: *SshConnectionManager, entry: *Entry) u16 {
 }
 
 /// Register a surface for frame dispatch from the SSH thread.
-pub fn registerSurface(entry: *Entry, target_id: u16, io: *termio.Termio, mailbox: *apprt.surface.Mailbox) void {
+/// Returns true on success, false if the maximum number of surfaces
+/// has been reached (caller should report error to user).
+pub fn registerSurface(
+    entry: *Entry,
+    target_id: u16,
+    io: *termio.Termio,
+    mailbox: *apprt.surface.Mailbox,
+    surface_id: Uuid,
+    group_id: Uuid,
+) bool {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
     for (&entry.surfaces) |*slot| {
@@ -159,11 +186,14 @@ pub fn registerSurface(entry: *Entry, target_id: u16, io: *termio.Termio, mailbo
                 .target_id = target_id,
                 .io = io,
                 .surface_mailbox = mailbox,
+                .surface_id = surface_id,
+                .group_id = group_id,
             };
-            return;
+            return true;
         }
     }
     log.err("max surfaces ({d}) exceeded for SSH connection", .{MAX_SURFACES});
+    return false;
 }
 
 /// Unregister a surface. After this returns, the SSH thread will not
@@ -232,6 +262,12 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
             std.heap.page_allocator.free(req.data);
         }
         entry.write_queue.deinit(std.heap.page_allocator);
+
+        // Free password if one was provided
+        if (entry.auth_state.password) |pw| {
+            std.heap.page_allocator.free(pw);
+            entry.auth_state.password = null;
+        }
 
         if (entry.helper_path.len > 0) self.alloc.free(entry.helper_path);
         if (entry.channel) |*ch| ch.close();
@@ -472,17 +508,52 @@ fn attemptReconnect(entry: *Entry) bool {
         sess.setBlocking(0);
         entry.channel = new_channel;
 
-        // Re-open sessions for all registered surfaces
+        // Re-open sessions for registered surfaces using their stable IDs.
+        // For grouped sessions, only send session_open(attach) for the first
+        // surface — the daemon will reply with layout_restore, and the UI
+        // layer will re-open individual surfaces with correct sizes.
+        // For non-grouped surfaces, send session_open(attach) individually.
         entry.surfaces_mutex.lock();
+        var group_sent = std.AutoArrayHashMap(session.shared.Uuid, void).init(std.heap.page_allocator);
+        defer group_sent.deinit();
         for (entry.surfaces) |slot| {
             if (slot) |s| {
-                const open_payload = (session.protocol.SessionOpen{
-                    .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
-                    .mode = .attach,
-                    .label_or_id = "reconnected",
-                }).encode(std.heap.page_allocator) catch continue;
-                defer std.heap.page_allocator.free(open_payload);
-                sendFrame(&entry.channel.?, .session_open, s.target_id, open_payload) catch {};
+                if (!session.shared.isZeroUuid(s.group_id)) {
+                    // Only send one session_open(attach) per group
+                    if (group_sent.contains(s.group_id)) continue;
+                    group_sent.put(s.group_id, {}) catch continue;
+
+                    const open_payload = (session.protocol.SessionOpen{
+                        .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
+                        .mode = .attach,
+                        .surface_id = s.surface_id,
+                        .group_id = s.group_id,
+                        .label = "reconnected",
+                    }).encode(std.heap.page_allocator) catch continue;
+                    defer std.heap.page_allocator.free(open_payload);
+                    sendFrame(&entry.channel.?, .session_open, s.target_id, open_payload) catch {
+                        log.warn("reconnect: failed to re-open group for target={d}", .{s.target_id});
+                        _ = s.surface_mailbox.push(.{
+                            .child_exited = .{ .exit_code = 1, .runtime_ms = 0 },
+                        }, .{ .forever = {} });
+                    };
+                } else {
+                    // Standalone surface: use session_open(attach) with surface_id
+                    const open_payload = (session.protocol.SessionOpen{
+                        .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
+                        .mode = .attach,
+                        .surface_id = s.surface_id,
+                        .group_id = s.group_id,
+                        .label = "reconnected",
+                    }).encode(std.heap.page_allocator) catch continue;
+                    defer std.heap.page_allocator.free(open_payload);
+                    sendFrame(&entry.channel.?, .session_open, s.target_id, open_payload) catch {
+                        log.warn("reconnect: failed to re-open surface target={d}", .{s.target_id});
+                        _ = s.surface_mailbox.push(.{
+                            .child_exited = .{ .exit_code = 1, .runtime_ms = 0 },
+                        }, .{ .forever = {} });
+                    };
+                }
             }
         }
         entry.surfaces_mutex.unlock();
@@ -493,18 +564,28 @@ fn attemptReconnect(entry: *Entry) bool {
 }
 
 /// Try to open a multiplexed channel, restarting the daemon if needed.
+/// Copies helper_path under surfaces_mutex to avoid racing with setupConnection.
 fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     const alloc = std.heap.page_allocator;
 
+    // Copy helper_path under mutex — setupConnection writes it from another thread.
+    entry.surfaces_mutex.lock();
+    const helper_path = alloc.dupe(u8, entry.helper_path) catch {
+        entry.surfaces_mutex.unlock();
+        return null;
+    };
+    entry.surfaces_mutex.unlock();
+    defer alloc.free(helper_path);
+
     // First attempt
-    if (session.client.openMultiplexChannel(alloc, &entry.ctx, entry.helper_path)) |ch| {
+    if (session.client.openMultiplexChannel(alloc, &entry.ctx, helper_path)) |ch| {
         return ch;
     } else |_| {}
 
     // Helper might be dead — restart daemon and retry
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, entry.helper_path, true) catch return null;
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path, true) catch return null;
 
-    return session.client.openMultiplexChannel(alloc, &entry.ctx, entry.helper_path) catch null;
+    return session.client.openMultiplexChannel(alloc, &entry.ctx, helper_path) catch null;
 }
 
 fn notifyAllSurfacesStale(entry: *Entry) void {
@@ -565,7 +646,23 @@ fn dispatchFrame(kind: session.protocol.Kind, slot: SurfaceSlot, payload: []cons
         .stdout, .state_full => {
             @call(.always_inline, termio.Termio.processOutput, .{ slot.io, payload });
         },
-        .session_opened => log.info("remote session opened id={s}", .{payload}),
+        .session_opened => {
+            log.info("remote session opened id={s}", .{payload});
+        },
+        .layout_restore => {
+            log.info("received layout_restore blob len={d}", .{payload.len});
+            // Copy blob to heap and send to surface for tree recreation
+            const blob_copy = std.heap.page_allocator.dupe(u8, payload) catch {
+                log.err("failed to allocate layout_restore blob", .{});
+                return;
+            };
+            _ = slot.surface_mailbox.push(.{
+                .layout_restore = .{
+                    .blob = blob_copy.ptr,
+                    .len = @intCast(blob_copy.len),
+                },
+            }, .{ .forever = {} });
+        },
         .info => log.info("remote info: {s}", .{payload}),
         .err => log.err("remote error: {s}", .{payload}),
         .eof => {

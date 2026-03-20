@@ -21,6 +21,12 @@ pub const Error = error{
     RemoteCheckFailed,
 };
 
+pub const ConnectResult = enum {
+    success,
+    password_required_target,
+    password_required_jump,
+};
+
 /// Native SSH connection context backed by libssh2. The session stays
 /// open across all operations — no ControlMaster or subprocess needed.
 pub const SshContext = struct {
@@ -139,6 +145,122 @@ pub const SshContext = struct {
             };
 
             self.session = sess;
+        }
+    }
+
+    /// Like connect() but returns password_required instead of reading stdin.
+    /// Designed for GUI-based authentication: if a password is needed and not
+    /// provided, returns which host needs it so the caller can prompt the user
+    /// and call again with the password.
+    ///
+    /// If `password` is non-null, it's used for the host indicated by `for_jump`:
+    /// - `for_jump == true` → password is applied to the jump host
+    /// - `for_jump == false` → password is applied to the target host
+    ///
+    /// Between calls, partially-established state (`self.jump_session`,
+    /// `self.session`) is preserved, so reconnection steps are skipped on retry.
+    pub fn connectWithAuth(
+        self: *SshContext,
+        stderr: *std.Io.Writer,
+        password: ?[]const u8,
+        for_jump: bool,
+    ) !ConnectResult {
+        if (self.session != null) return .success;
+
+        ssh.globalInit();
+        const target = try ssh.SshTarget.parse(self.ssh_target);
+
+        if (self.jump) |jump_str| {
+            const jump = try ssh.SshTarget.parse(jump_str);
+
+            // --- Jump host connection & auth ---
+            if (self.jump_session == null) {
+                var jump_sess = ssh.SshSession.connect(self.alloc, jump.host, jump.port) catch {
+                    try stderr.print("Failed to connect to jump host {s}\n", .{jump_str});
+                    try stderr.flush();
+                    return error.RemoteAuthRequired;
+                };
+                var jump_needs_close = true;
+                errdefer if (jump_needs_close) jump_sess.close();
+
+                jump_sess.authAuto(jump.user) catch {
+                    if (for_jump) {
+                        if (password) |pass| {
+                            jump_sess.authPassword(jump.user, pass) catch {
+                                try stderr.writeAll("Authentication failed for jump host.\n");
+                                try stderr.flush();
+                                return error.RemoteAuthRequired;
+                            };
+                            try stderr.writeAll("Jump host password auth OK.\n");
+                            try stderr.flush();
+                        } else {
+                            // Password needed but not provided — close and ask caller.
+                            return .password_required_jump;
+                        }
+                    } else {
+                        // We weren't given a password for the jump host.
+                        return .password_required_jump;
+                    }
+                };
+
+                jump_needs_close = false;
+                self.jump_session = jump_sess;
+            }
+
+            // --- Tunnel to target ---
+            try stderr.writeAll("Opening tunnel...\n");
+            try stderr.flush();
+
+            var target_sess = self.jump_session.?.tunnel(target.host, target.port) catch |err| {
+                try stderr.print("Failed to tunnel to {s} via {s}: {}\n", .{ self.ssh_target, jump_str, err });
+                try stderr.flush();
+                return error.RemoteAuthRequired;
+            };
+            errdefer target_sess.close();
+
+            // --- Target auth ---
+            target_sess.authAuto(target.user) catch {
+                if (!for_jump) {
+                    if (password) |pass| {
+                        target_sess.authPassword(target.user, pass) catch {
+                            try stderr.writeAll("Authentication failed for target host.\n");
+                            try stderr.flush();
+                            return error.RemoteAuthRequired;
+                        };
+                    } else {
+                        return .password_required_target;
+                    }
+                } else {
+                    // Password was for jump host, not target — ask caller for target password.
+                    return .password_required_target;
+                }
+            };
+
+            self.session = target_sess;
+            return .success;
+        } else {
+            // --- Direct connection (no jump host) ---
+            var sess = ssh.SshSession.connect(self.alloc, target.host, target.port) catch {
+                try stderr.print("Failed to connect to {s}\n", .{self.ssh_target});
+                try stderr.flush();
+                return error.RemoteAuthRequired;
+            };
+            errdefer sess.close();
+
+            sess.authAuto(target.user) catch {
+                if (password) |pass| {
+                    sess.authPassword(target.user, pass) catch {
+                        try stderr.writeAll("Authentication failed.\n");
+                        try stderr.flush();
+                        return error.RemoteAuthRequired;
+                    };
+                } else {
+                    return .password_required_target;
+                }
+            };
+
+            self.session = sess;
+            return .success;
         }
     }
 };

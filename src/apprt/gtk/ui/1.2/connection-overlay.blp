@@ -1,0 +1,55 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $GhosttyConnectionOverlay: Adw.Bin {
+  visible: false;
+  halign: center;
+  valign: center;
+  // Must not capture input by default; only interactive during password prompt.
+  can-focus: false;
+  can-target: false;
+  focusable: false;
+
+  Adw.Bin {
+    Box {
+      styles [
+        "background",
+        "connection-overlay",
+      ]
+
+      orientation: vertical;
+      spacing: 8;
+      halign: center;
+      valign: center;
+
+      Label status_label {
+        styles [
+          "connection-status",
+        ]
+
+        justify: center;
+        selectable: false;
+      }
+
+      ProgressBar progress_bar {
+        visible: false;
+        styles [
+          "osd",
+        ]
+      }
+
+      PasswordEntry password_entry {
+        visible: false;
+        placeholder-text: "Password";
+        activate => $password_activate();
+      }
+
+      Button action_button {
+        visible: false;
+        halign: center;
+        styles ["pill"]
+        clicked => $action_button_clicked();
+      }
+    }
+  }
+}

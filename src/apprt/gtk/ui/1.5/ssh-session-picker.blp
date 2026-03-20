@@ -1,0 +1,162 @@
+using Gtk 4.0;
+using Gio 2.0;
+using Adw 1;
+
+Adw.Dialog dialog {
+  title: "Attach SSH Session";
+  content-width: 450;
+  content-height: 500;
+  closed => $closed();
+
+  Adw.ToolbarView {
+    top-bar-style: flat;
+
+    [top]
+    Adw.HeaderBar {
+      [title]
+      Gtk.Label header_label {
+        label: "Select a session to attach";
+
+        styles [
+          "heading",
+        ]
+      }
+    }
+
+    Gtk.Stack stack {
+      transition-type: crossfade;
+
+      Gtk.StackPage {
+        name: "loading";
+        child: Gtk.Box {
+          orientation: vertical;
+          valign: center;
+          halign: center;
+          spacing: 12;
+
+          Gtk.Spinner spinner {
+            spinning: true;
+            width-request: 32;
+            height-request: 32;
+          }
+
+          Gtk.Label {
+            label: "Connecting and querying sessions…";
+
+            styles [
+              "dim-label",
+            ]
+          }
+        };
+      }
+
+      Gtk.StackPage {
+        name: "list";
+        child: Gtk.ScrolledWindow {
+          min-content-height: 300;
+
+          Gtk.ListView view {
+            single-click-activate: true;
+            activate => $row_activated();
+
+            model: Gtk.SingleSelection model {
+              model: Gio.ListStore source {
+                item-type: typeof<$GhosttySshSessionEntry>;
+              };
+            };
+
+            styles [
+              "navigation-sidebar",
+            ]
+
+            factory: Gtk.BuilderListItemFactory {
+              template Gtk.ListItem {
+                child: Gtk.Box {
+                  orientation: horizontal;
+                  spacing: 12;
+                  margin-start: 12;
+                  margin-end: 12;
+                  margin-top: 8;
+                  margin-bottom: 8;
+
+                  Gtk.Box {
+                    orientation: vertical;
+                    valign: center;
+                    spacing: 2;
+                    hexpand: true;
+
+                    Gtk.Label {
+                      halign: start;
+                      ellipsize: end;
+                      single-line-mode: true;
+
+                      styles [
+                        "heading",
+                      ]
+
+                      label: bind template.item as <$GhosttySshSessionEntry>.title;
+                    }
+
+                    Gtk.Label {
+                      halign: start;
+                      ellipsize: end;
+                      single-line-mode: true;
+
+                      styles [
+                        "dim-label",
+                        "caption",
+                      ]
+
+                      label: bind template.item as <$GhosttySshSessionEntry>.subtitle;
+                    }
+                  }
+
+                  Gtk.Label {
+                    valign: center;
+
+                    styles [
+                      "dim-label",
+                      "caption",
+                    ]
+
+                    label: bind template.item as <$GhosttySshSessionEntry>.status;
+                  }
+                };
+              }
+            };
+          }
+        };
+      }
+
+      Gtk.StackPage {
+        name: "error";
+        child: Gtk.Box {
+          orientation: vertical;
+          valign: center;
+          halign: center;
+          spacing: 12;
+          margin-start: 24;
+          margin-end: 24;
+
+          Gtk.Image {
+            icon-name: "dialog-warning-symbolic";
+            pixel-size: 48;
+
+            styles [
+              "dim-label",
+            ]
+          }
+
+          Gtk.Label error_label {
+            wrap: true;
+            justify: center;
+
+            styles [
+              "dim-label",
+            ]
+          }
+        };
+      }
+    }
+  }
+}

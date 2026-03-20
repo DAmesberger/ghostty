@@ -42,6 +42,7 @@ pub const blueprints: []const Blueprint = &.{
     .{ .major = 1, .minor = 5, .name = "imgui-widget" },
     .{ .major = 1, .minor = 5, .name = "inspector-widget" },
     .{ .major = 1, .minor = 5, .name = "inspector-window" },
+    .{ .major = 1, .minor = 2, .name = "connection-overlay" },
     .{ .major = 1, .minor = 2, .name = "resize-overlay" },
     .{ .major = 1, .minor = 2, .name = "search-overlay" },
     .{ .major = 1, .minor = 2, .name = "key-state-overlay" },
@@ -54,6 +55,8 @@ pub const blueprints: []const Blueprint = &.{
     .{ .major = 1, .minor = 5, .name = "title-dialog" },
     .{ .major = 1, .minor = 5, .name = "window" },
     .{ .major = 1, .minor = 5, .name = "command-palette" },
+    .{ .major = 1, .minor = 5, .name = "ssh-connection-overlay" },
+    .{ .major = 1, .minor = 5, .name = "ssh-session-picker" },
 };
 
 /// CSS files in css_path

@@ -29,12 +29,14 @@ const Config = @import("config.zig").Config;
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 const SearchOverlay = @import("search_overlay.zig").SearchOverlay;
 const KeyStateOverlay = @import("key_state_overlay.zig").KeyStateOverlay;
+const ConnectionOverlay = @import("connection_overlay.zig").ConnectionOverlay;
 const ChildExited = @import("surface_child_exited.zig").SurfaceChildExited;
 const ClipboardConfirmationDialog = @import("clipboard_confirmation_dialog.zig").ClipboardConfirmationDialog;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const Window = @import("window.zig").Window;
 const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 const i18n = @import("../../../os/i18n.zig");
+const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -612,6 +614,9 @@ pub const Surface = extern struct {
         /// The key state overlay
         key_state_overlay: *KeyStateOverlay,
 
+        /// The connection overlay (SSH remote sessions)
+        connection_overlay: *ConnectionOverlay,
+
         /// The apprt Surface.
         rt_surface: ApprtSurface = undefined,
 
@@ -642,6 +647,11 @@ pub const Surface = extern struct {
 
         /// True when the child has exited.
         child_exited: bool = false,
+
+        /// Opaque pointer to SshConnectionManager.AuthState for password prompts.
+        /// Set when the connection overlay shows a password prompt, cleared after
+        /// the user submits or cancels.
+        pending_auth_state: ?*anyopaque = null,
 
         // Progress bar
         progress_bar_timer: ?c_uint = null,
@@ -708,6 +718,9 @@ pub const Surface = extern struct {
         overrides: struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
+            ssh_surface_id: ?[]const u8 = null,
+            ssh_target: ?[]const u8 = null,
+            ssh_session: ?[]const u8 = null,
 
             pub const none: @This() = .{};
         } = .none,
@@ -719,6 +732,9 @@ pub const Surface = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        ssh_surface_id: ?[]const u8 = null,
+        ssh_target: ?[]const u8 = null,
+        ssh_session: ?[]const u8 = null,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -730,6 +746,9 @@ pub const Surface = extern struct {
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
+            .ssh_surface_id = if (overrides.ssh_surface_id) |sid| alloc.dupe(u8, sid) catch null else null,
+            .ssh_target = if (overrides.ssh_target) |t| alloc.dupe(u8, t) catch null else null,
+            .ssh_session = if (overrides.ssh_session) |s| alloc.dupe(u8, s) catch null else null,
         };
         return self;
     }
@@ -853,6 +872,14 @@ pub const Surface = extern struct {
         return self.as(gtk.Widget).activateAction("win.toggle-command-palette", null) != 0;
     }
 
+    pub fn openSshConnection(self: *Self) bool {
+        return self.as(gtk.Widget).activateAction("win.open-ssh-connection", null) != 0;
+    }
+
+    pub fn sshSessionAttach(self: *Self) bool {
+        return self.as(gtk.Widget).activateAction("win.ssh-session-attach", null) != 0;
+    }
+
     pub fn controlInspector(
         self: *Self,
         value: apprt.Action.Value(.inspector),
@@ -881,6 +908,141 @@ pub const Surface = extern struct {
     pub fn redrawInspector(self: *Self) void {
         const priv = self.private();
         if (priv.inspector) |v| v.queueRender();
+    }
+
+    /// Update the connection overlay from a connection state message.
+    /// Called on the GTK main thread when the core surface receives
+    /// a connection_state message from the termio backend.
+    pub fn updateConnectionOverlay(
+        self: *Self,
+        state: ?@import("../../../session.zig").protocol.ConnectionState,
+    ) void {
+        const priv = self.private();
+        const overlay = priv.connection_overlay;
+
+        const s = state orelse {
+            // null = connected/dismissed
+            priv.pending_auth_state = null;
+            overlay.setStatus(null);
+            overlay.setShowProgress(false);
+            overlay.setShowPassword(false);
+            overlay.setActionButton(null);
+            return;
+        };
+
+        switch (s) {
+            .connecting => {
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(false);
+                overlay.setActionButton(null);
+                overlay.setStatus("Connecting\xe2\x80\xa6");
+            },
+            .uploading => |progress| {
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(true);
+                overlay.setActionButton(null);
+                if (progress.total_bytes > 0) {
+                    const frac: f64 = @as(f64, @floatFromInt(progress.bytes_sent)) /
+                        @as(f64, @floatFromInt(progress.total_bytes));
+                    overlay.setProgress(frac);
+                } else {
+                    overlay.setProgress(0.0);
+                }
+                overlay.setStatus("Uploading helper\xe2\x80\xa6");
+            },
+            .setup => {
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(false);
+                overlay.setActionButton(null);
+                overlay.setStatus("Starting remote daemon\xe2\x80\xa6");
+            },
+            .connected => {
+                priv.pending_auth_state = null;
+                overlay.setStatus(null);
+                overlay.setShowProgress(false);
+                overlay.setShowPassword(false);
+                overlay.setActionButton(null);
+            },
+            .reconnecting => |info| {
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(false);
+                var buf: [96:0]u8 = @splat(0);
+                const elapsed_s = @divFloor(info.elapsed_ns, std.time.ns_per_s);
+                _ = std.fmt.bufPrint(&buf, "Reconnecting (attempt {d}, {d}s elapsed)\xe2\x80\xa6", .{ info.attempt, elapsed_s }) catch {};
+                overlay.setStatus(&buf);
+                overlay.setActionButton("Cancel");
+            },
+            .stale => {
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(false);
+                overlay.setActionButton(null);
+                overlay.setStatus("Connection stale");
+            },
+            .failed => |reason| {
+                priv.pending_auth_state = null;
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(false);
+                const msg: [:0]const u8 = switch (reason) {
+                    .auth_failed => "Authentication failed",
+                    .timeout => "Connection timed out",
+                    .helper_failed => "Helper setup failed",
+                    .unknown => "Connection failed",
+                };
+                overlay.setStatus(msg);
+                overlay.setActionButton("Close");
+            },
+            .password_required => |prompt| {
+                priv.pending_auth_state = prompt.auth_state;
+                overlay.setShowProgress(false);
+                overlay.setActionButton(null);
+                overlay.setShowPassword(true);
+                overlay.setStatus("Enter password:");
+            },
+        }
+    }
+
+    /// Called when the user submits a password in the connection overlay.
+    fn onPasswordSubmitted(
+        _: *ConnectionOverlay,
+        text: ?[*:0]const u8,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const auth_ptr = priv.pending_auth_state orelse return;
+        const auth_state: *SshConnectionManager.Entry.AuthState = @ptrCast(@alignCast(auth_ptr));
+
+        const password = if (text) |t| std.mem.span(t) else "";
+        const owned = std.heap.page_allocator.dupe(u8, password) catch return;
+
+        auth_state.mutex.lock();
+        auth_state.password = owned;
+        auth_state.cond.signal();
+        auth_state.mutex.unlock();
+
+        priv.pending_auth_state = null;
+    }
+
+    /// Called when the user cancels the password prompt (Escape).
+    fn onPasswordCancelled(
+        _: *ConnectionOverlay,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const auth_ptr = priv.pending_auth_state orelse return;
+        const auth_state: *SshConnectionManager.Entry.AuthState = @ptrCast(@alignCast(auth_ptr));
+
+        auth_state.mutex.lock();
+        auth_state.cancelled = true;
+        auth_state.cond.signal();
+        auth_state.mutex.unlock();
+
+        priv.pending_auth_state = null;
+    }
+
+    /// Called when the user clicks the action button on the connection overlay
+    /// (Cancel during reconnection or Close on failure). Closes the surface.
+    fn onConnectionAction(_: *ConnectionOverlay, self: *Self) callconv(.c) void {
+        self.close();
     }
 
     /// Handle a key sequence action from the apprt.
@@ -1798,6 +1960,29 @@ pub const Surface = extern struct {
         // Setup properties we can't set from our Blueprint file.
         self.as(gtk.Widget).setCursorFromName("text");
 
+        // Connect connection overlay password signals
+        _ = ConnectionOverlay.signals.@"password-submitted".connect(
+            priv.connection_overlay,
+            *Self,
+            onPasswordSubmitted,
+            self,
+            .{},
+        );
+        _ = ConnectionOverlay.signals.@"password-cancelled".connect(
+            priv.connection_overlay,
+            *Self,
+            onPasswordCancelled,
+            self,
+            .{},
+        );
+        _ = ConnectionOverlay.signals.@"action-triggered".connect(
+            priv.connection_overlay,
+            *Self,
+            onConnectionAction,
+            self,
+            .{},
+        );
+
         // Initialize our config
         self.propConfig(undefined, null);
     }
@@ -1938,6 +2123,18 @@ pub const Surface = extern struct {
         if (priv.overrides.working_directory) |wd| {
             alloc.free(wd);
             priv.overrides.working_directory = null;
+        }
+        if (priv.overrides.ssh_surface_id) |sid| {
+            alloc.free(sid);
+            priv.overrides.ssh_surface_id = null;
+        }
+        if (priv.overrides.ssh_target) |t| {
+            alloc.free(t);
+            priv.overrides.ssh_target = null;
+        }
+        if (priv.overrides.ssh_session) |s| {
+            alloc.free(s);
+            priv.overrides.ssh_session = null;
         }
 
         // Clean up key sequence and key table state
@@ -3394,6 +3591,15 @@ pub const Surface = extern struct {
             try wd_val.finalize(config_alloc);
             config.@"working-directory" = wd_val;
         }
+        if (priv.overrides.ssh_surface_id) |sid| {
+            config.@"ssh-surface-id" = try config.arenaAlloc().dupe(u8, sid);
+        }
+        if (priv.overrides.ssh_target) |t| {
+            config.@"ssh-target" = try config.arenaAlloc().dupe(u8, t);
+        }
+        if (priv.overrides.ssh_session) |s| {
+            config.@"ssh-session" = try config.arenaAlloc().dupe(u8, s);
+        }
 
         // Properties that can impact surface init
         if (priv.font_size_request) |size| config.@"font-size" = size.points;
@@ -3585,6 +3791,7 @@ pub const Surface = extern struct {
             class.bindTemplateChildPrivate("resize_overlay", .{});
             class.bindTemplateChildPrivate("search_overlay", .{});
             class.bindTemplateChildPrivate("key_state_overlay", .{});
+            class.bindTemplateChildPrivate("connection_overlay", .{});
             class.bindTemplateChildPrivate("terminal_page", .{});
             class.bindTemplateChildPrivate("drop_target", .{});
             class.bindTemplateChildPrivate("im_context", .{});

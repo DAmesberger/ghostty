@@ -28,6 +28,8 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
+const SshConnectionOverlay = @import("ssh_connection_overlay.zig").SshConnectionOverlay;
+const SshSessionPicker = @import("ssh_session_picker.zig").SshSessionPicker;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -252,6 +254,16 @@ pub const Window = extern struct {
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
 
+        /// A weak reference to an SSH connection overlay.
+        ssh_connection_overlay: WeakRef(SshConnectionOverlay) = .empty,
+
+        /// A weak reference to the SSH connection overlay used for the
+        /// attach flow (separate from the regular one).
+        ssh_attach_overlay: WeakRef(SshConnectionOverlay) = .empty,
+
+        /// A weak reference to the SSH session picker dialog.
+        ssh_session_picker: WeakRef(SshSessionPicker) = .empty,
+
         /// Tab page that the context menu was opened for.
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
@@ -373,6 +385,8 @@ pub const Window = extern struct {
             .init("clear", actionClear, null),
             // TODO: accept the surface that toggled the command palette
             .init("toggle-command-palette", actionToggleCommandPalette, null),
+            .init("open-ssh-connection", actionOpenSshConnection, null),
+            .init("ssh-session-attach", actionSshSessionAttach, null),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -398,6 +412,8 @@ pub const Window = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            ssh_target: ?[]const u8 = null,
+            ssh_session: ?[]const u8 = null,
 
             pub const none: @This() = .{};
         },
@@ -409,6 +425,8 @@ pub const Window = extern struct {
                 .command = overrides.command,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
+                .ssh_target = overrides.ssh_target,
+                .ssh_session = overrides.ssh_session,
             },
         );
     }
@@ -421,6 +439,8 @@ pub const Window = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            ssh_target: ?[]const u8 = null,
+            ssh_session: ?[]const u8 = null,
 
             pub const none: @This() = .{};
         },
@@ -435,6 +455,8 @@ pub const Window = extern struct {
                 .command = overrides.command,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
+                .ssh_target = overrides.ssh_target,
+                .ssh_session = overrides.ssh_session,
             },
         );
 
@@ -1228,6 +1250,9 @@ pub const Window = extern struct {
         const priv = self.private();
 
         priv.command_palette.set(null);
+        priv.ssh_connection_overlay.set(null);
+        priv.ssh_attach_overlay.set(null);
+        priv.ssh_session_picker.set(null);
 
         if (priv.config) |v| {
             v.unref();
@@ -1736,7 +1761,7 @@ pub const Window = extern struct {
     }
 
     fn tabSplitTreeChanged(
-        _: *SplitTree,
+        split_tree: *SplitTree,
         old_tree: ?*const Surface.Tree,
         new_tree: ?*const Surface.Tree,
         self: *Self,
@@ -1748,6 +1773,9 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+
+        // Send layout update to remote daemon for reconnect support
+        split_tree.sendRemoteLayoutUpdate();
     }
 
     fn actionAbout(
@@ -2026,6 +2054,344 @@ pub const Window = extern struct {
         // TODO: accept the surface that toggled the command palette as a
         // parameter
         self.toggleCommandPalette();
+    }
+
+    /// Open the SSH connection picker overlay.
+    fn openSshConnection(self: *Window) void {
+        const priv = self.private();
+
+        // Get a reference to the SSH connection overlay. First check the weak
+        // reference to see if we already have one stored. If not, create one.
+        const ssh_overlay = priv.ssh_connection_overlay.get() orelse ssh_overlay: {
+            const overlay = SshConnectionOverlay.new();
+
+            // Connect the "host-connect" signal to create a new window with SSH
+            _ = SshConnectionOverlay.signals.@"host-connect".connect(
+                overlay,
+                *Window,
+                signalSshConnect,
+                self,
+                .{},
+            );
+
+            priv.ssh_connection_overlay.set(overlay);
+            break :ssh_overlay overlay;
+        };
+        defer ssh_overlay.unref();
+
+        ssh_overlay.toggle(self);
+    }
+
+    /// React to the SSH connection overlay "connect" signal by opening a new
+    /// window with the selected SSH target.
+    fn signalSshConnect(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, _: *Self) callconv(.c) void {
+        if (target_str) |t| {
+            Application.default().newSshWindow(std.mem.span(t));
+        }
+    }
+
+    /// React to a GTK action requesting the SSH connection picker.
+    fn actionOpenSshConnection(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        self.openSshConnection();
+    }
+
+    /// Open the SSH connection picker for the attach flow.
+    /// After the user selects a host, the session picker is shown
+    /// to choose a detached session.
+    fn sshSessionAttach(self: *Window) void {
+        const priv = self.private();
+
+        // Get a reference to the attach-specific SSH connection overlay.
+        const ssh_overlay = priv.ssh_attach_overlay.get() orelse ssh_overlay: {
+            const overlay = SshConnectionOverlay.new();
+
+            // Connect with attach-specific handler
+            _ = SshConnectionOverlay.signals.@"host-connect".connect(
+                overlay,
+                *Window,
+                signalSshAttach,
+                self,
+                .{},
+            );
+
+            priv.ssh_attach_overlay.set(overlay);
+            break :ssh_overlay overlay;
+        };
+        defer ssh_overlay.unref();
+
+        ssh_overlay.toggle(self);
+    }
+
+    /// React to the SSH connection overlay "connect" signal in attach mode.
+    /// Instead of opening a new session, show the session picker for the host.
+    fn signalSshAttach(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, self: *Self) callconv(.c) void {
+        const target = std.mem.span(target_str orelse return);
+        if (target.len == 0) return;
+
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        // Create the session picker dialog
+        const picker = SshSessionPicker.new() orelse return;
+        priv.ssh_session_picker.set(picker);
+
+        // Connect the session-selected signal
+        _ = SshSessionPicker.signals.@"session-selected".connect(
+            picker,
+            *Window,
+            signalSessionSelected,
+            self,
+            .{},
+        );
+
+        // Show the picker immediately with a loading state
+        picker.present(self);
+
+        // Duplicate the target string for the background thread
+        const target_dup = alloc.dupeZ(u8, target) catch return;
+
+        // Spawn a background thread to query sessions
+        const thread_data = alloc.create(SessionQueryData) catch {
+            alloc.free(target_dup);
+            return;
+        };
+        thread_data.* = .{
+            .picker = picker.ref(),
+            .ssh_target = target_dup,
+        };
+
+        const thread = std.Thread.spawn(.{}, sessionQueryThread, .{thread_data}) catch {
+            picker.unref();
+            alloc.free(target_dup);
+            alloc.destroy(thread_data);
+            return;
+        };
+        thread.detach();
+    }
+
+    const SessionQueryData = struct {
+        picker: *SshSessionPicker,
+        ssh_target: [:0]const u8,
+    };
+
+    fn sessionQueryThread(data: *SessionQueryData) void {
+        defer {
+            const alloc = Application.default().allocator();
+            data.picker.unref();
+            alloc.free(data.ssh_target);
+            alloc.destroy(data);
+        }
+
+        const alloc = Application.default().allocator();
+
+        // Query sessions from the remote host via SSH
+        const sessions = querySshSessions(alloc, data.ssh_target) catch |err| {
+            log.warn("failed to query SSH sessions: {}", .{err});
+            // Post back to GTK main thread to show error
+            _ = glib.idleAdd(struct {
+                fn callback(picker_ptr: ?*anyopaque) callconv(.c) c_int {
+                    const p: *SshSessionPicker = @ptrCast(@alignCast(picker_ptr orelse return 0));
+                    p.setError("Failed to connect or query sessions");
+                    return 0; // G_SOURCE_REMOVE
+                }
+            }.callback, data.picker);
+            return;
+        };
+        defer {
+            for (sessions) |s| {
+                alloc.free(s.id);
+                alloc.free(s.label);
+                alloc.free(s.detail);
+                alloc.free(s.status);
+            }
+            alloc.free(sessions);
+        }
+
+        // Copy session data to owned strings for the idle callback
+        const callback_data = alloc.create(SessionResultData) catch return;
+        callback_data.* = .{
+            .picker = data.picker.ref(),
+            .ssh_target = alloc.dupeZ(u8, data.ssh_target) catch {
+                data.picker.unref();
+                alloc.destroy(callback_data);
+                return;
+            },
+            .sessions = blk: {
+                var list = alloc.alloc(SessionResultData.Entry, sessions.len) catch {
+                    data.picker.unref();
+                    alloc.destroy(callback_data);
+                    return;
+                };
+                for (sessions, 0..) |s, i| {
+                    list[i] = .{
+                        .id = alloc.dupeZ(u8, s.id) catch "",
+                        .label = alloc.dupeZ(u8, s.label) catch "",
+                        .detail = alloc.dupeZ(u8, s.detail) catch "",
+                        .status = alloc.dupeZ(u8, s.status) catch "",
+                    };
+                }
+                break :blk list;
+            },
+        };
+
+        _ = glib.idleAdd(sessionResultCallback, @as(?*anyopaque, @ptrCast(callback_data)));
+    }
+
+    const SessionResultData = struct {
+        picker: *SshSessionPicker,
+        ssh_target: [:0]const u8,
+        sessions: []Entry,
+
+        const Entry = struct {
+            id: [:0]const u8,
+            label: [:0]const u8,
+            detail: [:0]const u8,
+            status: [:0]const u8,
+        };
+    };
+
+    fn sessionResultCallback(user_data: ?*anyopaque) callconv(.c) c_int {
+        const data: *SessionResultData = @ptrCast(@alignCast(user_data orelse return 0));
+        defer {
+            const alloc = Application.default().allocator();
+            data.picker.unref();
+            for (data.sessions) |s| {
+                if (s.id.len > 0) alloc.free(s.id);
+                if (s.label.len > 0) alloc.free(s.label);
+                if (s.detail.len > 0) alloc.free(s.detail);
+                if (s.status.len > 0) alloc.free(s.status);
+            }
+            alloc.free(data.sessions);
+            alloc.free(data.ssh_target);
+            alloc.destroy(data);
+        }
+
+        data.picker.setSshTarget(data.ssh_target);
+
+        if (data.sessions.len == 0) {
+            data.picker.setError("No detached sessions found on this host");
+            return 0;
+        }
+
+        for (data.sessions) |s| {
+            data.picker.addSession(s.id, s.label, s.detail, s.status);
+        }
+        data.picker.setLoaded();
+
+        return 0; // G_SOURCE_REMOVE
+    }
+
+    /// React to the session picker's "session-selected" signal.
+    fn signalSessionSelected(
+        _: *SshSessionPicker,
+        ssh_target: ?[*:0]const u8,
+        session_id: ?[*:0]const u8,
+        _: *Self,
+    ) callconv(.c) void {
+        const target = std.mem.span(ssh_target orelse return);
+        const sid = std.mem.span(session_id orelse return);
+        if (target.len == 0 or sid.len == 0) return;
+
+        // Create new window with ssh-target and ssh-session config set.
+        // The ssh-session config tells the Remote backend to attach to
+        // the specified session rather than creating a new one.
+        Application.default().newSshAttachWindow(target, sid);
+    }
+
+    /// Query detached sessions from a remote host by running the session helper
+    /// via SSH. Returns parsed session entries.
+    fn querySshSessions(alloc: std.mem.Allocator, ssh_target: []const u8) ![]SessionQueryEntry {
+        // Build the SSH command to query sessions
+        // ssh <target> "~/.local/share/ghostty/ghostty-session-helper +session-helper --list"
+        const helper_path = "~/.local/share/ghostty/ghostty-session-helper";
+        const cmd_str = try std.fmt.allocPrintSentinel(alloc, "{s} +session-helper --list", .{helper_path}, 0);
+        defer alloc.free(cmd_str);
+
+        var child = std.process.Child.init(
+            &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_target, cmd_str },
+            alloc,
+        );
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        try child.spawn();
+
+        // Collect stdout/stderr before waiting to avoid deadlock
+        var stdout_buf: std.ArrayListUnmanaged(u8) = .{};
+        var stderr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer {
+            stdout_buf.deinit(alloc);
+            stderr_buf.deinit(alloc);
+        }
+        try child.collectOutput(alloc, &stdout_buf, &stderr_buf, 50 * 1024);
+        const term = try child.wait();
+
+        const exit_code: u32 = switch (term) {
+            .Exited => |code| code,
+            else => 1,
+        };
+
+        if (exit_code != 0 and stdout_buf.items.len == 0) {
+            return error.SshCommandFailed;
+        }
+
+        // Parse the output: each line is a session entry
+        // Format: "uuid|label|N surfaces|timestamp|status"
+        // Lines starting with "  " are surface detail lines (skip them)
+        var entries: std.ArrayListUnmanaged(SessionQueryEntry) = .{};
+        errdefer {
+            for (entries.items) |e| {
+                alloc.free(e.id);
+                alloc.free(e.label);
+                alloc.free(e.detail);
+                alloc.free(e.status);
+            }
+            entries.deinit(alloc);
+        }
+
+        var lines = std.mem.splitScalar(u8, stdout_buf.items, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            // Skip surface detail lines (indented)
+            if (line.len > 2 and line[0] == ' ' and line[1] == ' ') continue;
+
+            // Parse: uuid|label|surfaces_info|timestamp|status
+            var parts = std.mem.splitScalar(u8, line, '|');
+            const id_raw = parts.next() orelse continue;
+            const label_raw = parts.next() orelse continue;
+            const surfaces_raw = parts.next() orelse continue;
+            _ = parts.next(); // timestamp - skip
+            const status_raw = parts.next() orelse continue;
+
+            try entries.append(alloc, .{
+                .id = try alloc.dupe(u8, id_raw),
+                .label = try alloc.dupe(u8, label_raw),
+                .detail = try alloc.dupe(u8, surfaces_raw),
+                .status = try alloc.dupe(u8, status_raw),
+            });
+        }
+
+        return try entries.toOwnedSlice(alloc);
+    }
+
+    const SessionQueryEntry = struct {
+        id: []const u8,
+        label: []const u8,
+        detail: []const u8,
+        status: []const u8,
+    };
+
+    /// React to a GTK action requesting the SSH session attach flow.
+    fn actionSshSessionAttach(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        self.sshSessionAttach();
     }
 
     /// Toggle the Ghostty inspector for the active surface.

@@ -23,6 +23,8 @@ const SshConnectionManager = @import("SshConnectionManager.zig");
 
 const log = std.log.scoped(.io_remote);
 
+const Uuid = session.shared.Uuid;
+
 /// Allocator used to own copied config strings.
 alloc: Allocator,
 
@@ -37,6 +39,13 @@ label: ?[]const u8,
 
 /// Session ID for reconnecting to an existing session — owned copy.
 session_id: ?[]const u8,
+
+/// Stable surface UUID, generated at init. Survives reconnects.
+surface_id: Uuid,
+
+/// Group UUID, inherited from parent for splits or generated for first surface.
+/// Zero UUID means this is the first surface (will create a new group).
+group_id: Uuid,
 
 /// Reference to the shared connection manager
 connection_manager: *SshConnectionManager,
@@ -64,17 +73,37 @@ pub fn init(
     errdefer if (label) |l| alloc.free(l);
     const session_id = if (cfg.session_id) |s| try alloc.dupe(u8, s) else null;
 
+    // Surface ID: always a fresh UUID (unique per surface)
+    const surface_id = if (!session.shared.isZeroUuid(cfg.surface_id))
+        cfg.surface_id
+    else
+        session.shared.generateUuid();
+
+    // Group ID: inherited from parent (for splits) or zero (will create new group)
+    const group_id = cfg.group_id;
+
     return .{
         .alloc = alloc,
         .ssh_target = ssh_target,
         .jump = jump,
         .label = label,
         .session_id = session_id,
+        .surface_id = surface_id,
+        .group_id = group_id,
         .connection_manager = cfg.connection_manager,
     };
 }
 
 pub fn deinit(self: *Remote) void {
+    // Unblock any password wait if the surface is closing while the
+    // authentication loop is blocked on the condition variable.
+    if (self.conn_entry) |entry| {
+        entry.auth_state.mutex.lock();
+        entry.auth_state.cancelled = true;
+        entry.auth_state.cond.signal();
+        entry.auth_state.mutex.unlock();
+    }
+
     // Release our reference to the connection (safety net if threadExit wasn't called)
     if (self.conn_entry != null) {
         self.connection_manager.release(self.ssh_target, self.jump);
@@ -142,27 +171,60 @@ pub fn threadEnter(
     self.target_id = self.connection_manager.allocateTarget(entry);
 
     // Register surface for frame dispatch from the SSH thread
-    SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox);
+    if (!SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox, self.surface_id, self.group_id)) {
+        _ = td.surface_mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
+        return error.MaxSurfacesExceeded;
+    }
     errdefer SshConnectionManager.unregisterSurface(entry, self.target_id);
 
     _ = td.surface_mailbox.push(.{ .connection_state = .setup }, .{ .forever = {} });
 
-    // Send session_open frame via write queue.
+    // Send session_open or surface_open frame via write queue.
     {
-        const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
-        const label_or_id = self.session_id orelse (self.label orelse "session");
-        const open_payload = (session.protocol.SessionOpen{
-            .resize = .{
-                .rows = @intCast(self.grid_size.rows),
-                .cols = @intCast(self.grid_size.columns),
-                .width_px = @intCast(self.screen_size.width),
-                .height_px = @intCast(self.screen_size.height),
-            },
-            .mode = mode,
-            .label_or_id = label_or_id,
-        }).encode(alloc) catch return error.OutOfMemory;
-        defer alloc.free(open_payload);
-        SshConnectionManager.enqueueWrite(entry, .session_open, self.target_id, open_payload);
+        const open_resize: session.protocol.Resize = .{
+            .rows = @intCast(self.grid_size.rows),
+            .cols = @intCast(self.grid_size.columns),
+            .width_px = @intCast(self.screen_size.width),
+            .height_px = @intCast(self.screen_size.height),
+        };
+
+        if (!session.shared.isZeroUuid(self.group_id)) {
+            // Split surface: join existing group via surface_open
+            const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
+            const open_payload = (session.protocol.SurfaceOpen{
+                .resize = open_resize,
+                .mode = mode,
+                .group_id = self.group_id,
+                .surface_id = self.surface_id,
+            }).encode(alloc) catch return error.OutOfMemory;
+            defer alloc.free(open_payload);
+            SshConnectionManager.enqueueWrite(entry, .surface_open, self.target_id, open_payload);
+        } else {
+            // First surface: generate group_id and create new group
+            self.group_id = session.shared.generateUuid();
+            const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
+            const label = self.label orelse "session";
+
+            // For attach mode with session_id, try to parse it as UUID for group lookup
+            var attach_group_id = self.group_id;
+            if (mode == .attach) {
+                if (self.session_id) |sid| {
+                    attach_group_id = session.shared.parseUuid(sid) catch
+                        session.shared.parseUuidDashed(sid) catch
+                        self.group_id;
+                }
+            }
+
+            const open_payload = (session.protocol.SessionOpen{
+                .resize = open_resize,
+                .mode = mode,
+                .surface_id = self.surface_id,
+                .group_id = if (mode == .attach) attach_group_id else self.group_id,
+                .label = if (mode == .attach) (self.session_id orelse label) else label,
+            }).encode(alloc) catch return error.OutOfMemory;
+            defer alloc.free(open_payload);
+            SshConnectionManager.enqueueWrite(entry, .session_open, self.target_id, open_payload);
+        }
     }
 
     // Dismiss the connection overlay
@@ -187,10 +249,47 @@ fn setupConnection(
     var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer_.interface;
 
-    entry.ctx.connect(stderr) catch |err| {
-        _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
-        return err;
-    };
+    // Password authentication loop: use connectWithAuth so passwords come
+    // from the GUI overlay instead of stdin.
+    var for_jump: bool = false;
+    while (true) {
+        const result = entry.ctx.connectWithAuth(stderr, entry.auth_state.password, for_jump) catch |err| {
+            _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
+            return err;
+        };
+
+        // Free the previous password after use (allocated by GTK thread via page_allocator)
+        if (entry.auth_state.password) |pw| {
+            std.heap.page_allocator.free(pw);
+            entry.auth_state.password = null;
+        }
+
+        switch (result) {
+            .success => break,
+            .password_required_jump, .password_required_target => {
+                for_jump = (result == .password_required_jump);
+
+                // Tell the GTK overlay to show the password prompt
+                _ = mailbox.push(.{ .connection_state = .{
+                    .password_required = .{ .is_jump = for_jump, .auth_state = @ptrCast(&entry.auth_state) },
+                } }, .{ .forever = {} });
+
+                // Wait for the GTK thread to provide a password
+                entry.auth_state.mutex.lock();
+                while (entry.auth_state.password == null and !entry.auth_state.cancelled) {
+                    entry.auth_state.cond.wait(&entry.auth_state.mutex);
+                }
+
+                if (entry.auth_state.cancelled) {
+                    entry.auth_state.mutex.unlock();
+                    _ = mailbox.push(.{ .connection_state = .{ .failed = .auth_failed } }, .{ .forever = {} });
+                    return error.RemoteAuthRequired;
+                }
+                entry.auth_state.mutex.unlock();
+                // Loop back to retry connectWithAuth with the provided password
+            },
+        }
+    }
 
     const helper_path = session.client.ensureRemoteHelper(alloc, &entry.ctx, stderr, mailbox) catch |err| {
         _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
@@ -246,8 +345,13 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     _ = td;
     const entry = self.conn_entry orelse return;
 
-    // Enqueue session_close frame
-    SshConnectionManager.enqueueWrite(entry, .session_close, self.target_id, "");
+    if (!session.shared.isZeroUuid(self.group_id)) {
+        // Grouped surface: send surface_close with our UUID
+        SshConnectionManager.enqueueWrite(entry, .surface_close, self.target_id, &self.surface_id);
+    } else {
+        // Standalone: send session_close (detach, keeps session alive)
+        SshConnectionManager.enqueueWrite(entry, .session_close, self.target_id, "");
+    }
 
     // Unregister surface — after this returns, SSH thread won't access our io
     SshConnectionManager.unregisterSurface(entry, self.target_id);
@@ -348,5 +452,9 @@ pub const Config = struct {
     jump: ?[]const u8 = null,
     label: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
+    /// Inherited from parent surface for splits, zero for first surface.
+    group_id: Uuid = session.shared.zero_uuid,
+    /// Pre-assigned surface UUID, or zero to auto-generate.
+    surface_id: Uuid = session.shared.zero_uuid,
     connection_manager: *SshConnectionManager,
 };

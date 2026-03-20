@@ -142,6 +142,11 @@ config_conditional_state: configpkg.ConditionalState,
 /// This is used to determine if we need to confirm, hold open, etc.
 child_exited: bool = false,
 
+/// Pending layout restore blob from a remote session daemon.
+/// Set by performMessage, consumed by the apprt's restore_layout handler.
+/// Heap-allocated via page_allocator, freed after the action completes.
+pending_layout_restore: ?[]const u8 = null,
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -625,10 +630,22 @@ pub fn init(
         const io_backend: termio.Backend = backend: {
             if (config.@"ssh-target") |ssh_target| {
                 // Remote SSH backend
+                const group_id = if (config.@"ssh-group-id") |gid_hex|
+                    session.shared.parseUuid(gid_hex) catch session.shared.zero_uuid
+                else
+                    session.shared.zero_uuid;
+
+                const surface_id = if (config.@"ssh-surface-id") |sid_hex|
+                    session.shared.parseUuid(sid_hex) catch session.shared.zero_uuid
+                else
+                    session.shared.zero_uuid;
+
                 var io_remote = try termio.Remote.init(alloc, .{
                     .ssh_target = ssh_target,
                     .jump = config.@"ssh-jump",
                     .session_id = config.@"ssh-session",
+                    .group_id = group_id,
+                    .surface_id = surface_id,
                     .connection_manager = &app.ssh_connection_manager,
                 });
                 errdefer io_remote.deinit();
@@ -1194,12 +1211,37 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .connection_state => |state| {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            self.renderer_state.connection_state = switch (state) {
-                .connected => null, // dismiss overlay
-                else => state,
-            };
+            {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.connection_state = switch (state) {
+                    .connected => null, // dismiss overlay
+                    else => state,
+                };
+            }
+
+            // Notify the apprt so it can update a native overlay (GTK).
+            // Must be outside the mutex — the handler may read renderer_state.
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .connection_state,
+                state,
+            ) catch {};
+        },
+
+        .layout_restore => |lr| {
+            // Store blob for the apprt handler to consume, then trigger action.
+            self.pending_layout_restore = lr.slice();
+            defer {
+                // Free the blob after the action handler has consumed it
+                lr.deinit();
+                self.pending_layout_restore = null;
+            }
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .restore_layout,
+                {},
+            );
         },
     }
 }
@@ -5830,9 +5872,21 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .session_detach => return sendSessionControl(self, .detach),
+        .open_ssh_connection => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .open_ssh_connection,
+            {},
+        ),
 
-        .session_reconnect => return sendSessionControl(self, .reconnect),
+        .ssh_session_attach => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .ssh_session_attach,
+            {},
+        ),
+
+        .ssh_session_detach => return sendSessionControl(self, .detach),
+
+        .ssh_session_reconnect => return sendSessionControl(self, .reconnect),
 
         .toggle_background_opacity => return try self.rt_app.performAction(
             .{ .surface = self },

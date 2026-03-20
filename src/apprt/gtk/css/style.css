@@ -59,6 +59,30 @@ label.url-overlay.right {
 }
 
 /*
+ * GhosttySurface connection overlay (SSH remote sessions)
+ */
+.connection-overlay {
+  padding: 16px 32px;
+  border-radius: 8px;
+  outline-style: solid;
+  outline-color: #555555;
+  outline-width: 1px;
+  min-width: 240px;
+}
+
+.connection-overlay .connection-status {
+  font-size: 14px;
+}
+
+.connection-overlay progressbar {
+  min-width: 200px;
+}
+
+.connection-overlay passwordentry {
+  min-width: 200px;
+}
+
+/*
  * GhosttySurface resize overlay
  */
 label.resize-overlay {

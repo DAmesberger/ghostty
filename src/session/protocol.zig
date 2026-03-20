@@ -21,6 +21,15 @@ pub const ConnectionState = union(enum) {
     reconnecting: ReconnectInfo,
     stale,
     failed: FailReason,
+    password_required: PasswordPrompt,
+
+    pub const PasswordPrompt = struct {
+        /// True if the password is for the jump host, false for the target.
+        is_jump: bool,
+        /// Opaque pointer to SshConnectionManager.AuthState.
+        /// The GTK handler uses this to submit the password.
+        auth_state: ?*anyopaque = null,
+    };
 
     pub const UploadProgress = struct {
         bytes_sent: u64,
@@ -38,13 +47,21 @@ pub const ConnectionState = union(enum) {
         timeout,
         helper_failed,
     };
+
+    /// C ABI representation — this is an internal-only action so we
+    /// use void; the GTK handler reads from renderer_state instead.
+    pub const C = void;
+
+    pub fn cval(self: ConnectionState) void {
+        _ = self;
+    }
 };
 
 /// Protocol version for the session wire format. Increment this when
 /// making incompatible changes to the protocol. The remote helper
 /// reports this via `+session-helper --version` so the client knows
 /// whether to re-upload.
-pub const protocol_version: u16 = 5;
+pub const protocol_version: u16 = 6;
 
 /// Size of a frame header in bytes.
 pub const header_size: usize = 8;
@@ -68,6 +85,7 @@ pub const Kind = enum(u8) {
     layout_restore = 20,
     surface_open = 21,
     surface_close = 22,
+    session_rename = 23,
 };
 
 pub const Header = struct {
@@ -82,28 +100,83 @@ pub const OpenMode = enum(u8) {
     attach = 1,
 };
 
+pub const Uuid = @import("shared.zig").Uuid;
+pub const zero_uuid = @import("shared.zig").zero_uuid;
+pub const uuid_size = 16;
+
 /// Payload for session_open:
-///   8-byte resize + 1-byte open_mode + label_or_id string.
+///   [8]  Resize
+///   [1]  OpenMode
+///   [16] surface_id (UUID, binary)
+///   [16] group_id   (UUID, binary; client-generated for new, lookup key for attach)
+///   [N]  label      (remaining bytes; session label for new, label-based lookup for attach)
+///
+/// Both IDs are generated client-side to avoid round-trip latency.
+/// For mode=new: daemon creates a SessionGroup with the given group_id.
+/// For mode=attach: daemon finds group by group_id, or by label if group_id is zero.
 pub const SessionOpen = struct {
     resize: Resize,
     mode: OpenMode = .new,
-    label_or_id: []const u8,
+    surface_id: Uuid = zero_uuid,
+    group_id: Uuid = zero_uuid,
+    label: []const u8 = "",
 
     pub fn encode(self: SessionOpen, alloc: Allocator) ![]u8 {
+        const total = 9 + uuid_size * 2 + self.label.len;
+        var buf = try alloc.alloc(u8, total);
         const resize_bytes = self.resize.bytes();
-        var buf = try alloc.alloc(u8, 9 + self.label_or_id.len);
         @memcpy(buf[0..8], &resize_bytes);
         buf[8] = @intFromEnum(self.mode);
-        @memcpy(buf[9..], self.label_or_id);
+        @memcpy(buf[9 .. 9 + uuid_size], &self.surface_id);
+        @memcpy(buf[9 + uuid_size .. 9 + uuid_size * 2], &self.group_id);
+        @memcpy(buf[9 + uuid_size * 2 ..], self.label);
         return buf;
     }
 
     pub fn parse(payload: []const u8) !SessionOpen {
-        if (payload.len < 9) return error.InvalidSessionOpenPayload;
+        if (payload.len < 9 + uuid_size * 2) return error.InvalidSessionOpenPayload;
         return .{
             .resize = try Resize.parse(payload[0..8]),
             .mode = std.meta.intToEnum(OpenMode, payload[8]) catch .new,
-            .label_or_id = payload[9..],
+            .surface_id = payload[9..][0..uuid_size].*,
+            .group_id = payload[9 + uuid_size ..][0..uuid_size].*,
+            .label = payload[9 + uuid_size * 2 ..],
+        };
+    }
+};
+
+/// Payload for surface_open:
+///   [8]  Resize
+///   [1]  OpenMode
+///   [16] group_id (UUID, binary)
+///   [16] surface_id (UUID, binary)
+///
+/// Used when adding a surface to an existing session group (e.g. splits).
+pub const SurfaceOpen = struct {
+    resize: Resize,
+    mode: OpenMode = .new,
+    group_id: Uuid,
+    surface_id: Uuid,
+
+    pub const payload_size = 9 + uuid_size * 2;
+
+    pub fn encode(self: SurfaceOpen, alloc: Allocator) ![]u8 {
+        var buf = try alloc.alloc(u8, payload_size);
+        const resize_bytes = self.resize.bytes();
+        @memcpy(buf[0..8], &resize_bytes);
+        buf[8] = @intFromEnum(self.mode);
+        @memcpy(buf[9 .. 9 + uuid_size], &self.group_id);
+        @memcpy(buf[9 + uuid_size .. 9 + uuid_size * 2], &self.surface_id);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !SurfaceOpen {
+        if (payload.len < payload_size) return error.InvalidSurfaceOpenPayload;
+        return .{
+            .resize = try Resize.parse(payload[0..8]),
+            .mode = std.meta.intToEnum(OpenMode, payload[8]) catch .new,
+            .group_id = payload[9..][0..uuid_size].*,
+            .surface_id = payload[9 + uuid_size ..][0..uuid_size].*,
         };
     }
 };
@@ -219,17 +292,22 @@ test "protocol roundtrip" {
     try testing.expectEqualStrings("hello", payload);
 }
 
-test "protocol version is 5" {
+test "protocol version is 6" {
     const testing = std.testing;
-    try testing.expectEqual(@as(u16, 5), protocol_version);
+    try testing.expectEqual(@as(u16, 6), protocol_version);
 }
 
-test "session open encode/parse" {
+test "session open encode/parse with IDs" {
     const testing = std.testing;
+    const shared = @import("shared.zig");
+    const sid = shared.generateUuid();
+    const gid = shared.generateUuid();
     const so = SessionOpen{
         .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
         .mode = .new,
-        .label_or_id = "test-session",
+        .surface_id = sid,
+        .group_id = gid,
+        .label = "test-session",
     };
     const encoded = try so.encode(testing.allocator);
     defer testing.allocator.free(encoded);
@@ -238,15 +316,19 @@ test "session open encode/parse" {
     try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
     try testing.expectEqual(@as(u16, 80), parsed.resize.cols);
     try testing.expectEqual(OpenMode.new, parsed.mode);
-    try testing.expectEqualStrings("test-session", parsed.label_or_id);
+    try testing.expectEqualSlices(u8, &sid, &parsed.surface_id);
+    try testing.expectEqualSlices(u8, &gid, &parsed.group_id);
+    try testing.expectEqualStrings("test-session", parsed.label);
 }
 
 test "session open attach mode" {
     const testing = std.testing;
+    const shared = @import("shared.zig");
+    const gid = shared.generateUuid();
     const so = SessionOpen{
         .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
         .mode = .attach,
-        .label_or_id = "abc123",
+        .group_id = gid,
     };
     const encoded = try so.encode(testing.allocator);
     defer testing.allocator.free(encoded);
@@ -254,5 +336,29 @@ test "session open attach mode" {
     const parsed = try SessionOpen.parse(encoded);
     try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
     try testing.expectEqual(OpenMode.attach, parsed.mode);
-    try testing.expectEqualStrings("abc123", parsed.label_or_id);
+    try testing.expectEqualSlices(u8, &gid, &parsed.group_id);
+}
+
+test "surface open encode/parse" {
+    const testing = std.testing;
+    const shared = @import("shared.zig");
+    const gid = shared.generateUuid();
+    const sid = shared.generateUuid();
+    const so = SurfaceOpen{
+        .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
+        .mode = .new,
+        .group_id = gid,
+        .surface_id = sid,
+    };
+    const encoded = try so.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+
+    try testing.expectEqual(@as(usize, SurfaceOpen.payload_size), encoded.len);
+
+    const parsed = try SurfaceOpen.parse(encoded);
+    try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
+    try testing.expectEqual(@as(u16, 80), parsed.resize.cols);
+    try testing.expectEqual(OpenMode.new, parsed.mode);
+    try testing.expectEqualSlices(u8, &gid, &parsed.group_id);
+    try testing.expectEqualSlices(u8, &sid, &parsed.surface_id);
 }

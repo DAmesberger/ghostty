@@ -658,6 +658,25 @@ pub const Application = extern struct {
         self.private().running = false;
     }
 
+    /// Open a new window with an SSH remote session to the given target.
+    pub fn newSshWindow(self: *Self, ssh_target: []const u8) void {
+        Action.newWindow(self, null, .{
+            .ssh_target = ssh_target,
+        }) catch |err| {
+            log.warn("failed to create SSH window: {}", .{err});
+        };
+    }
+
+    /// Open a new window that attaches to an existing SSH remote session.
+    pub fn newSshAttachWindow(self: *Self, ssh_target: []const u8, ssh_session: []const u8) void {
+        Action.newWindow(self, null, .{
+            .ssh_target = ssh_target,
+            .ssh_session = ssh_session,
+        }) catch |err| {
+            log.warn("failed to create SSH attach window: {}", .{err});
+        };
+    }
+
     /// apprt API to perform an action.
     pub fn performAction(
         self: *Self,
@@ -763,6 +782,14 @@ pub const Application = extern struct {
             .end_search => Action.endSearch(target),
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
+
+            .restore_layout => return Action.restoreLayout(target),
+
+            .connection_state => return Action.connectionState(target),
+
+            .open_ssh_connection => return Action.openSshConnection(target),
+
+            .ssh_session_attach => return Action.sshSessionAttach(target),
 
             // Unimplemented
             .secure_input,
@@ -2225,6 +2252,8 @@ const Action = struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            ssh_target: ?[]const u8 = null,
+            ssh_session: ?[]const u8 = null,
 
             pub const none: @This() = .{};
         },
@@ -2247,6 +2276,8 @@ const Action = struct {
                 .command = overrides.command,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
+                .ssh_target = overrides.ssh_target,
+                .ssh_session = overrides.ssh_session,
             },
         );
     }
@@ -2259,6 +2290,8 @@ const Action = struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            ssh_target: ?[]const u8 = null,
+            ssh_session: ?[]const u8 = null,
 
             pub const none: @This() = .{};
         },
@@ -2279,6 +2312,8 @@ const Action = struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
+            .ssh_target = overrides.ssh_target,
+            .ssh_session = overrides.ssh_session,
         });
 
         // Estimate the initial window size before presenting so the window
@@ -2580,6 +2615,37 @@ const Action = struct {
         };
     }
 
+    pub fn restoreLayout(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const blob = core.pending_layout_restore orelse return false;
+                const surface = core.rt_surface.surface;
+                const split_tree = ext.getAncestor(
+                    SplitTree,
+                    surface.as(gtk.Widget),
+                ) orelse return false;
+                split_tree.restoreFromBlob(blob, surface);
+                return true;
+            },
+        }
+    }
+
+    pub fn connectionState(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const gtk_surface = core.rt_surface.surface;
+                // renderer_state.connection_state was set by the caller
+                // (Surface.handleMessage) just before dispatching this action,
+                // on the same thread, so no lock needed here.
+                const conn_state = core.renderer_state.connection_state;
+                gtk_surface.updateConnectionOverlay(conn_state);
+                return true;
+            },
+        }
+    }
+
     pub fn showGtkInspector() void {
         gtk.Window.setInteractiveDebugging(@intFromBool(true));
     }
@@ -2745,6 +2811,24 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().toggleCommandPalette();
+            },
+        }
+    }
+
+    pub fn openSshConnection(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().openSshConnection();
+            },
+        }
+    }
+
+    pub fn sshSessionAttach(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().sshSessionAttach();
             },
         }
     }

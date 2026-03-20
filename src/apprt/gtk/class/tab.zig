@@ -191,6 +191,8 @@ pub const Tab = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        ssh_target: ?[]const u8 = null,
+        ssh_session: ?[]const u8 = null,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -214,6 +216,8 @@ pub const Tab = extern struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
+            .ssh_target = overrides.ssh_target,
+            .ssh_session = overrides.ssh_session,
         }) catch |err| switch (err) {
             error.OutOfMemory => {
                 // TODO: We should make our "no surfaces" state more aesthetically
@@ -478,7 +482,7 @@ pub const Tab = extern struct {
     }
 
     fn closureComputedTitle(
-        _: *Self,
+        self: *Self,
         config_: ?*Config,
         terminal_: ?[*:0]const u8,
         surface_override_: ?[*:0]const u8,
@@ -521,6 +525,18 @@ pub const Tab = extern struct {
         var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
         defer buf.deinit();
 
+        // If the connection is degraded, prefix with state indicator.
+        const remote_info = self.getRemoteInfo();
+        if (remote_info.conn_state) |state| {
+            switch (state) {
+                .reconnecting => buf.writer.writeAll("[reconnecting] ") catch {},
+                .stale => buf.writer.writeAll("[stale] ") catch {},
+                .failed => buf.writer.writeAll("[disconnected] ") catch {},
+                .connecting => buf.writer.writeAll("[connecting] ") catch {},
+                else => {},
+            }
+        }
+
         // If our bell is ringing, then we prefix the bell icon to the title.
         if (bell_ringing and config.@"bell-features".title) {
             buf.writer.writeAll("🔔 ") catch {};
@@ -532,7 +548,45 @@ pub const Tab = extern struct {
         }
 
         buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
+
+        // Append SSH target info for remote surfaces.
+        if (remote_info.ssh_target) |target| {
+            buf.writer.writeAll(" \xe2\x80\x94 ") catch {}; // " — " (em dash)
+            buf.writer.writeAll(target) catch {};
+            if (remote_info.label) |label| {
+                buf.writer.writeAll(" (") catch {};
+                buf.writer.writeAll(label) catch {};
+                buf.writer.writeAll(")") catch {};
+            }
+        }
+
         return glib.ext.dupeZ(u8, buf.written());
+    }
+
+    const RemoteInfo = struct {
+        ssh_target: ?[]const u8 = null,
+        label: ?[]const u8 = null,
+        conn_state: ?@import("../../../session.zig").protocol.ConnectionState = null,
+    };
+
+    /// Get SSH remote info from the active surface, if any.
+    fn getRemoteInfo(self: *Self) RemoteInfo {
+        const split_tree = self.private().split_tree;
+        const surface = split_tree.getActiveSurface() orelse return .{};
+        const core = surface.core() orelse return .{};
+        return switch (core.io.backend) {
+            .remote => |remote| blk: {
+                core.renderer_state.mutex.lock();
+                const conn_state = core.renderer_state.connection_state;
+                core.renderer_state.mutex.unlock();
+                break :blk .{
+                    .ssh_target = remote.ssh_target,
+                    .label = remote.label,
+                    .conn_state = conn_state,
+                };
+            },
+            else => .{},
+        };
     }
 
     const C = Common(Self, Private);

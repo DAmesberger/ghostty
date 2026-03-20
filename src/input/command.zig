@@ -561,16 +561,28 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show the on-screen keyboard if present.",
         }},
 
-        .session_detach => comptime &.{.{
-            .action = .session_detach,
+        .ssh_session_detach => comptime &.{.{
+            .action = .ssh_session_detach,
             .title = "Detach Remote Session",
             .description = "Detach the current Ghostty remote session without killing it.",
         }},
 
-        .session_reconnect => comptime &.{.{
-            .action = .session_reconnect,
+        .open_ssh_connection => comptime &.{.{
+            .action = .open_ssh_connection,
+            .title = "Open SSH Connection",
+            .description = "Open the SSH connection picker to connect to a saved host from ~/.ssh/config or enter an ad-hoc SSH target.",
+        }},
+
+        .ssh_session_reconnect => comptime &.{.{
+            .action = .ssh_session_reconnect,
             .title = "Reconnect Remote Session",
             .description = "Reconnect the current Ghostty remote session after a disconnect.",
+        }},
+
+        .ssh_session_attach => comptime &.{.{
+            .action = .ssh_session_attach,
+            .title = "Attach SSH Session",
+            .description = "Attach to a detached remote SSH session.",
         }},
 
         .open_config => comptime &.{.{

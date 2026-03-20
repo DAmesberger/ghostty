@@ -6,6 +6,7 @@ const configpkg = @import("../config.zig");
 const input = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const session = @import("../session.zig");
 const CoreSurface = @import("../Surface.zig");
 const lib = @import("../lib/main.zig");
 
@@ -343,6 +344,21 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Restore a split layout from a remote session daemon.
+    /// The blob is stored on the surface's `pending_layout_restore` field
+    /// and should be consumed and cleared by the handler.
+    restore_layout,
+
+    /// The SSH connection state has changed for the target surface.
+    /// The GTK handler reads the actual state from renderer_state.
+    connection_state: session.protocol.ConnectionState,
+
+    /// Open the SSH connection picker dialog.
+    open_ssh_connection,
+
+    /// Attach to a detached SSH remote session.
+    ssh_session_attach,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -410,6 +426,10 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        restore_layout,
+        connection_state,
+        open_ssh_connection,
+        ssh_session_attach,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

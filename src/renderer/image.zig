@@ -9,8 +9,6 @@ const GraphicsAPI = Renderer.API;
 const Texture = GraphicsAPI.Texture;
 const CellSize = @import("size.zig").CellSize;
 const Overlay = @import("Overlay.zig");
-const ConnectionOverlay = @import("ConnectionOverlay.zig");
-
 const log = std.log.scoped(.renderer_image);
 
 /// Generic image rendering state for the renderer. This stores all
@@ -37,9 +35,6 @@ pub const State = struct {
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
-    /// Connection status overlay placements
-    connection_overlay_placements: std.ArrayListUnmanaged(Placement),
-
     pub const empty: State = .{
         .images = .empty,
         .kitty_placements = .empty,
@@ -47,7 +42,6 @@ pub const State = struct {
         .kitty_text_end = 0,
         .kitty_virtual = false,
         .overlay_placements = .empty,
-        .connection_overlay_placements = .empty,
     };
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -58,7 +52,6 @@ pub const State = struct {
         }
         self.kitty_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
-        self.connection_overlay_placements.deinit(alloc);
     }
 
     /// Upload any images to the GPU that need to be uploaded,
@@ -101,7 +94,6 @@ pub const State = struct {
         kitty_below_text,
         kitty_above_text,
         overlay,
-        connection_overlay,
     };
 
     /// Draw the given named set of placements.
@@ -120,7 +112,6 @@ pub const State = struct {
             .kitty_below_text => self.kitty_placements.items[self.kitty_bg_end..self.kitty_text_end],
             .kitty_above_text => self.kitty_placements.items[self.kitty_text_end..],
             .overlay => self.overlay_placements.items,
-            .connection_overlay => self.connection_overlay_placements.items,
         };
 
         for (placements) |p| {
@@ -237,50 +228,6 @@ pub const State = struct {
         });
     }
 
-    /// Update connection overlay state. Null value removes existing overlay.
-    pub fn connectionOverlayUpdate(
-        self: *State,
-        alloc: Allocator,
-        conn_overlay: ?ConnectionOverlay,
-    ) !void {
-        const co = conn_overlay orelse {
-            if (self.images.getPtr(.connection_overlay)) |data| {
-                data.image.markForUnload();
-            }
-            self.connection_overlay_placements.clearRetainingCapacity();
-            return;
-        };
-
-        const transmit_time = try std.time.Instant.now();
-
-        self.connection_overlay_placements.clearRetainingCapacity();
-        try self.connection_overlay_placements.ensureUnusedCapacity(alloc, 1);
-
-        const pending = co.pendingImage();
-        try self.prepImage(
-            alloc,
-            .connection_overlay,
-            transmit_time,
-            pending,
-        );
-        errdefer comptime unreachable;
-
-        self.connection_overlay_placements.appendAssumeCapacity(.{
-            .image_id = .connection_overlay,
-            .x = 0,
-            .y = 0,
-            .z = 0,
-            .width = pending.width,
-            .height = pending.height,
-            .cell_offset_x = 0,
-            .cell_offset_y = 0,
-            .source_x = 0,
-            .source_y = 0,
-            .source_width = pending.width,
-            .source_height = pending.height,
-        });
-    }
-
     /// Returns true if the Kitty graphics state requires an update based
     /// on the terminal state and our internal state.
     ///
@@ -332,7 +279,7 @@ pub const State = struct {
                         kv.value_ptr.image.markForUnload();
                     },
 
-                    .overlay, .connection_overlay => {},
+                    .overlay => {},
                 }
             }
         }
@@ -713,9 +660,6 @@ pub const Id = union(enum) {
     /// image for now. In the future we can support layers here if we want.
     overlay,
 
-    /// Connection status overlay for SSH remote sessions.
-    connection_overlay,
-
     /// Z-ordering tie-breaker for images with the same z value.
     pub fn zLessThan(lhs: Id, rhs: Id) bool {
         // If our tags aren't the same, we sort by tag.
@@ -724,7 +668,7 @@ pub const Id = union(enum) {
                 // Kitty images always sort before (lower z) non-kitty images.
                 .kitty => true,
 
-                .overlay, .connection_overlay => false,
+                .overlay => false,
             };
         }
 
@@ -735,7 +679,7 @@ pub const Id = union(enum) {
             },
 
             // No sensical ordering
-            .overlay, .connection_overlay => return false,
+            .overlay => return false,
         }
     }
 };
