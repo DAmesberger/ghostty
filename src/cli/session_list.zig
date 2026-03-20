@@ -92,6 +92,53 @@ pub fn run(alloc: Allocator) !u8 {
         return 1;
     }
 
-    try std.fs.File.stdout().writeAll(result.stdout);
+    // Parse and format the session list with human-readable ages.
+    // Raw format from daemon: id|label|status|created_at|attached
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer_ = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_writer_.interface;
+
+    const now = std.time.timestamp();
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '|');
+        const id = fields.next() orelse continue;
+        const label = fields.next() orelse "";
+        const status = fields.next() orelse "";
+        const created_str = fields.next() orelse "";
+        const attached = fields.next() orelse "";
+
+        const created_at = std.fmt.parseInt(i64, created_str, 10) catch 0;
+        const age_secs: u64 = if (created_at > 0) @intCast(@max(0, now - created_at)) else 0;
+
+        try stdout.print("{s}  {s}  {s}  age: {s}  {s}\n", .{
+            id,
+            label,
+            status,
+            formatAge(age_secs),
+            attached,
+        });
+    }
+    try stdout.flush();
     return 0;
+}
+
+fn formatAge(secs: u64) []const u8 {
+    const State = struct {
+        var buf: [32]u8 = undefined;
+    };
+    if (secs < 60) {
+        const result = std.fmt.bufPrint(&State.buf, "{d}s", .{secs}) catch "?";
+        return result;
+    } else if (secs < 3600) {
+        const result = std.fmt.bufPrint(&State.buf, "{d}m", .{secs / 60}) catch "?";
+        return result;
+    } else if (secs < 86400) {
+        const result = std.fmt.bufPrint(&State.buf, "{d}h{d}m", .{ secs / 3600, (secs % 3600) / 60 }) catch "?";
+        return result;
+    } else {
+        const result = std.fmt.bufPrint(&State.buf, "{d}d{d}h", .{ secs / 86400, (secs % 86400) / 3600 }) catch "?";
+        return result;
+    }
 }

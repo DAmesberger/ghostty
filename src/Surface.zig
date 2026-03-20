@@ -628,6 +628,7 @@ pub fn init(
                 var io_remote = try termio.Remote.init(alloc, .{
                     .ssh_target = ssh_target,
                     .jump = config.@"ssh-jump",
+                    .session_id = config.@"ssh-session",
                     .connection_manager = &app.ssh_connection_manager,
                 });
                 errdefer io_remote.deinit();
@@ -882,10 +883,24 @@ fn isRemoteSurface(self: *const Surface) bool {
 
 fn sendSessionControl(self: *Surface, comptime cmd: session.shared.ControlCommand) bool {
     if (!isRemoteSurface(self)) return false;
-    // For remote surfaces, we send detach/reconnect through the protocol
-    _ = cmd;
-    // TODO: implement detach/reconnect for Remote backend
-    return false;
+    switch (cmd) {
+        .detach => {
+            // Send detach frame to the remote, then close the surface.
+            // The remote session stays alive for later reattachment.
+            const remote = &self.io.backend.remote;
+            if (remote.conn_entry) |entry| {
+                termio.SshConnectionManager.enqueueWrite(
+                    entry,
+                    .detach,
+                    remote.target_id,
+                    "",
+                );
+            }
+            self.close();
+            return true;
+        },
+        .reconnect => return false,
+    }
 }
 
 /// Forces the surface to render. This is useful for when the surface

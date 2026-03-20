@@ -1208,6 +1208,12 @@ command: ?Command = null,
 /// or `user@host:port`.
 @"ssh-jump": ?[]const u8 = null,
 
+/// Attach to an existing remote session instead of creating a new one.
+/// The value is a session ID as shown by `ghostty +session-list`.
+/// When set, the remote daemon reattaches to the existing session and
+/// sends a snapshot of the current terminal state.
+@"ssh-session": ?[]const u8 = null,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///
