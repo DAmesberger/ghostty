@@ -82,7 +82,7 @@ pub fn run(alloc: Allocator) !u8 {
 
     const helper_path = try session.client.ensureRemoteHelper(alloc, &ctx, stderr, null);
     defer alloc.free(helper_path);
-    try session.client.ensureRemoteDaemon(alloc, &ctx, helper_path);
+    try session.client.ensureRemoteDaemon(alloc, &ctx, helper_path, false);
 
     const cmd = try std.fmt.allocPrint(
         alloc,

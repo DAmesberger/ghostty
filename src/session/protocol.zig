@@ -44,7 +44,7 @@ pub const ConnectionState = union(enum) {
 /// making incompatible changes to the protocol. The remote helper
 /// reports this via `+session-helper --version` so the client knows
 /// whether to re-upload.
-pub const protocol_version: u16 = 3;
+pub const protocol_version: u16 = 5;
 
 /// Size of a frame header in bytes.
 pub const header_size: usize = 8;
@@ -62,8 +62,12 @@ pub const Kind = enum(u8) {
     session_close = 10,
     keepalive = 11,
     state_full = 12,
-    state_delta = 13,
-    state_ack = 14,
+    session_list_request = 15,
+    session_list_entry = 16,
+    layout_update = 19,
+    layout_restore = 20,
+    surface_open = 21,
+    surface_close = 22,
 };
 
 pub const Header = struct {
@@ -73,41 +77,33 @@ pub const Header = struct {
     len: u32,
 };
 
-pub const RenderMode = enum(u8) {
-    raw = 0,
-    state_sync = 1,
+pub const OpenMode = enum(u8) {
+    new = 0,
+    attach = 1,
 };
 
-/// Payload for session_open: 8-byte resize + 1-byte render_mode + label string.
-/// For backward compatibility, if payload is exactly 8 + label (no render_mode byte),
-/// we default to .raw.
+/// Payload for session_open:
+///   8-byte resize + 1-byte open_mode + label_or_id string.
 pub const SessionOpen = struct {
     resize: Resize,
-    render_mode: RenderMode = .raw,
-    label: []const u8,
+    mode: OpenMode = .new,
+    label_or_id: []const u8,
 
     pub fn encode(self: SessionOpen, alloc: Allocator) ![]u8 {
         const resize_bytes = self.resize.bytes();
-        var buf = try alloc.alloc(u8, 9 + self.label.len);
+        var buf = try alloc.alloc(u8, 9 + self.label_or_id.len);
         @memcpy(buf[0..8], &resize_bytes);
-        buf[8] = @intFromEnum(self.render_mode);
-        @memcpy(buf[9..], self.label);
+        buf[8] = @intFromEnum(self.mode);
+        @memcpy(buf[9..], self.label_or_id);
         return buf;
     }
 
     pub fn parse(payload: []const u8) !SessionOpen {
-        if (payload.len < 8) return error.InvalidSessionOpenPayload;
-        // Backward compat: old clients send 8-byte resize + label (no render_mode)
-        if (payload.len == 8 or payload[8] > 1) {
-            return .{
-                .resize = try Resize.parse(payload[0..8]),
-                .label = payload[8..],
-            };
-        }
+        if (payload.len < 9) return error.InvalidSessionOpenPayload;
         return .{
             .resize = try Resize.parse(payload[0..8]),
-            .render_mode = std.meta.intToEnum(RenderMode, payload[8]) catch .raw,
-            .label = payload[9..],
+            .mode = std.meta.intToEnum(OpenMode, payload[8]) catch .new,
+            .label_or_id = payload[9..],
         };
     }
 };
@@ -223,17 +219,17 @@ test "protocol roundtrip" {
     try testing.expectEqualStrings("hello", payload);
 }
 
-test "protocol version is 3" {
+test "protocol version is 5" {
     const testing = std.testing;
-    try testing.expectEqual(@as(u16, 3), protocol_version);
+    try testing.expectEqual(@as(u16, 5), protocol_version);
 }
 
 test "session open encode/parse" {
     const testing = std.testing;
     const so = SessionOpen{
         .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
-        .render_mode = .state_sync,
-        .label = "test-session",
+        .mode = .new,
+        .label_or_id = "test-session",
     };
     const encoded = try so.encode(testing.allocator);
     defer testing.allocator.free(encoded);
@@ -241,21 +237,22 @@ test "session open encode/parse" {
     const parsed = try SessionOpen.parse(encoded);
     try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
     try testing.expectEqual(@as(u16, 80), parsed.resize.cols);
-    try testing.expectEqual(RenderMode.state_sync, parsed.render_mode);
-    try testing.expectEqualStrings("test-session", parsed.label);
+    try testing.expectEqual(OpenMode.new, parsed.mode);
+    try testing.expectEqualStrings("test-session", parsed.label_or_id);
 }
 
-test "session open backward compat parse" {
+test "session open attach mode" {
     const testing = std.testing;
-    // Simulate old-format payload: 8-byte resize + label (no render_mode)
-    const resize = Resize{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 };
-    const resize_bytes = resize.bytes();
-    var old_payload: [8 + 7]u8 = undefined;
-    @memcpy(old_payload[0..8], &resize_bytes);
-    @memcpy(old_payload[8..], "session");
+    const so = SessionOpen{
+        .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
+        .mode = .attach,
+        .label_or_id = "abc123",
+    };
+    const encoded = try so.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
 
-    const parsed = try SessionOpen.parse(&old_payload);
+    const parsed = try SessionOpen.parse(encoded);
     try testing.expectEqual(@as(u16, 24), parsed.resize.rows);
-    try testing.expectEqual(RenderMode.raw, parsed.render_mode);
-    try testing.expectEqualStrings("session", parsed.label);
+    try testing.expectEqual(OpenMode.attach, parsed.mode);
+    try testing.expectEqualStrings("abc123", parsed.label_or_id);
 }

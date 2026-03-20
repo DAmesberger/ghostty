@@ -147,8 +147,10 @@ pub fn threadEnter(
 
     _ = td.surface_mailbox.push(.{ .connection_state = .setup }, .{ .forever = {} });
 
-    // Send session_open frame via write queue
+    // Send session_open frame via write queue.
     {
+        const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
+        const label_or_id = self.session_id orelse (self.label orelse "session");
         const open_payload = (session.protocol.SessionOpen{
             .resize = .{
                 .rows = @intCast(self.grid_size.rows),
@@ -156,7 +158,8 @@ pub fn threadEnter(
                 .width_px = @intCast(self.screen_size.width),
                 .height_px = @intCast(self.screen_size.height),
             },
-            .label = self.label orelse "session",
+            .mode = mode,
+            .label_or_id = label_or_id,
         }).encode(alloc) catch return error.OutOfMemory;
         defer alloc.free(open_payload);
         SshConnectionManager.enqueueWrite(entry, .session_open, self.target_id, open_payload);
@@ -194,7 +197,7 @@ fn setupConnection(
         return err;
     };
 
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path) catch |err| {
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path, true) catch |err| {
         alloc.free(helper_path);
         _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;

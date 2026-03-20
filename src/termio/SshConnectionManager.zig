@@ -248,6 +248,7 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
 // =========================================================================
 
 pub fn sshThreadMain(entry: *Entry) void {
+
     // Close read ends of pipes on exit
     defer posix.close(entry.quit_pipe[0]);
     defer posix.close(entry.write_pipe[0]);
@@ -373,7 +374,7 @@ pub fn sshThreadMain(entry: *Entry) void {
 
         // 7. Block in poll until next event or timeout
         _ = posix.poll(&pollfds, timeout_ms) catch |err| {
-            log.warn("ssh thread poll failed: {}", .{err});
+            log.warn("poll failed: {}", .{err});
             return;
         };
 
@@ -477,7 +478,8 @@ fn attemptReconnect(entry: *Entry) bool {
             if (slot) |s| {
                 const open_payload = (session.protocol.SessionOpen{
                     .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
-                    .label = "reconnected",
+                    .mode = .attach,
+                    .label_or_id = "reconnected",
                 }).encode(std.heap.page_allocator) catch continue;
                 defer std.heap.page_allocator.free(open_payload);
                 sendFrame(&entry.channel.?, .session_open, s.target_id, open_payload) catch {};
@@ -500,7 +502,7 @@ fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     } else |_| {}
 
     // Helper might be dead — restart daemon and retry
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, entry.helper_path) catch return null;
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, entry.helper_path, true) catch return null;
 
     return session.client.openMultiplexChannel(alloc, &entry.ctx, entry.helper_path) catch null;
 }
@@ -560,13 +562,8 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
 
 fn dispatchFrame(kind: session.protocol.Kind, slot: SurfaceSlot, payload: []const u8) void {
     switch (kind) {
-        .stdout => @call(.always_inline, termio.Termio.processOutput, .{ slot.io, payload }),
-        .state_delta, .state_full => {
-            // Apply terminal state delta/snapshot to the surface's terminal.
-            // This is the client-side of the state sync protocol.
-            slot.io.applyStateDelta(payload) catch |err| {
-                log.warn("state delta apply failed: {}", .{err});
-            };
+        .stdout, .state_full => {
+            @call(.always_inline, termio.Termio.processOutput, .{ slot.io, payload });
         },
         .session_opened => log.info("remote session opened id={s}", .{payload}),
         .info => log.info("remote info: {s}", .{payload}),

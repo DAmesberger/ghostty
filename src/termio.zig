@@ -23,6 +23,7 @@ const message = @import("termio/message.zig");
 pub const backend = @import("termio/backend.zig");
 pub const mailbox = @import("termio/mailbox.zig");
 pub const Exec = @import("termio/Exec.zig");
+pub const HeadlessStreamHandler = @import("termio/HeadlessStreamHandler.zig");
 pub const Remote = @import("termio/Remote.zig");
 pub const SshConnectionManager = @import("termio/SshConnectionManager.zig");
 pub const Options = @import("termio/Options.zig");

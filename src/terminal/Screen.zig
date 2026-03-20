@@ -1378,7 +1378,6 @@ pub fn clearCells(
         const page_rows = page.rows.ptr(page.memory.ptr);
         assert(@intFromPtr(row) >= @intFromPtr(&page_rows[0]));
         assert(@intFromPtr(row) <= @intFromPtr(&page_rows[page.size.rows - 1]));
-
         const row_cells = page.getCells(row);
         assert(@intFromPtr(&cells[0]) >= @intFromPtr(&row_cells[0]));
         assert(@intFromPtr(&cells[cells.len - 1]) <= @intFromPtr(&row_cells[row_cells.len - 1]));

@@ -295,10 +295,10 @@ pub const Page = struct {
     /// safety is disabled. This uses the libc allocator.
     pub inline fn assertIntegrity(self: *const Page) void {
         if (comptime build_options.slow_runtime_safety) {
-            var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-            defer _ = debug_allocator.deinit();
-            const alloc = debug_allocator.allocator();
-            self.verifyIntegrity(alloc) catch |err| {
+            // Use c_allocator for temporary allocations. DebugAllocator
+            // (GPA wrapper) is not safe in forked processes due to
+            // thread-local storage and ELF debug info access issues.
+            self.verifyIntegrity(std.heap.c_allocator) catch |err| {
                 log.err("page integrity violation, crashing. err={}", .{err});
                 @panic("page integrity violation");
             };

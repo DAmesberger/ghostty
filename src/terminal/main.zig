@@ -48,7 +48,6 @@ pub const SizeReportStyle = csi.SizeReportStyle;
 pub const StringMap = @import("StringMap.zig");
 pub const Style = style.Style;
 pub const Terminal = @import("Terminal.zig");
-pub const state_sync = @import("state_sync.zig");
 pub const Stream = stream.Stream;
 pub const StreamAction = stream.Action;
 pub const Cursor = Screen.Cursor;

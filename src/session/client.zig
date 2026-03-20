@@ -207,19 +207,32 @@ pub fn ensureRemoteHelper(
 }
 
 /// Launch the remote session daemon via the helper's --daemonize flag.
-/// With the double-fork daemonization, this returns promptly.
+/// If `force_restart` is true, kills any existing daemon first (used
+/// when the helper binary was re-uploaded with a new protocol version).
 pub fn ensureRemoteDaemon(
     alloc: Allocator,
     ctx: *const SshContext,
     helper_path: []const u8,
+    force_restart: bool,
 ) !void {
     var sess = ctx.session orelse return error.RemoteCommandFailed;
-    {
-        const dbg = std.fs.File.stderr();
-        var b: [80]u8 = undefined;
-        const m = std.fmt.bufPrint(&b, "[ensureRemoteDaemon] sock={d}\n", .{sess.sock}) catch "";
-        dbg.writeAll(m) catch {};
+
+    if (force_restart) {
+        // Kill any existing daemon — the old one may be running old code
+        // in memory even after the binary was re-uploaded.
+        const kill_cmd = try std.fmt.allocPrint(
+            alloc,
+            "{s} +session-helper --kill-daemon",
+            .{helper_path},
+        );
+        defer alloc.free(kill_cmd);
+        const kill_result = sess.exec(kill_cmd) catch null;
+        if (kill_result) |r| {
+            alloc.free(r.stdout);
+            alloc.free(r.stderr);
+        }
     }
+
     const cmd = try std.fmt.allocPrint(
         alloc,
         "{s} +session-helper --daemonize",
