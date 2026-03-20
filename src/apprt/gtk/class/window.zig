@@ -28,6 +28,8 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
+const session_layout = @import("../../../session.zig").layout;
+const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
 const SshConnectionOverlay = @import("ssh_connection_overlay.zig").SshConnectionOverlay;
 const SshSessionPicker = @import("ssh_session_picker.zig").SshSessionPicker;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -402,7 +404,13 @@ pub const Window = extern struct {
     /// at the position dictated by the `window-new-tab-position` config.
     /// The new tab will be selected.
     pub fn newTab(self: *Self, parent_: ?*CoreSurface) void {
-        _ = self.newTabPage(parent_, .tab, .none);
+        // If the parent surface is remote, inherit its SSH target so new tabs
+        // stay on the same connection instead of opening a local terminal.
+        const ssh_target: ?[]const u8 = if (parent_) |p|
+            (if (p.io.backend == .remote) p.io.backend.remote.ssh_target else null)
+        else
+            null;
+        _ = self.newTabPage(parent_, .tab, .{ .ssh_target = ssh_target });
     }
 
     pub fn newTabForWindow(
@@ -1229,13 +1237,32 @@ pub const Window = extern struct {
     }
 
     fn closureSubtitle(
-        _: *Self,
+        self: *Self,
         config_: ?*Config,
         pwd_: ?[*:0]const u8,
     ) callconv(.c) ?[*:0]const u8 {
         const config = if (config_) |v| v.get() else return null;
+        if (config.@"window-subtitle" == .false) return null;
+
+        // For remote surfaces, show "session-name @ ssh-target" as subtitle.
+        if (self.getActiveSurface()) |surface| {
+            if (surface.core()) |core| {
+                if (core.io.backend == .remote) {
+                    const remote = &core.io.backend.remote;
+                    var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
+                    defer buf.deinit();
+                    if (remote.label) |label| {
+                        buf.writer.writeAll(label) catch {};
+                        buf.writer.writeAll(" @ ") catch {};
+                    }
+                    buf.writer.writeAll(remote.ssh_target) catch {};
+                    return glib.ext.dupeZ(u8, buf.written());
+                }
+            }
+        }
+
         return switch (config.@"window-subtitle") {
-            .false => null,
+            .false => unreachable,
             .@"working-directory" => pwd: {
                 const pwd = pwd_ orelse return null;
                 break :pwd glib.ext.dupeZ(u8, std.mem.span(pwd));
@@ -1775,7 +1802,207 @@ pub const Window = extern struct {
         }
 
         // Send layout update to remote daemon for reconnect support
-        split_tree.sendRemoteLayoutUpdate();
+        _ = split_tree;
+        self.sendRemoteLayoutUpdate();
+    }
+
+    /// Serialize the layout of ALL tabs in this window and send it to
+    /// the remote daemon. Only acts if at least one tab contains remote
+    /// surfaces. Called whenever any SplitTree in the window changes.
+    pub fn sendRemoteLayoutUpdate(self: *Self) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const tab_view = priv.tab_view;
+        const n_pages = tab_view.getNPages();
+        if (n_pages <= 0) return;
+        const n: usize = @intCast(n_pages);
+
+        log.debug("sendRemoteLayoutUpdate: {d} pages in tab_view", .{n});
+
+        // Temporary per-tab info collected on the stack/heap
+        const tab_infos = alloc.alloc(session_layout.TabInfo, n) catch return;
+        var send_entry: ?*SshConnectionManager.Entry = null;
+        var send_target: u16 = 0;
+        var remote_tab_count: usize = 0;
+        defer {
+            for (tab_infos[0..remote_tab_count]) |*ti| alloc.free(ti.nodes);
+            alloc.free(tab_infos);
+        }
+
+        for (0..n) |i| {
+            const page = tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const tab = gobject.ext.cast(Tab, child) orelse {
+                log.debug("sendRemoteLayoutUpdate: tab {d} cast failed", .{i});
+                continue;
+            };
+            const split_tree = tab.getSplitTree();
+            const tree = split_tree.getTree() orelse {
+                log.debug("sendRemoteLayoutUpdate: tab {d} no tree", .{i});
+                continue;
+            };
+            if (tree.nodes.len == 0) {
+                log.debug("sendRemoteLayoutUpdate: tab {d} empty tree", .{i});
+                continue;
+            }
+
+            // Convert tree nodes to NodeInfo
+            const nodes = alloc.alloc(session_layout.NodeInfo, tree.nodes.len) catch return;
+            var tab_has_remote = false;
+
+            for (tree.nodes, 0..) |node, j| {
+                switch (node) {
+                    .leaf => |surface| {
+                        const core = surface.core() orelse {
+                            // Surface not yet initialized — skip this tab
+                            log.debug("sendRemoteLayoutUpdate: tab {d} leaf {d} no core", .{ i, j });
+                            alloc.free(nodes);
+                            break;
+                        };
+                        switch (core.io.backend) {
+                            .remote => |remote| {
+                                nodes[j] = .{ .leaf = .{ .surface_id = remote.surface_id } };
+                                tab_has_remote = true;
+                                if (send_entry == null) {
+                                    send_entry = remote.conn_entry;
+                                    send_target = remote.target_id;
+                                }
+                            },
+                            else => {
+                                // Non-remote tab — skip entirely
+                                alloc.free(nodes);
+                                break;
+                            },
+                        }
+                    },
+                    .split => |split| {
+                        nodes[j] = .{ .split = .{
+                            .direction = switch (split.layout) {
+                                .horizontal => .horizontal,
+                                .vertical => .vertical,
+                            },
+                            .ratio = split.ratio,
+                            .left = @intFromEnum(split.left),
+                            .right = @intFromEnum(split.right),
+                        } };
+                    },
+                }
+            } else {
+                // Loop completed without break — tab was fully processed
+                if (!tab_has_remote) {
+                    alloc.free(nodes);
+                    continue;
+                }
+
+                const zoomed: ?u16 = if (tree.zoomed) |h| @intFromEnum(h) else null;
+                const title: ?[]const u8 = if (tab.getTitleOverride()) |t| @as([]const u8, t) else null;
+
+                tab_infos[remote_tab_count] = .{
+                    .nodes = nodes,
+                    .zoomed = zoomed,
+                    .title_override = title,
+                };
+                remote_tab_count += 1;
+                continue;
+            }
+            // If we got here via break (non-remote surface), skip this tab
+        }
+
+        log.debug("sendRemoteLayoutUpdate: {d} remote tabs serialized", .{remote_tab_count});
+        if (remote_tab_count == 0) return;
+        const entry = send_entry orelse return;
+
+        const blob = session_layout.serialize(alloc, .{
+            .tabs = tab_infos[0..remote_tab_count],
+        }) catch return;
+        defer alloc.free(blob);
+
+        log.info("sendRemoteLayoutUpdate: sending {d}-tab layout ({d} bytes)", .{ remote_tab_count, blob.len });
+        SshConnectionManager.enqueueWrite(entry, .layout_update, send_target, blob);
+    }
+
+    /// Restore a multi-tab layout from a serialized blob received from
+    /// the remote daemon. `origin` is the surface that received the
+    /// `layout_restore` message (already in a tab). The first tab in the
+    /// blob restores into origin's existing SplitTree; subsequent tabs
+    /// create new tabs.
+    pub fn restoreFromBlob(self: *Self, blob: []const u8, origin: *Surface) void {
+        const session = @import("../../../session.zig");
+        const gpa = Application.default().allocator();
+
+        var layout = session.layout.deserialize(gpa, blob) catch |err| {
+            log.warn("failed to deserialize layout_restore blob: {}", .{err});
+            return;
+        };
+        defer layout.deinit(gpa);
+
+        log.info("restoreFromBlob: {d} tabs in layout", .{layout.tabs.len});
+        if (layout.tabs.len == 0) return;
+
+        for (layout.tabs, 0..) |tab_info, tab_i| {
+            log.info("restoreFromBlob: tab {d} has {d} nodes", .{ tab_i, tab_info.nodes.len });
+            if (tab_info.nodes.len == 0) continue;
+
+            // Allocate null-terminated title if present (setTitleOverride expects [:0]const u8)
+            const title_z: ?[:0]const u8 = if (tab_info.title_override) |title|
+                gpa.dupeZ(u8, title) catch null
+            else
+                null;
+            defer if (title_z) |t| gpa.free(t);
+
+            if (tab_i == 0) {
+                // First tab: the origin surface is already attached to the
+                // first daemon surface via session_open(attach). Don't replace
+                // the tree — the origin IS the first surface. Only restore
+                // splits if the tab had multiple surfaces.
+                if (tab_info.nodes.len > 1) {
+                    const split_tree = ext.getAncestor(
+                        SplitTree,
+                        origin.as(gtk.Widget),
+                    ) orelse continue;
+                    split_tree.restoreFromTabInfo(tab_info, origin);
+                }
+
+                if (title_z) |t| {
+                    const tab = ext.getAncestor(Tab, origin.as(gtk.Widget)) orelse continue;
+                    tab.setTitleOverride(t);
+                }
+            } else {
+                // Subsequent tabs: create a new tab, then restore into it
+                const core = origin.core() orelse continue;
+
+                // Get SSH target and session label from origin so the
+                // initial surface joins the same session group (avoids
+                // generating a new readable name per tab).
+                const ssh_target: ?[]const u8 = blk: {
+                    if (core.io.backend != .remote) break :blk null;
+                    break :blk core.io.backend.remote.ssh_target;
+                };
+                const ssh_session: ?[]const u8 = blk: {
+                    if (core.io.backend != .remote) break :blk null;
+                    break :blk core.io.backend.remote.label;
+                };
+
+                const page = self.newTabPage(core, .tab, .{
+                    .ssh_target = ssh_target,
+                    .ssh_session = ssh_session,
+                });
+                const child = page.getChild();
+                const new_tab = gobject.ext.cast(Tab, child) orelse continue;
+                const split_tree = new_tab.getSplitTree();
+
+                // Wait for the surface in the new tab to be available,
+                // then restore the layout into its SplitTree.
+                const surface = split_tree.getActiveSurface() orelse continue;
+                split_tree.restoreFromTabInfo(tab_info, surface);
+
+                if (title_z) |t| {
+                    new_tab.setTitleOverride(t);
+                }
+            }
+        }
+
+        log.info("restored {d}-tab layout from remote daemon", .{layout.tabs.len});
     }
 
     fn actionAbout(
@@ -2178,6 +2405,11 @@ pub const Window = extern struct {
         ssh_target: [:0]const u8,
     };
 
+    const QueryErrorData = struct {
+        picker: *SshSessionPicker,
+        msg: [:0]const u8,
+    };
+
     fn sessionQueryThread(data: *SessionQueryData) void {
         defer {
             const alloc = Application.default().allocator();
@@ -2191,14 +2423,22 @@ pub const Window = extern struct {
         // Query sessions from the remote host via SSH
         const sessions = querySshSessions(alloc, data.ssh_target) catch |err| {
             log.warn("failed to query SSH sessions: {}", .{err});
-            // Post back to GTK main thread to show error
+            const msg: [:0]const u8 = switch (err) {
+                error.PasswordRequired => "Password authentication required. Open a regular SSH tab first, then retry.",
+                error.SessionQueryFailed => "Failed to query remote sessions. Check that the daemon is running.",
+                else => "Failed to connect or query sessions",
+            };
+            const err_data = alloc.create(QueryErrorData) catch return;
+            err_data.* = .{ .picker = data.picker.ref(), .msg = msg };
             _ = glib.idleAdd(struct {
-                fn callback(picker_ptr: ?*anyopaque) callconv(.c) c_int {
-                    const p: *SshSessionPicker = @ptrCast(@alignCast(picker_ptr orelse return 0));
-                    p.setError("Failed to connect or query sessions");
-                    return 0; // G_SOURCE_REMOVE
+                fn callback(ptr: ?*anyopaque) callconv(.c) c_int {
+                    const d: *QueryErrorData = @ptrCast(@alignCast(ptr orelse return 0));
+                    d.picker.setError(d.msg);
+                    d.picker.unref();
+                    Application.default().allocator().destroy(d);
+                    return 0;
                 }
-            }.callback, data.picker);
+            }.callback, err_data);
             return;
         };
         defer {
@@ -2302,42 +2542,77 @@ pub const Window = extern struct {
         Application.default().newSshAttachWindow(target, sid);
     }
 
-    /// Query detached sessions from a remote host by running the session helper
-    /// via SSH. Returns parsed session entries.
+    /// Query sessions from a remote host. First tries the existing multiplexed
+    /// connection (fast). If none exists, establishes a temporary SSH connection
+    /// using key-based auth and runs the remote `--list` command directly.
     fn querySshSessions(alloc: std.mem.Allocator, ssh_target: []const u8) ![]SessionQueryEntry {
-        // Build the SSH command to query sessions
-        // ssh <target> "~/.local/share/ghostty/ghostty-session-helper +session-helper --list"
-        const helper_path = "~/.local/share/ghostty/ghostty-session-helper";
-        const cmd_str = try std.fmt.allocPrintSentinel(alloc, "{s} +session-helper --list", .{helper_path}, 0);
-        defer alloc.free(cmd_str);
+        const raw_output = blk: {
+            // Fast path: use existing multiplexed connection if available
+            const mgr = &Application.default().core().ssh_connection_manager;
+            if (mgr.findEntry(ssh_target, null)) |entry| {
+                if (entry.conn_state.load(.seq_cst) == .ready) {
+                    break :blk SshConnectionManager.querySessions(entry, alloc, 5000) orelse
+                        return error.SessionQueryFailed;
+                }
+            }
 
-        var child = std.process.Child.init(
-            &.{ "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_target, cmd_str },
-            alloc,
-        );
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+            // Slow path: establish a temporary SSH connection for the query
+            const session = @import("../../../session.zig");
 
-        try child.spawn();
+            var ctx: session.client.SshContext = .{
+                .alloc = alloc,
+                .ssh_target = ssh_target,
+                .jump = null,
+            };
+            defer ctx.deinit();
 
-        // Collect stdout/stderr before waiting to avoid deadlock
-        var stdout_buf: std.ArrayListUnmanaged(u8) = .{};
-        var stderr_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer {
-            stdout_buf.deinit(alloc);
-            stderr_buf.deinit(alloc);
-        }
-        try child.collectOutput(alloc, &stdout_buf, &stderr_buf, 50 * 1024);
-        const term = try child.wait();
+            var stderr_buf: [1024]u8 = undefined;
+            var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
+            const stderr = &stderr_writer_.interface;
 
-        const exit_code: u32 = switch (term) {
-            .Exited => |code| code,
-            else => 1,
+            const connect_result = ctx.connectWithAuth(stderr, null, false) catch
+                return error.NoActiveConnection;
+            switch (connect_result) {
+                .success => {},
+                .password_required_target, .password_required_jump =>
+                    return error.PasswordRequired,
+            }
+
+            log.info("session query: SSH connected, checking remote Ghostty...", .{});
+
+            const helper_result = session.client.ensureRemoteHelper(alloc, &ctx, stderr, null) catch |err| {
+                log.warn("session query: ensureRemoteHelper failed: {}", .{err});
+                return error.NoActiveConnection;
+            };
+            const helper_path = helper_result.path;
+            defer alloc.free(helper_path);
+
+            log.info("session query: remote Ghostty at {s}, starting daemon...", .{helper_path});
+
+            session.client.ensureRemoteDaemon(alloc, &ctx, helper_path, helper_result.uploaded) catch |err| {
+                log.warn("session query: ensureRemoteDaemon failed: {}", .{err});
+                return error.NoActiveConnection;
+            };
+
+            log.info("session query: daemon ready, listing sessions...", .{});
+
+            const cmd = std.fmt.allocPrint(
+                alloc,
+                "{s} " ++ session.shared.remote_subcommand ++ " --list",
+                .{helper_path},
+            ) catch return error.SessionQueryFailed;
+            defer alloc.free(cmd);
+
+            const result = session.client.runRemoteCapture(alloc, &ctx, cmd) catch
+                return error.SessionQueryFailed;
+            defer alloc.free(result.stderr);
+            if (result.exit_code != 0) {
+                alloc.free(result.stdout);
+                return error.SessionQueryFailed;
+            }
+            break :blk result.stdout;
         };
-
-        if (exit_code != 0 and stdout_buf.items.len == 0) {
-            return error.SshCommandFailed;
-        }
+        defer alloc.free(raw_output);
 
         // Parse the output: each line is a session entry
         // Format: "uuid|label|N surfaces|timestamp|status"
@@ -2353,7 +2628,7 @@ pub const Window = extern struct {
             entries.deinit(alloc);
         }
 
-        var lines = std.mem.splitScalar(u8, stdout_buf.items, '\n');
+        var lines = std.mem.splitScalar(u8, raw_output, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             // Skip surface detail lines (indented)
@@ -2364,16 +2639,34 @@ pub const Window = extern struct {
             const id_raw = parts.next() orelse continue;
             const label_raw = parts.next() orelse continue;
             const surfaces_raw = parts.next() orelse continue;
-            _ = parts.next(); // timestamp - skip
+            const timestamp_raw = parts.next() orelse continue;
             const status_raw = parts.next() orelse continue;
+
+            // Format detail with human-readable age
+            const created_at = std.fmt.parseInt(i64, timestamp_raw, 10) catch 0;
+            const now = std.time.timestamp();
+            const age_secs: u64 = if (created_at > 0) @intCast(@max(0, now - created_at)) else 0;
+            const detail = if (age_secs > 0)
+                std.fmt.allocPrint(alloc, "{s}, created {s} ago", .{ surfaces_raw, formatAge(age_secs) }) catch
+                    try alloc.dupe(u8, surfaces_raw)
+            else
+                try alloc.dupe(u8, surfaces_raw);
 
             try entries.append(alloc, .{
                 .id = try alloc.dupe(u8, id_raw),
                 .label = try alloc.dupe(u8, label_raw),
-                .detail = try alloc.dupe(u8, surfaces_raw),
+                .detail = detail,
                 .status = try alloc.dupe(u8, status_raw),
+                .created_at = created_at,
             });
         }
+
+        // Sort descending by creation time (newest first)
+        std.mem.sortUnstable(SessionQueryEntry, entries.items, {}, struct {
+            fn lessThan(_: void, a: SessionQueryEntry, b: SessionQueryEntry) bool {
+                return a.created_at > b.created_at;
+            }
+        }.lessThan);
 
         return try entries.toOwnedSlice(alloc);
     }
@@ -2383,7 +2676,23 @@ pub const Window = extern struct {
         label: []const u8,
         detail: []const u8,
         status: []const u8,
+        created_at: i64,
     };
+
+    fn formatAge(secs: u64) []const u8 {
+        const State = struct {
+            var buf: [32]u8 = undefined;
+        };
+        if (secs < 60) {
+            return std.fmt.bufPrint(&State.buf, "{d}s", .{secs}) catch "?";
+        } else if (secs < 3600) {
+            return std.fmt.bufPrint(&State.buf, "{d}m", .{secs / 60}) catch "?";
+        } else if (secs < 86400) {
+            return std.fmt.bufPrint(&State.buf, "{d}h{d}m", .{ secs / 3600, (secs % 3600) / 60 }) catch "?";
+        } else {
+            return std.fmt.bufPrint(&State.buf, "{d}d{d}h", .{ secs / 86400, (secs % 86400) / 3600 }) catch "?";
+        }
+    }
 
     /// React to a GTK action requesting the SSH session attach flow.
     fn actionSshSessionAttach(

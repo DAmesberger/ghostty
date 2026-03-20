@@ -9,7 +9,6 @@ const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
-const termio = @import("../../../termio.zig");
 const session_layout = @import("../../../session.zig").layout;
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
@@ -328,82 +327,15 @@ pub const SplitTree = extern struct {
         return true;
     }
 
-    /// Serialize the current tree layout and send it to the remote daemon.
-    /// Only does anything if the tree contains remote (SSH) surfaces.
-    /// Called after tree mutations (split, close, resize) so the daemon
-    /// can restore the layout on reconnect.
-    pub fn sendRemoteLayoutUpdate(self: *Self) void {
-        const tree = self.getTree() orelse return;
-        if (tree.nodes.len == 0) return;
-
-        const alloc = Application.default().allocator();
-
-        // Build NodeInfo array from the tree
-        const nodes = alloc.alloc(session_layout.NodeInfo, tree.nodes.len) catch return;
-        defer alloc.free(nodes);
-
-        // The surface whose connection we'll use to send the update
-        var send_entry: ?*termio.SshConnectionManager.Entry = null;
-        var send_target: u16 = 0;
-
-        for (tree.nodes, 0..) |node, i| {
-            switch (node) {
-                .leaf => |surface| {
-                    const core = surface.core() orelse return;
-                    switch (core.io.backend) {
-                        .remote => |remote| {
-                            nodes[i] = .{ .leaf = .{ .surface_id = remote.surface_id } };
-                            // Use the first surface's connection for sending
-                            if (send_entry == null) {
-                                send_entry = remote.conn_entry;
-                                send_target = remote.target_id;
-                            }
-                        },
-                        else => return, // mixed local/remote not supported
-                    }
-                },
-                .split => |split| {
-                    nodes[i] = .{ .split = .{
-                        .direction = switch (split.layout) {
-                            .horizontal => .horizontal,
-                            .vertical => .vertical,
-                        },
-                        .ratio = split.ratio,
-                        .left = @intFromEnum(split.left),
-                        .right = @intFromEnum(split.right),
-                    } };
-                },
-            }
-        }
-
-        const entry = send_entry orelse return;
-
-        const zoomed: ?u16 = if (tree.zoomed) |h| @intFromEnum(h) else null;
-        const blob = session_layout.serialize(alloc, .{
-            .nodes = nodes,
-            .zoomed = zoomed,
-        }) catch return;
-        defer alloc.free(blob);
-
-        termio.SshConnectionManager.enqueueWrite(entry, .layout_update, send_target, blob);
-    }
-
-    /// Restore a split layout from a remote daemon's serialized blob.
+    /// Restore a single tab's split layout from a TabInfo.
     /// Creates new surfaces for each leaf with the correct surface_id
     /// so they reattach to the right daemon-side PTYs.
-    /// `origin` is the surface that received the layout_restore message
-    /// and is used to inherit SSH connection properties.
-    pub fn restoreFromBlob(self: *Self, blob: []const u8, origin: *Surface) void {
+    /// `origin` is the surface used to inherit SSH connection properties.
+    pub fn restoreFromTabInfo(self: *Self, tab_info: session_layout.TabInfo, origin: *Surface) void {
         const session = @import("../../../session.zig");
         const gpa = Application.default().allocator();
 
-        var layout = session.layout.deserialize(gpa, blob) catch |err| {
-            log.warn("failed to deserialize layout_restore blob: {}", .{err});
-            return;
-        };
-        defer layout.deinit(gpa);
-
-        if (layout.nodes.len == 0) return;
+        if (tab_info.nodes.len == 0) return;
 
         // Build a Surface.Tree with an arena allocator (same pattern as
         // SplitTree.init). Each leaf gets a new Surface widget with the
@@ -412,12 +344,12 @@ pub const SplitTree = extern struct {
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const tree_nodes = arena_alloc.alloc(Surface.Tree.Node, layout.nodes.len) catch return;
+        const tree_nodes = arena_alloc.alloc(Surface.Tree.Node, tab_info.nodes.len) catch return;
 
         // Track created surfaces so we can unref them if something fails.
         // Each surface gets one ref for the tree (viewRef equivalent).
         var created_surfaces: std.ArrayList(*Surface) = .empty;
-        created_surfaces.ensureTotalCapacity(gpa, @intCast(layout.nodes.len)) catch return;
+        created_surfaces.ensureTotalCapacity(gpa, @intCast(tab_info.nodes.len)) catch return;
         defer {
             // On error only — if we succeed, setTree/clone handles ownership.
             for (created_surfaces.items) |s| s.unref();
@@ -426,7 +358,7 @@ pub const SplitTree = extern struct {
 
         var first_surface: ?*Surface = null;
 
-        for (layout.nodes, 0..) |node, i| {
+        for (tab_info.nodes, 0..) |node, i| {
             switch (node) {
                 .leaf => |leaf| {
                     const sid_hex = session.shared.formatUuid(leaf.surface_id);
@@ -475,7 +407,7 @@ pub const SplitTree = extern struct {
         var tree: Surface.Tree = .{
             .arena = arena,
             .nodes = tree_nodes,
-            .zoomed = if (layout.zoomed) |z| @enumFromInt(z) else null,
+            .zoomed = if (tab_info.zoomed) |z| @enumFromInt(z) else null,
         };
         defer tree.deinit();
 
@@ -487,7 +419,7 @@ pub const SplitTree = extern struct {
         created_surfaces.clearRetainingCapacity();
 
         self.setTree(&tree);
-        log.info("restored layout with {d} nodes from remote daemon", .{layout.nodes.len});
+        log.info("restored layout with {d} nodes from remote daemon", .{tab_info.nodes.len});
     }
 
     /// Move focus from the currently focused surface to the given
@@ -789,10 +721,19 @@ pub const SplitTree = extern struct {
             return;
         };
 
+        // If the active surface is remote, inherit its SSH target so splits
+        // stay on the same connection instead of opening a local terminal.
+        const active = self.getActiveSurface();
+        const ssh_target: ?[]const u8 = if (active) |s| blk: {
+            const core = s.core() orelse break :blk null;
+            if (core.io.backend != .remote) break :blk null;
+            break :blk core.io.backend.remote.ssh_target;
+        } else null;
+
         self.newSplit(
             direction,
-            self.getActiveSurface(),
-            .none,
+            active,
+            .{ .ssh_target = ssh_target },
         ) catch |err| {
             log.warn("new split failed error={}", .{err});
         };

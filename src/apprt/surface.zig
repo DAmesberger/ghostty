@@ -215,18 +215,20 @@ pub fn newConfig(
             }
         }
 
-        // For splits from remote surfaces: propagate the group_id so the
-        // new surface joins the same session group on the daemon.
-        if (context == .split and config.@"ssh-target" != null) {
-            switch (p.io.backend) {
-                .remote => |remote| {
-                    if (!session.shared.isZeroUuid(remote.group_id)) {
-                        const hex = session.shared.formatUuid(remote.group_id);
-                        copy.@"ssh-group-id" = try alloc.dupe(u8, &hex);
-                    }
-                },
-                else => {},
-            }
+        // For new surfaces from remote surfaces: propagate the group_id so
+        // the new surface joins the same session group on the daemon.
+        // This applies to both splits and new tabs on the same connection.
+        // We check the parent's backend rather than config.ssh-target because
+        // for new tabs the ssh-target override hasn't been applied to the
+        // config yet at this point.
+        switch (p.io.backend) {
+            .remote => |remote| {
+                if (!session.shared.isZeroUuid(remote.group_id)) {
+                    const hex = session.shared.formatUuid(remote.group_id);
+                    copy.@"ssh-group-id" = try alloc.dupe(u8, &hex);
+                }
+            },
+            else => {},
         }
     }
 

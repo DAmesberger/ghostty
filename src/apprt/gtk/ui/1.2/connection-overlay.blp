@@ -44,11 +44,25 @@ template $GhosttyConnectionOverlay: Adw.Bin {
         activate => $password_activate();
       }
 
-      Button action_button {
+      Box button_box {
         visible: false;
+        orientation: horizontal;
+        spacing: 8;
         halign: center;
-        styles ["pill"]
-        clicked => $action_button_clicked();
+
+        styles [
+          "linked",
+        ]
+
+        Button reconnect_button {
+          styles ["suggested-action"]
+          clicked => $reconnect_button_clicked();
+        }
+
+        Button action_button {
+          styles ["destructive-action"]
+          clicked => $action_button_clicked();
+        }
       }
     }
   }

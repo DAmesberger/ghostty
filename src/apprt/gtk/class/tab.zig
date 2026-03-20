@@ -8,6 +8,7 @@ const gtk = @import("gtk");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const CoreSurface = @import("../../../Surface.zig");
+const session = @import("../../../session.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -255,6 +256,11 @@ pub const Tab = extern struct {
     //---------------------------------------------------------------
     // Properties
 
+    /// Get the overridden title, if any.
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
     /// Overridden title. This will be generally be shown over the title
     /// unless this is unset (null).
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
@@ -271,6 +277,10 @@ pub const Tab = extern struct {
     ) callconv(.c) void {
         const title = std.mem.span(title_ptr);
         self.setTitleOverride(if (title.len == 0) null else title);
+
+        // Tab titles are now persisted in the window-level layout blob,
+        // so no separate session_rename needed here. The next layout_update
+        // from the Window will include the new title.
     }
     pub fn promptTabTitle(self: *Self) void {
         const priv = self.private();
@@ -532,6 +542,7 @@ pub const Tab = extern struct {
                 .reconnecting => buf.writer.writeAll("[reconnecting] ") catch {},
                 .stale => buf.writer.writeAll("[stale] ") catch {},
                 .failed => buf.writer.writeAll("[disconnected] ") catch {},
+                .disconnected => buf.writer.writeAll("[disconnected] ") catch {},
                 .connecting => buf.writer.writeAll("[connecting] ") catch {},
                 else => {},
             }
@@ -550,14 +561,10 @@ pub const Tab = extern struct {
         buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
 
         // Append SSH target info for remote surfaces.
+        // Session label is only shown in the window subtitle, not per-tab.
         if (remote_info.ssh_target) |target| {
             buf.writer.writeAll(" \xe2\x80\x94 ") catch {}; // " — " (em dash)
             buf.writer.writeAll(target) catch {};
-            if (remote_info.label) |label| {
-                buf.writer.writeAll(" (") catch {};
-                buf.writer.writeAll(label) catch {};
-                buf.writer.writeAll(")") catch {};
-            }
         }
 
         return glib.ext.dupeZ(u8, buf.written());

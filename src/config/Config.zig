@@ -1224,6 +1224,29 @@ command: ?Command = null,
 /// the correct daemon-side PTY.
 @"ssh-surface-id": ?[]const u8 = null,
 
+/// Maximum number of automatic reconnect attempts after an SSH
+/// disconnect (e.g. laptop sleep). Once exhausted, the overlay shows
+/// Reconnect/Exit buttons for manual retry. Set to 0 to disable
+/// auto-reconnect entirely (shows Reconnect/Exit immediately).
+///
+/// Available since 1.3.0.
+@"ssh-reconnect-attempts": u32 = 5,
+
+/// Backoff strategy for automatic SSH reconnection.
+///
+/// * `exponential` - `min(interval * 2^attempt, 30000)` (the default)
+/// * `linear` - `min(interval * attempt, 30000)`
+/// * `constant` - Uses `ssh-reconnect-interval` as-is for every attempt
+///
+/// Available since 1.3.0.
+@"ssh-reconnect-backoff": SshReconnectBackoff = .exponential,
+
+/// Base interval in milliseconds between SSH reconnect attempts.
+/// Interpretation depends on `ssh-reconnect-backoff`.
+///
+/// Available since 1.3.0.
+@"ssh-reconnect-interval": u32 = 1000,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///
@@ -10173,6 +10196,13 @@ pub const ScrollToBottom = packed struct {
     output: bool = false,
 
     pub const default: ScrollToBottom = .{};
+};
+
+/// See ssh-reconnect-backoff
+pub const SshReconnectBackoff = enum {
+    exponential,
+    linear,
+    constant,
 };
 
 /// See notify-on-command-finish

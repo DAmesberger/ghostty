@@ -4,7 +4,9 @@ const Allocator = std.mem.Allocator;
 const internal_os = @import("../os/main.zig");
 
 pub const helper_subdir = "ghostty/remote-session";
-pub const helper_binary_name = "ghostty-session-helper";
+pub const remote_binary_name = "ghostty";
+/// The CLI subcommand used to invoke the remote helper modes.
+pub const remote_subcommand = "+ssh-session";
 
 pub const ControlCommand = enum {
     detach,
@@ -40,23 +42,21 @@ pub fn socketPath(alloc: Allocator) ![]const u8 {
     return try std.fs.path.join(alloc, &.{ dir, "daemon.sock" });
 }
 
-/// Relative suffix for the remote helper install directory under the
-/// user's home. Uses the XDG state convention (~/.local/state/) to
-/// avoid the world-writable /tmp (race conditions, binary replacement).
-pub const remote_base_suffix = ".local/state/ghostty/bin";
-
-/// Build the remote install directory path. The returned string
-/// contains "$HOME/" which must be expanded by a shell on the remote
-/// host. For SCP uploads, callers should resolve $HOME first via an
-/// SSH exec of `printf '%s' "$HOME"`.
-pub fn remoteInstallDir(alloc: Allocator, remote_home: []const u8) ![]const u8 {
-    return try std.fs.path.join(alloc, &.{ remote_home, remote_base_suffix });
+/// Build the remote install directory path, platform-aware.
+/// - macOS (Darwin): ~/Library/Application Support/com.ghostty/bin
+/// - Linux/FreeBSD:  ~/.local/state/ghostty/bin (XDG_STATE_HOME default)
+pub fn remoteInstallDir(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
+    const suffix = if (std.mem.eql(u8, remote_os, "Darwin"))
+        "Library/Application Support/com.ghostty/bin"
+    else
+        ".local/state/ghostty/bin";
+    return try std.fs.path.join(alloc, &.{ remote_home, suffix });
 }
 
-pub fn remoteInstallPath(alloc: Allocator, remote_home: []const u8) ![]const u8 {
-    const dir = try remoteInstallDir(alloc, remote_home);
+pub fn remoteInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
+    const dir = try remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, helper_binary_name });
+    return try std.fs.path.join(alloc, &.{ dir, remote_binary_name });
 }
 
 pub fn sanitizeLabelAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
@@ -159,6 +159,38 @@ pub fn isZeroUuid(uuid: Uuid) bool {
     return std.mem.eql(u8, &uuid, &zero_uuid);
 }
 
+/// Word lists for generating human-readable session names.
+/// 64 adjectives × 64 nouns = 4096 unique combinations.
+const adjectives = [64][]const u8{
+    "bold", "calm", "cool", "dark", "deep", "fair", "fast", "fine",
+    "free", "glad", "gold", "good", "gray", "grim", "keen", "kind",
+    "late", "lean", "live", "lone", "lost", "mild", "near", "neat",
+    "next", "pale", "pure", "rare", "rich", "safe", "slim", "slow",
+    "soft", "sure", "tall", "thin", "true", "vast", "warm", "weak",
+    "wide", "wild", "wise", "blue", "cold", "dear", "easy", "even",
+    "flat", "full", "half", "hard", "high", "just", "last", "long",
+    "loud", "main", "more", "much", "nice", "open", "real", "same",
+};
+
+const nouns = [64][]const u8{
+    "arch", "bark", "bell", "bird", "bolt", "bone", "cape", "cave",
+    "claw", "coin", "cone", "cove", "crow", "dawn", "deer", "dove",
+    "drum", "dune", "dust", "echo", "edge", "fern", "fish", "fawn",
+    "frog", "gate", "glow", "hare", "hawk", "hill", "iris", "jade",
+    "lake", "lark", "leaf", "lily", "lynx", "mesa", "mint", "moon",
+    "moss", "moth", "nest", "nova", "opal", "orca", "palm", "peak",
+    "pine", "pond", "rain", "reed", "reef", "rose", "sage", "seal",
+    "snow", "star", "swan", "tarn", "tide", "vine", "wave", "wolf",
+};
+
+/// Generate a human-readable session name deterministically from a UUID.
+/// Returns an "adjective-noun" string like "bold-hawk" or "calm-reef".
+pub fn generateReadableName(alloc: Allocator, uuid: Uuid) ![]u8 {
+    const adj_idx = uuid[0] & 0x3F;
+    const noun_idx = uuid[1] & 0x3F;
+    return try std.fmt.allocPrint(alloc, "{s}-{s}", .{ adjectives[adj_idx], nouns[noun_idx] });
+}
+
 pub const Platform = struct {
     os: []const u8,
     arch: []const u8,
@@ -169,6 +201,18 @@ pub fn localPlatform() Platform {
         .os = @tagName(builtin.os.tag),
         .arch = @tagName(builtin.cpu.arch),
     };
+}
+
+test "generate readable name" {
+    const testing = std.testing;
+
+    // A deterministic UUID should always produce the same name.
+    const uuid: Uuid = .{ 0x02, 0x05, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0 };
+    const name = try generateReadableName(testing.allocator, uuid);
+    defer testing.allocator.free(name);
+
+    // adj index 0x02 & 0x3F = 2 → "cool", noun index 0x05 & 0x3F = 5 → "bone"
+    try testing.expectEqualStrings("cool-bone", name);
 }
 
 test "sanitize label" {

@@ -24,7 +24,7 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("unistd.h");
 });
 
-const log = std.log.scoped(.session_helper);
+const log = std.log.scoped(.ssh_session);
 
 pub const Options = struct {
     daemonize: bool = false,
@@ -293,6 +293,9 @@ const ClientThread = struct {
             .session_rename => {
                 self.daemon.handleSessionRename(payload);
             },
+            .surface_rename => {
+                self.daemon.handleSurfaceRename(payload);
+            },
             else => {},
         }
     }
@@ -468,7 +471,14 @@ const Daemon = struct {
                 } else group.firstAliveSurface();
 
                 if (sess) |s| {
-                    s.attachAndServe(fd, target, open_data.resize) catch {};
+                    s.attachAndServe(fd, target, open_data.resize) catch |err| {
+                        const msg = switch (err) {
+                            error.SessionAlreadyAttached => "session is already attached by another client",
+                            else => "failed to attach to session",
+                        };
+                        sendFrameFd(fd, .err, target, msg) catch {};
+                        sendFrameFd(fd, .eof, target, "") catch {};
+                    };
                 } else if (created_new) {
                     // New group via create-or-attach: create the first surface.
                     const surface_id = if (!session.shared.isZeroUuid(open_data.surface_id))
@@ -479,7 +489,10 @@ const Daemon = struct {
                         sendFrameFd(fd, .eof, target, "") catch {};
                         return;
                     };
-                    new_sess.attachAndServe(fd, target, open_data.resize) catch {};
+                    new_sess.attachAndServe(fd, target, open_data.resize) catch |err| {
+                        log.warn("attach to new session failed: {}", .{err});
+                        sendFrameFd(fd, .eof, target, "") catch {};
+                    };
 
                     if (new_sess.closed) {
                         new_sess.kill();
@@ -491,6 +504,19 @@ const Daemon = struct {
                         self.mutex.unlock();
                     }
                 } else {
+                    // Send diagnostic info back to client
+                    group.mutex.lock();
+                    const total = group.surfaces.count();
+                    var dead_count: usize = 0;
+                    for (group.surfaces.values()) |s_| {
+                        s_.mutex.lock();
+                        if (!s_.alive) dead_count += 1;
+                        s_.mutex.unlock();
+                    }
+                    group.mutex.unlock();
+                    var err_buf: [256]u8 = undefined;
+                    const err_msg = std.fmt.bufPrint(&err_buf, "no alive surfaces in session ({d} total, {d} dead)", .{ total, dead_count }) catch "no alive surfaces in session";
+                    sendFrameFd(fd, .err, target, err_msg) catch {};
                     sendFrameFd(fd, .eof, target, "") catch {};
                 }
             },
@@ -588,12 +614,19 @@ const Daemon = struct {
 
             const gid_hex = session.shared.formatUuid(group.id);
             var entry_buf: [512]u8 = undefined;
-            const entry = std.fmt.bufPrint(&entry_buf, "{s}|{s}|{d} surfaces|{d}|{s}", .{
+            const status: []const u8 = if (alive_count == 0)
+                "dead"
+            else if (attached_count > 0)
+                "attached"
+            else
+                "detached";
+            const entry = std.fmt.bufPrint(&entry_buf, "{s}|{s}|{d} surfaces ({d} alive)|{d}|{s}", .{
                 &gid_hex,
                 group.label,
                 surface_count,
+                alive_count,
                 created_at,
-                if (attached_count > 0) "attached" else "detached",
+                status,
             }) catch continue;
             sendFrameFd(fd, .session_list_entry, 0, entry) catch {};
 
@@ -663,6 +696,31 @@ const Daemon = struct {
         group.label = new_label;
         group.mutex.unlock();
         log.info("renamed group to '{s}'", .{new_label});
+    }
+
+    /// Rename a surface. Payload: [16] surface_id + [N] new_label.
+    fn handleSurfaceRename(self: *Daemon, payload: []const u8) void {
+        if (payload.len < 17) return; // need at least UUID + 1 byte label
+        const surface_id: Uuid = payload[0..16].*;
+        const new_label_raw = payload[16..];
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Find the surface across all groups.
+        for (self.groups.values()) |group| {
+            group.mutex.lock();
+            defer group.mutex.unlock();
+            if (group.surfaces.get(surface_id)) |sess| {
+                const new_label = session.shared.sanitizeLabelAlloc(self.alloc, new_label_raw) catch return;
+                sess.mutex.lock();
+                self.alloc.free(sess.label);
+                sess.label = new_label;
+                sess.mutex.unlock();
+                log.info("renamed surface to '{s}'", .{new_label});
+                return;
+            }
+        }
     }
 
     /// Grace period before reaping empty groups (5 minutes).
@@ -970,6 +1028,7 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                 .resize,
                 .layout_update,
                 .session_rename,
+                .surface_rename,
                 => {
                     if (findMuxSession(&sessions, target)) |s| {
                         sendFrameFd(s.daemon_fd, kind, target, payload) catch {

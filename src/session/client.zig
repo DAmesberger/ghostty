@@ -276,67 +276,102 @@ pub const Mailbox = @import("../apprt.zig").surface.Mailbox;
 
 /// Ensure the remote helper binary exists on the target host with a
 /// compatible protocol version.
+pub const HelperResult = struct {
+    path: []const u8,
+    uploaded: bool,
+};
+
 pub fn ensureRemoteHelper(
     alloc: Allocator,
     ctx: *SshContext,
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
-) ![]const u8 {
+) !HelperResult {
     // Establish SSH connection
     try ctx.connect(stderr);
     var sess = &ctx.session.?;
 
-    // Resolve the remote HOME directory for secure path construction
+    // Resolve remote HOME and OS for platform-aware path construction
     const remote_home = try resolveRemoteHome(alloc, sess);
     defer alloc.free(remote_home);
 
-    const helper_path = try shared.remoteInstallPath(alloc, remote_home);
+    const remote_os = try resolveRemoteOs(alloc, sess);
+    defer alloc.free(remote_os);
+
+    const helper_path = try shared.remoteInstallPath(alloc, remote_home, remote_os);
     errdefer alloc.free(helper_path);
 
-    // Probe: run the helper's --version flag. If the binary is missing,
-    // wrong arch, or a different protocol version, we re-upload.
+    // First, check if ghostty is in PATH on the remote and has the right version.
+    const path_check = sess.exec("ghostty " ++ shared.remote_subcommand ++ " --protocol-version") catch null;
+    if (path_check) |pc| {
+        defer alloc.free(pc.stdout);
+        defer alloc.free(pc.stderr);
+        if (pc.exit_code == 0) {
+            if (parseProtocolVersion(pc.stdout)) |ver| {
+                if (ver == protocol.protocol_version) {
+                    // ghostty in PATH has the right version — use it directly.
+                    const system_path = try alloc.dupe(u8, "ghostty");
+                    alloc.free(helper_path);
+                    return .{ .path = system_path, .uploaded = false };
+                }
+            }
+        }
+    }
+
+    // Probe the deployed binary at the install path.
     const version_cmd = try std.fmt.allocPrint(
         alloc,
-        "{s} +session-helper --protocol-version",
+        "{s} " ++ shared.remote_subcommand ++ " --protocol-version",
         .{helper_path},
     );
     defer alloc.free(version_cmd);
 
     const result = sess.exec(version_cmd) catch {
-        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
-        return helper_path;
+        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
+        return .{ .path = helper_path, .uploaded = true };
     };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
     if (result.exit_code != 0) {
-        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
-        return helper_path;
+        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
+        return .{ .path = helper_path, .uploaded = true };
     }
 
-    // Parse "GHOSTTY_SESSION_PROTOCOL <version>\n"
-    const prefix = "GHOSTTY_SESSION_PROTOCOL ";
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, prefix)) {
-        try stderr.writeAll("Remote helper version unrecognized, re-uploading...\n");
-        try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
-        return helper_path;
-    }
-
-    const ver_str = trimmed[prefix.len..];
-    const remote_version = std.fmt.parseInt(u16, ver_str, 10) catch {
-        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
-        return helper_path;
+    const remote_version = parseProtocolVersion(result.stdout) orelse {
+        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
+        return .{ .path = helper_path, .uploaded = true };
     };
 
     if (remote_version != protocol.protocol_version) {
-        try stderr.writeAll("Remote helper protocol version mismatch, re-uploading...\n");
+        try stderr.writeAll("Ghostty version mismatch on remote, re-uploading...\n");
         try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
+        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
+        return .{ .path = helper_path, .uploaded = true };
     }
 
-    return helper_path;
+    return .{ .path = helper_path, .uploaded = false };
+}
+
+fn parseProtocolVersion(stdout: []const u8) ?u16 {
+    const prefix = "GHOSTTY_SESSION_PROTOCOL ";
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    return std.fmt.parseInt(u16, trimmed[prefix.len..], 10) catch null;
+}
+
+fn resolveRemoteOs(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
+    const result = try sess.exec("uname -s");
+    defer alloc.free(result.stderr);
+    if (result.exit_code != 0) {
+        alloc.free(result.stdout);
+        return try alloc.dupe(u8, "Linux");
+    }
+    // result.stdout is already allocated by sess.exec, return owned
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const os = try alloc.dupe(u8, trimmed);
+    alloc.free(result.stdout);
+    return os;
 }
 
 /// Launch the remote session daemon via the helper's --daemonize flag.
@@ -355,7 +390,7 @@ pub fn ensureRemoteDaemon(
         // in memory even after the binary was re-uploaded.
         const kill_cmd = try std.fmt.allocPrint(
             alloc,
-            "{s} +session-helper --kill-daemon",
+            "{s} " ++ shared.remote_subcommand ++ " --kill-daemon",
             .{helper_path},
         );
         defer alloc.free(kill_cmd);
@@ -368,7 +403,7 @@ pub fn ensureRemoteDaemon(
 
     const cmd = try std.fmt.allocPrint(
         alloc,
-        "{s} +session-helper --daemonize",
+        "{s} " ++ shared.remote_subcommand ++ " --daemonize",
         .{helper_path},
     );
     defer alloc.free(cmd);
@@ -376,7 +411,12 @@ pub fn ensureRemoteDaemon(
     const result = try sess.exec(cmd);
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
-    if (result.exit_code != 0) return error.RemoteCommandFailed;
+    if (result.exit_code != 0) {
+        log.warn("daemon start failed (exit={d}): stdout={s} stderr={s}", .{
+            result.exit_code, result.stdout, result.stderr,
+        });
+        return error.RemoteCommandFailed;
+    }
 }
 
 pub const Capture = struct {
@@ -463,7 +503,7 @@ pub fn openMultiplexChannel(
     var channel = try sess.openChannel();
     errdefer channel.close();
 
-    const cmd = try std.fmt.allocPrint(alloc, "{s} +session-helper --stdio-attach", .{helper_path});
+    const cmd = try std.fmt.allocPrint(alloc, "{s} " ++ shared.remote_subcommand ++ " --stdio-attach", .{helper_path});
     defer alloc.free(cmd);
 
     try channel.exec(cmd);
@@ -477,16 +517,17 @@ fn uploadHelper(
     sess: *ssh.SshSession,
     helper_path: []const u8,
     remote_home: []const u8,
+    remote_os: []const u8,
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
 ) !void {
-    try stderr.writeAll("\nSetting up Ghostty helper on remote host...\n");
+    try stderr.writeAll("\nCopying Ghostty to remote host...\n");
     try stderr.flush();
 
     const exe_path = try std.fs.selfExePathAlloc(alloc);
     defer alloc.free(exe_path);
 
-    const install_dir = try shared.remoteInstallDir(alloc, remote_home);
+    const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(install_dir);
 
     // Create the install directory and set restrictive permissions
@@ -496,21 +537,20 @@ fn uploadHelper(
     defer alloc.free(mkdir_result.stdout);
     defer alloc.free(mkdir_result.stderr);
 
-    // Check platform
-    const uname_result = try sess.exec("uname -s && uname -m");
-    defer alloc.free(uname_result.stdout);
-    defer alloc.free(uname_result.stderr);
-
-    if (uname_result.exit_code == 0) {
-        var it = std.mem.splitScalar(u8, std.mem.trim(u8, uname_result.stdout, " \t\r\n"), '\n');
-        const remote_os = it.next() orelse "";
-        const remote_arch = it.next() orelse "";
-        const local = shared.localPlatform();
-        if (!platformMatches(local.os, remote_os) or
-            !std.ascii.eqlIgnoreCase(local.arch, remote_arch))
-        {
-            try stderr.writeAll("Warning: remote platform may not match local binary.\n");
-            try stderr.flush();
+    // Check platform compatibility
+    {
+        const arch_result = sess.exec("uname -m") catch null;
+        if (arch_result) |ar| {
+            defer alloc.free(ar.stdout);
+            defer alloc.free(ar.stderr);
+            const remote_arch = std.mem.trim(u8, ar.stdout, " \t\r\n");
+            const local = shared.localPlatform();
+            if (!platformMatches(local.os, remote_os) or
+                !std.ascii.eqlIgnoreCase(local.arch, remote_arch))
+            {
+                try stderr.writeAll("Warning: remote platform may not match local binary.\n");
+                try stderr.flush();
+            }
         }
     }
 
@@ -558,12 +598,12 @@ fn uploadHelper(
     defer alloc.free(mv_result.stderr);
 
     if (std.mem.indexOf(u8, mv_result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
-        try stderr.writeAll("Setup failed: could not install helper binary.\n");
+        try stderr.writeAll("Setup failed: could not install Ghostty on remote host.\n");
         try stderr.flush();
         return error.RemoteHelperUploadFailed;
     }
 
-    try stderr.writeAll("Helper installed successfully.\n");
+    try stderr.writeAll("Ghostty installed successfully.\n");
     try stderr.flush();
 }
 

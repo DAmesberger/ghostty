@@ -68,13 +68,14 @@ pub fn run(alloc: Allocator) !u8 {
     };
     defer ctx.deinit();
 
-    const helper_path = try session.client.ensureRemoteHelper(alloc, &ctx, stderr, null);
+    const helper_result = try session.client.ensureRemoteHelper(alloc, &ctx, stderr, null);
+    const helper_path = helper_result.path;
     defer alloc.free(helper_path);
-    try session.client.ensureRemoteDaemon(alloc, &ctx, helper_path, false);
+    try session.client.ensureRemoteDaemon(alloc, &ctx, helper_path, helper_result.uploaded);
 
     const cmd = try std.fmt.allocPrint(
         alloc,
-        "{s} +session-helper --list",
+        "{s} " ++ session.shared.remote_subcommand ++ " --list",
         .{helper_path},
     );
     defer alloc.free(cmd);

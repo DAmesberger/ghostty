@@ -21,7 +21,7 @@ const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const session_list = @import("session_list.zig");
 const session_kill = @import("session_kill.zig");
-const session_helper = @import("session_helper.zig");
+const ssh_session = @import("ssh_session.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -78,8 +78,8 @@ pub const Action = enum {
     // Kill a remote session on an SSH target.
     @"session-kill",
 
-    // Internal helper used on the remote host for remote sessions.
-    @"session-helper",
+    // Remote session management, used on the remote host via SSH.
+    @"ssh-session",
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -161,7 +161,7 @@ pub const Action = enum {
             .@"new-window" => try new_window.run(alloc),
             .@"session-list" => try session_list.run(alloc),
             .@"session-kill" => try session_kill.run(alloc),
-            .@"session-helper" => try session_helper.run(alloc),
+            .@"ssh-session" => try ssh_session.run(alloc),
         };
     }
 
@@ -203,7 +203,7 @@ pub const Action = enum {
                 .@"new-window" => new_window.Options,
                 .@"session-list" => session_list.Options,
                 .@"session-kill" => session_kill.Options,
-                .@"session-helper" => session_helper.Options,
+                .@"ssh-session" => ssh_session.Options,
             };
         }
     }

@@ -21,6 +21,7 @@ pub const ConnectionState = union(enum) {
     reconnecting: ReconnectInfo,
     stale,
     failed: FailReason,
+    disconnected: DisconnectInfo,
     password_required: PasswordPrompt,
 
     pub const PasswordPrompt = struct {
@@ -38,7 +39,20 @@ pub const ConnectionState = union(enum) {
 
     pub const ReconnectInfo = struct {
         attempt: u32,
+        max_attempts: u32,
         elapsed_ns: i128,
+        next_retry_ns: i128,
+    };
+
+    pub const DisconnectInfo = struct {
+        attempts_made: u32,
+        reason: DisconnectReason,
+    };
+
+    pub const DisconnectReason = enum(u8) {
+        exhausted,
+        cancelled,
+        disabled,
     };
 
     pub const FailReason = enum(u8) {
@@ -59,7 +73,7 @@ pub const ConnectionState = union(enum) {
 
 /// Protocol version for the session wire format. Increment this when
 /// making incompatible changes to the protocol. The remote helper
-/// reports this via `+session-helper --version` so the client knows
+/// reports this via `+ssh-session --protocol-version` so the client knows
 /// whether to re-upload.
 pub const protocol_version: u16 = 6;
 
@@ -86,6 +100,7 @@ pub const Kind = enum(u8) {
     surface_open = 21,
     surface_close = 22,
     session_rename = 23,
+    surface_rename = 24,
 };
 
 pub const Header = struct {

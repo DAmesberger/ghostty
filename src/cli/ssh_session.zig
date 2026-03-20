@@ -17,6 +17,9 @@ pub const Options = struct {
     /// Run the remote helper in daemon mode.
     daemon: bool = false,
 
+    /// Kill any running daemon and exit.
+    @"kill-daemon": bool = false,
+
     /// List the sessions known to the remote helper.
     list: bool = false,
 
@@ -79,6 +82,7 @@ pub fn run(alloc: Allocator) !u8 {
         .@"protocol-version" = opts.@"protocol-version",
         .daemonize = opts.daemonize,
         .daemon = opts.daemon,
+        .@"kill-daemon" = opts.@"kill-daemon",
         .list = opts.list,
         .@"stdio-attach" = opts.@"stdio-attach",
         .kill = opts.kill,

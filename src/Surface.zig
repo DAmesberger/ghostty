@@ -647,6 +647,9 @@ pub fn init(
                     .group_id = group_id,
                     .surface_id = surface_id,
                     .connection_manager = &app.ssh_connection_manager,
+                    .reconnect_attempts = config.@"ssh-reconnect-attempts",
+                    .reconnect_backoff = config.@"ssh-reconnect-backoff",
+                    .reconnect_interval_ms = config.@"ssh-reconnect-interval",
                 });
                 errdefer io_remote.deinit();
                 break :backend .{ .remote = io_remote };
@@ -902,21 +905,52 @@ fn sendSessionControl(self: *Surface, comptime cmd: session.shared.ControlComman
     if (!isRemoteSurface(self)) return false;
     switch (cmd) {
         .detach => {
-            // Send detach frame to the remote, then close the surface.
-            // The remote session stays alive for later reattachment.
+            // Detach the entire SSH connection — all tabs and splits on this
+            // host. Send a detach frame for each surface, then close them all.
             const remote = &self.io.backend.remote;
-            if (remote.conn_entry) |entry| {
-                termio.SshConnectionManager.enqueueWrite(
-                    entry,
-                    .detach,
-                    remote.target_id,
-                    "",
-                );
+            const entry = remote.conn_entry orelse {
+                self.close();
+                return true;
+            };
+
+            // Collect ALL surfaces on this connection entry.
+            entry.surfaces_mutex.lock();
+            var targets: [termio.SshConnectionManager.MAX_SURFACES]struct {
+                target_id: u16,
+                io: *termio.Termio,
+                mailbox: *apprt.surface.Mailbox,
+            } = undefined;
+            var count: usize = 0;
+            for (entry.surfaces) |slot| {
+                if (slot) |s| {
+                    targets[count] = .{
+                        .target_id = s.target_id,
+                        .io = s.io,
+                        .mailbox = s.surface_mailbox,
+                    };
+                    count += 1;
+                }
             }
-            self.close();
+            entry.surfaces_mutex.unlock();
+
+            // Mark all surfaces as detaching so threadExit won't send
+            // surface_close (which would kill the daemon-side session).
+            // Then send detach frames and close all surfaces.
+            for (targets[0..count]) |t| {
+                t.io.backend.remote.detaching = true;
+                termio.SshConnectionManager.enqueueWrite(entry, .detach, t.target_id, "");
+                _ = t.mailbox.push(.close, .{ .forever = {} });
+            }
             return true;
         },
-        .reconnect => return false,
+        .reconnect => {
+            const remote = &self.io.backend.remote;
+            if (remote.conn_entry) |entry| {
+                termio.SshConnectionManager.requestReconnect(entry);
+                return true;
+            }
+            return false;
+        },
     }
 }
 
@@ -1022,6 +1056,29 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .set_title,
                 .{ .title = slice },
             );
+
+            // For remote surfaces, sync the title to the remote daemon so it
+            // survives reconnect. Also update the local SurfaceSlot label.
+            if (self.io.backend == .remote) {
+                const remote = &self.io.backend.remote;
+                if (remote.conn_entry) |entry| {
+                    // Update local slot label for reconnect
+                    termio.SshConnectionManager.updateSurfaceLabel(entry, remote.target_id, slice);
+
+                    // Send session_rename frame to daemon.
+                    // Payload: [16 bytes group_id][N bytes label].
+                    var buf: [16 + 256]u8 = undefined;
+                    @memcpy(buf[0..16], &remote.group_id);
+                    const label_len = @min(slice.len, 256);
+                    @memcpy(buf[16..][0..label_len], slice[0..label_len]);
+                    termio.SshConnectionManager.enqueueWrite(
+                        entry,
+                        .session_rename,
+                        remote.target_id,
+                        buf[0 .. 16 + label_len],
+                    );
+                }
+            }
         },
 
         .report_title => |style| report_title: {

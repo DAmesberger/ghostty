@@ -132,6 +132,19 @@ pub const ConnectionOverlay = extern struct {
                 void,
             );
         };
+
+        /// Emitted when the user clicks the reconnect button or presses
+        /// Escape/Enter during the disconnected state.
+        pub const @"reconnect-triggered" = struct {
+            pub const name = "reconnect-triggered";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{},
+                void,
+            );
+        };
     };
 
     const Private = struct {
@@ -144,8 +157,14 @@ pub const ConnectionOverlay = extern struct {
         /// The password entry for interactive auth.
         password_entry: *gtk.PasswordEntry,
 
-        /// The action button (Cancel/Close) for reconnecting/failed states.
+        /// The action button (Cancel/Close/Exit) for reconnecting/failed states.
         action_button: *gtk.Button,
+
+        /// The reconnect button (Retry Now/Reconnect).
+        reconnect_button: *gtk.Button,
+
+        /// The horizontal box containing reconnect + action buttons.
+        button_box: *gtk.Box,
 
         /// The status text (null = hidden).
         status_text: ?[:0]const u8 = null,
@@ -158,6 +177,9 @@ pub const ConnectionOverlay = extern struct {
 
         /// Whether the password entry is visible.
         show_password: bool = false,
+
+        /// True when in disconnected state (Escape triggers reconnect, not action).
+        in_disconnected: bool = false,
 
         /// Key controller for Escape handling.
         key_controller: ?*gtk.EventControllerKey = null,
@@ -231,40 +253,77 @@ pub const ConnectionOverlay = extern struct {
             widget.setFocusable(1);
             _ = priv.password_entry.as(gtk.Widget).grabFocus();
         } else {
-            // Only return to non-interactive if action button is also hidden.
-            if (priv.action_button.as(gtk.Widget).getVisible() == 0) {
+            // Only return to non-interactive if button_box is also hidden.
+            if (priv.button_box.as(gtk.Widget).getVisible() == 0) {
                 widget.setCanFocus(0);
                 widget.setCanTarget(0);
                 widget.setFocusable(0);
+                self.restoreFocusToParent();
             }
         }
 
         self.as(gobject.Object).notifyByPspec(properties.@"show-password".impl.param_spec);
     }
 
-    /// Show or hide the action button with the given label. When shown with the
-    /// password hidden, the overlay becomes interactive so the button can be clicked.
+    /// Show or hide the action button with the given label.
+    /// The button_box is shown when either button is visible.
     pub fn setActionButton(self: *Self, label: ?[:0]const u8) void {
         const priv = self.private();
         if (label) |l| {
             priv.action_button.setLabel(l);
             priv.action_button.as(gtk.Widget).setVisible(1);
-            // Make overlay interactive so the button can receive input.
-            const widget = self.as(gtk.Widget);
+        } else {
+            priv.action_button.as(gtk.Widget).setVisible(0);
+        }
+        self.updateButtonBoxVisibility();
+    }
+
+    /// Show or hide the reconnect button with the given label.
+    pub fn setReconnectButton(self: *Self, label: ?[:0]const u8) void {
+        const priv = self.private();
+        if (label) |l| {
+            priv.reconnect_button.setLabel(l);
+            priv.reconnect_button.as(gtk.Widget).setVisible(1);
+        } else {
+            priv.reconnect_button.as(gtk.Widget).setVisible(0);
+        }
+        self.updateButtonBoxVisibility();
+    }
+
+    /// Set whether the overlay is in the disconnected state (affects Escape behavior).
+    pub fn setDisconnected(self: *Self, disconnected: bool) void {
+        self.private().in_disconnected = disconnected;
+    }
+
+    /// Returns true if the overlay is in the disconnected state.
+    pub fn isDisconnected(self: *Self) bool {
+        return self.private().in_disconnected;
+    }
+
+    /// Update button_box visibility and overlay interactivity based on button states.
+    fn updateButtonBoxVisibility(self: *Self) void {
+        const priv = self.private();
+        const any_visible = priv.action_button.as(gtk.Widget).getVisible() != 0 or
+            priv.reconnect_button.as(gtk.Widget).getVisible() != 0;
+
+        priv.button_box.as(gtk.Widget).setVisible(@intFromBool(any_visible));
+
+        const widget = self.as(gtk.Widget);
+        if (any_visible) {
             widget.setCanFocus(1);
             widget.setCanTarget(1);
             widget.setFocusable(1);
-            // Focus the button so Enter activates it.
-            _ = priv.action_button.as(gtk.Widget).grabFocus();
-        } else {
-            priv.action_button.as(gtk.Widget).setVisible(0);
-            // Only return to non-interactive if password is also hidden.
-            if (!priv.show_password) {
-                const widget = self.as(gtk.Widget);
-                widget.setCanFocus(0);
-                widget.setCanTarget(0);
-                widget.setFocusable(0);
+            // Focus the reconnect button if visible, otherwise the action button
+            if (priv.reconnect_button.as(gtk.Widget).getVisible() != 0) {
+                _ = priv.reconnect_button.as(gtk.Widget).grabFocus();
+            } else {
+                _ = priv.action_button.as(gtk.Widget).grabFocus();
             }
+        } else if (!priv.show_password) {
+            widget.setCanFocus(0);
+            widget.setCanTarget(0);
+            widget.setFocusable(0);
+            self.restoreFocusToParent();
         }
     }
 
@@ -283,6 +342,23 @@ pub const ConnectionOverlay = extern struct {
         signals.@"action-triggered".impl.emit(self, null, .{}, null);
     }
 
+    // Template callback: user clicked the reconnect button.
+    fn reconnectButtonClicked(_: *gtk.Button, self: *Self) callconv(.c) void {
+        signals.@"reconnect-triggered".impl.emit(self, null, .{}, null);
+    }
+
+    /// Restore keyboard focus to the parent widget when this overlay
+    /// becomes non-interactive. Without this, GTK4 leaves focus in limbo
+    /// after setFocusable(0).
+    fn restoreFocusToParent(self: *Self) void {
+        const widget = self.as(gtk.Widget);
+        if (widget.hasFocus() != 0) {
+            if (widget.getParent()) |parent| {
+                _ = parent.grabFocus();
+            }
+        }
+    }
+
     // Key pressed handler on the overlay for Escape.
     fn onKeyPressed(
         _: *gtk.EventControllerKey,
@@ -297,8 +373,13 @@ pub const ConnectionOverlay = extern struct {
                 signals.@"password-cancelled".impl.emit(self, null, .{}, null);
                 return 1;
             }
-            // Handle Escape for action button states (reconnecting/failed).
-            if (priv.action_button.as(gtk.Widget).getVisible() != 0) {
+            // In disconnected state, Escape triggers reconnect (default action).
+            if (priv.in_disconnected) {
+                signals.@"reconnect-triggered".impl.emit(self, null, .{}, null);
+                return 1;
+            }
+            // Handle Escape for action button states (reconnecting).
+            if (priv.button_box.as(gtk.Widget).getVisible() != 0) {
                 signals.@"action-triggered".impl.emit(self, null, .{}, null);
                 return 1;
             }
@@ -360,10 +441,13 @@ pub const ConnectionOverlay = extern struct {
             class.bindTemplateChildPrivate("progress_bar", .{});
             class.bindTemplateChildPrivate("password_entry", .{});
             class.bindTemplateChildPrivate("action_button", .{});
+            class.bindTemplateChildPrivate("reconnect_button", .{});
+            class.bindTemplateChildPrivate("button_box", .{});
 
             // Template callbacks
             class.bindTemplateCallback("password_activate", &passwordActivate);
             class.bindTemplateCallback("action_button_clicked", &actionButtonClicked);
+            class.bindTemplateCallback("reconnect_button_clicked", &reconnectButtonClicked);
 
             // Properties
             gobject.ext.registerProperties(class, &.{
@@ -377,6 +461,7 @@ pub const ConnectionOverlay = extern struct {
             signals.@"password-submitted".impl.register(.{});
             signals.@"password-cancelled".impl.register(.{});
             signals.@"action-triggered".impl.register(.{});
+            signals.@"reconnect-triggered".impl.register(.{});
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);

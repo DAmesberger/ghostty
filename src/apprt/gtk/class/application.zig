@@ -2621,11 +2621,11 @@ const Action = struct {
             .surface => |core| {
                 const blob = core.pending_layout_restore orelse return false;
                 const surface = core.rt_surface.surface;
-                const split_tree = ext.getAncestor(
-                    SplitTree,
+                const window = ext.getAncestor(
+                    Window,
                     surface.as(gtk.Widget),
                 ) orelse return false;
-                split_tree.restoreFromBlob(blob, surface);
+                window.restoreFromBlob(blob, surface);
                 return true;
             },
         }
@@ -2641,6 +2641,16 @@ const Action = struct {
                 // on the same thread, so no lock needed here.
                 const conn_state = core.renderer_state.connection_state;
                 gtk_surface.updateConnectionOverlay(conn_state);
+
+                // When a surface finishes connecting, trigger a layout update
+                // so the window-level layout blob includes this surface.
+                // This handles the case where a new tab was created and the
+                // tree-changed signal fired before the surface had a core.
+                if (conn_state == null) {
+                    if (ext.getAncestor(Window, gtk_surface.as(gtk.Widget))) |window| {
+                        window.sendRemoteLayoutUpdate();
+                    }
+                }
                 return true;
             },
         }

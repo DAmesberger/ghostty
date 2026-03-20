@@ -1,6 +1,6 @@
 //! Remote implements the termio backend for SSH remote sessions.
 //! It connects to a remote host via libssh2 and communicates with
-//! the ghostty session helper using the binary protocol with multiplexed
+//! the remote Ghostty instance using the binary protocol with multiplexed
 //! target IDs. Multiple surfaces share one SSH channel per host.
 //!
 //! All libssh2 operations happen on a dedicated SSH thread per connection
@@ -50,11 +50,25 @@ group_id: Uuid,
 /// Reference to the shared connection manager
 connection_manager: *SshConnectionManager,
 
+/// Reconnect configuration (plumbed from config)
+reconnect_attempts: u32 = 5,
+reconnect_backoff: @import("../config.zig").Config.SshReconnectBackoff = .exponential,
+reconnect_interval_ms: u32 = 1000,
+
 /// The connection entry from the manager (set during threadEnter)
 conn_entry: ?*SshConnectionManager.Entry = null,
 
 /// This surface's target ID for multiplexing (assigned during threadEnter)
 target_id: u16 = 0,
+
+/// True if this surface was created from a layout restore (has a specific
+/// surface_id from ssh-surface-id config). Used to select attach mode
+/// in surface_open so the daemon reattaches to the existing PTY.
+restoring: bool = false,
+
+/// Set by the detach flow so threadExit skips sending surface_close
+/// (which would kill the daemon-side surface we want to keep alive).
+detaching: bool = false,
 
 /// Initial grid size, stored from initTerminal
 grid_size: renderer.GridSize = .{ .columns = 80, .rows = 24 },
@@ -73,11 +87,9 @@ pub fn init(
     errdefer if (label) |l| alloc.free(l);
     const session_id = if (cfg.session_id) |s| try alloc.dupe(u8, s) else null;
 
-    // Surface ID: always a fresh UUID (unique per surface)
-    const surface_id = if (!session.shared.isZeroUuid(cfg.surface_id))
-        cfg.surface_id
-    else
-        session.shared.generateUuid();
+    // Surface ID: use the configured one (from layout restore) or generate fresh.
+    const restoring = !session.shared.isZeroUuid(cfg.surface_id);
+    const surface_id = if (restoring) cfg.surface_id else session.shared.generateUuid();
 
     // Group ID: inherited from parent (for splits) or zero (will create new group)
     const group_id = cfg.group_id;
@@ -90,7 +102,11 @@ pub fn init(
         .session_id = session_id,
         .surface_id = surface_id,
         .group_id = group_id,
+        .restoring = restoring,
         .connection_manager = cfg.connection_manager,
+        .reconnect_attempts = cfg.reconnect_attempts,
+        .reconnect_backoff = cfg.reconnect_backoff,
+        .reconnect_interval_ms = cfg.reconnect_interval_ms,
     };
 }
 
@@ -176,7 +192,7 @@ pub fn threadEnter(
     self.target_id = self.connection_manager.allocateTarget(entry);
 
     // Register surface for frame dispatch from the SSH thread
-    if (!SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox, self.surface_id, self.group_id)) {
+    if (!SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox, self.surface_id, self.group_id, self.label)) {
         _ = td.surface_mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
         return error.MaxSurfacesExceeded;
     }
@@ -194,8 +210,10 @@ pub fn threadEnter(
         };
 
         if (!session.shared.isZeroUuid(self.group_id)) {
-            // Split surface: join existing group via surface_open
-            const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
+            // Split/restored surface: join existing group via surface_open.
+            // Use attach mode if restoring from a layout blob (ssh-surface-id
+            // was set), so the daemon reattaches to the existing PTY.
+            const mode: session.protocol.OpenMode = if (self.session_id != null or self.restoring) .attach else .new;
             const open_payload = (session.protocol.SurfaceOpen{
                 .resize = open_resize,
                 .mode = mode,
@@ -207,8 +225,16 @@ pub fn threadEnter(
         } else {
             // First surface: generate group_id and create new group
             self.group_id = session.shared.generateUuid();
+            // Update the registered slot so detach/reconnect can find us by group.
+            SshConnectionManager.updateSurfaceGroupId(entry, self.target_id, self.group_id);
+
+            // Generate a readable session name if no explicit label was provided.
+            if (self.label == null) {
+                self.label = session.shared.generateReadableName(self.alloc, self.group_id) catch null;
+            }
+
             const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
-            const label = self.label orelse "session";
+            const label = self.label orelse self.ssh_target;
 
             // For attach mode with session_id, try to parse it as UUID for group lookup
             var attach_group_id = self.group_id;
@@ -223,7 +249,9 @@ pub fn threadEnter(
             const open_payload = (session.protocol.SessionOpen{
                 .resize = open_resize,
                 .mode = mode,
-                .surface_id = self.surface_id,
+                // For attach mode, send zero surface_id so the daemon picks
+                // the first alive surface rather than looking up a specific one.
+                .surface_id = if (mode == .attach) session.shared.zero_uuid else self.surface_id,
                 .group_id = if (mode == .attach) attach_group_id else self.group_id,
                 .label = if (mode == .attach) (self.session_id orelse label) else label,
             }).encode(alloc) catch return error.OutOfMemory;
@@ -297,12 +325,16 @@ fn setupConnection(
         }
     }
 
-    const helper_path = session.client.ensureRemoteHelper(alloc, &entry.ctx, stderr, mailbox) catch |err| {
+    const helper_result = session.client.ensureRemoteHelper(alloc, &entry.ctx, stderr, mailbox) catch |err| {
         _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;
     };
+    const helper_path = helper_result.path;
 
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path, true) catch |err| {
+    // Only force-restart the daemon if the helper binary was re-uploaded
+    // (version mismatch). Otherwise reuse the running daemon to preserve
+    // existing sessions.
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path, helper_result.uploaded) catch |err| {
         alloc.free(helper_path);
         _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;
@@ -330,6 +362,11 @@ fn setupConnection(
     entry.channel = channel;
     self.connection_manager.mutex.unlock();
 
+    // Store reconnect config into the entry (first surface only)
+    entry.max_reconnect_attempts = self.reconnect_attempts;
+    entry.reconnect_backoff = self.reconnect_backoff;
+    entry.reconnect_interval_ms = self.reconnect_interval_ms;
+
     // Create pipes for SSH thread communication
     entry.quit_pipe = try posix.pipe2(.{ .CLOEXEC = true });
     errdefer {
@@ -341,6 +378,11 @@ fn setupConnection(
         posix.close(entry.write_pipe[0]);
         posix.close(entry.write_pipe[1]);
     }
+    entry.reconnect_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(entry.reconnect_pipe[0]);
+        posix.close(entry.reconnect_pipe[1]);
+    }
 
     // Spawn the dedicated SSH thread
     entry.ssh_thread = try std.Thread.spawn(.{}, SshConnectionManager.sshThreadMain, .{entry});
@@ -351,7 +393,11 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     _ = td;
     const entry = self.conn_entry orelse return;
 
-    if (!session.shared.isZeroUuid(self.group_id)) {
+    if (self.detaching) {
+        // Detach flow: the detach frame was already sent by sendSessionControl.
+        // Don't send surface_close — the daemon-side surface must stay alive
+        // so the session can be reattached later.
+    } else if (!session.shared.isZeroUuid(self.group_id)) {
         // Grouped surface: send surface_close with our UUID
         SshConnectionManager.enqueueWrite(entry, .surface_close, self.target_id, &self.surface_id);
     } else {
@@ -463,4 +509,8 @@ pub const Config = struct {
     /// Pre-assigned surface UUID, or zero to auto-generate.
     surface_id: Uuid = session.shared.zero_uuid,
     connection_manager: *SshConnectionManager,
+    // Reconnect config
+    reconnect_attempts: u32 = 5,
+    reconnect_backoff: @import("../config.zig").Config.SshReconnectBackoff = .exponential,
+    reconnect_interval_ms: u32 = 1000,
 };

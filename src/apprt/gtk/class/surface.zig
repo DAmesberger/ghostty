@@ -653,6 +653,14 @@ pub const Surface = extern struct {
         /// the user submits or cancels.
         pending_auth_state: ?*anyopaque = null,
 
+        /// GLib timer source ID for the reconnect countdown (1-second tick).
+        countdown_timer: c_uint = 0,
+        /// Target nanosecond timestamp for countdown display.
+        countdown_target_ns: i128 = 0,
+        /// Current reconnect attempt info for countdown display.
+        countdown_attempt: u32 = 0,
+        countdown_max_attempts: u32 = 0,
+
         // Progress bar
         progress_bar_timer: ?c_uint = null,
 
@@ -920,6 +928,9 @@ pub const Surface = extern struct {
         const priv = self.private();
         const overlay = priv.connection_overlay;
 
+        // Stop any running countdown timer when state changes
+        self.stopCountdownTimer();
+
         const s = state orelse {
             // null = connected/dismissed
             priv.pending_auth_state = null;
@@ -927,6 +938,8 @@ pub const Surface = extern struct {
             overlay.setShowProgress(false);
             overlay.setShowPassword(false);
             overlay.setActionButton(null);
+            overlay.setReconnectButton(null);
+            overlay.setDisconnected(false);
             return;
         };
 
@@ -935,12 +948,16 @@ pub const Surface = extern struct {
                 overlay.setShowPassword(false);
                 overlay.setShowProgress(false);
                 overlay.setActionButton(null);
+                overlay.setReconnectButton(null);
+                overlay.setDisconnected(false);
                 overlay.setStatus("Connecting\xe2\x80\xa6");
             },
             .uploading => |progress| {
                 overlay.setShowPassword(false);
                 overlay.setShowProgress(true);
                 overlay.setActionButton(null);
+                overlay.setReconnectButton(null);
+                overlay.setDisconnected(false);
                 if (progress.total_bytes > 0) {
                     const frac: f64 = @as(f64, @floatFromInt(progress.bytes_sent)) /
                         @as(f64, @floatFromInt(progress.total_bytes));
@@ -948,12 +965,14 @@ pub const Surface = extern struct {
                 } else {
                     overlay.setProgress(0.0);
                 }
-                overlay.setStatus("Uploading helper\xe2\x80\xa6");
+                overlay.setStatus("Uploading Ghostty\xe2\x80\xa6");
             },
             .setup => {
                 overlay.setShowPassword(false);
                 overlay.setShowProgress(false);
                 overlay.setActionButton(null);
+                overlay.setReconnectButton(null);
+                overlay.setDisconnected(false);
                 overlay.setStatus("Starting remote daemon\xe2\x80\xa6");
             },
             .connected => {
@@ -962,43 +981,132 @@ pub const Surface = extern struct {
                 overlay.setShowProgress(false);
                 overlay.setShowPassword(false);
                 overlay.setActionButton(null);
+                overlay.setReconnectButton(null);
+                overlay.setDisconnected(false);
+                // Trigger subtitle re-evaluation now that remote info is available.
+                self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
             },
             .reconnecting => |info| {
                 overlay.setShowPassword(false);
                 overlay.setShowProgress(false);
-                var buf: [96:0]u8 = @splat(0);
-                const elapsed_s = @divFloor(info.elapsed_ns, std.time.ns_per_s);
-                _ = std.fmt.bufPrint(&buf, "Reconnecting (attempt {d}, {d}s elapsed)\xe2\x80\xa6", .{ info.attempt, elapsed_s }) catch {};
-                overlay.setStatus(&buf);
-                overlay.setActionButton("Cancel");
+                overlay.setDisconnected(false);
+                var buf: [128:0]u8 = @splat(0);
+
+                if (info.next_retry_ns == 0) {
+                    // Actively attempting connection
+                    _ = std.fmt.bufPrint(&buf, "Connecting\xe2\x80\xa6 (attempt {d} of {d})", .{ info.attempt, info.max_attempts }) catch {};
+                    overlay.setStatus(&buf);
+                    overlay.setReconnectButton(null);
+                    overlay.setActionButton("Cancel");
+                } else {
+                    // Waiting for backoff — show countdown + Retry Now
+                    const now = std.time.nanoTimestamp();
+                    const remaining_ns = info.next_retry_ns - now;
+                    const remaining_s = @max(@as(i128, 0), @divFloor(remaining_ns, std.time.ns_per_s));
+                    _ = std.fmt.bufPrint(&buf, "Reconnect failed, retrying in {d}s (attempt {d} of {d})", .{ remaining_s, info.attempt, info.max_attempts }) catch {};
+                    overlay.setStatus(&buf);
+                    overlay.setReconnectButton("Retry Now");
+                    overlay.setActionButton("Cancel");
+                    // Start a 1-second countdown timer
+                    self.startCountdownTimer(info);
+                }
             },
             .stale => {
                 overlay.setShowPassword(false);
                 overlay.setShowProgress(false);
                 overlay.setActionButton(null);
+                overlay.setReconnectButton(null);
+                overlay.setDisconnected(false);
                 overlay.setStatus("Connection stale");
             },
             .failed => |reason| {
                 priv.pending_auth_state = null;
                 overlay.setShowPassword(false);
                 overlay.setShowProgress(false);
+                overlay.setDisconnected(false);
                 const msg: [:0]const u8 = switch (reason) {
                     .auth_failed => "Authentication failed",
                     .timeout => "Connection timed out",
-                    .helper_failed => "Helper setup failed",
+                    .helper_failed => "Ghostty setup failed",
                     .unknown => "Connection failed",
                 };
                 overlay.setStatus(msg);
+                overlay.setReconnectButton(null);
                 overlay.setActionButton("Close");
+            },
+            .disconnected => |info| {
+                priv.pending_auth_state = null;
+                overlay.setShowPassword(false);
+                overlay.setShowProgress(false);
+                overlay.setDisconnected(true);
+                var buf: [128:0]u8 = @splat(0);
+                const msg: [:0]const u8 = switch (info.reason) {
+                    .exhausted => msg: {
+                        _ = std.fmt.bufPrint(&buf, "Reconnect failed after {d} attempts", .{info.attempts_made}) catch {};
+                        break :msg &buf;
+                    },
+                    .cancelled => "Reconnect cancelled",
+                    .disabled => "Connection lost",
+                };
+                overlay.setStatus(msg);
+                overlay.setReconnectButton("Reconnect");
+                overlay.setActionButton("Exit");
             },
             .password_required => |prompt| {
                 priv.pending_auth_state = prompt.auth_state;
                 overlay.setShowProgress(false);
                 overlay.setActionButton(null);
+                overlay.setReconnectButton(null);
+                overlay.setDisconnected(false);
                 overlay.setShowPassword(true);
                 overlay.setStatus("Enter password:");
             },
         }
+    }
+
+    /// Start a 1-second countdown timer for the reconnect backoff display.
+    fn startCountdownTimer(
+        self: *Self,
+        info: @import("../../../session.zig").protocol.ConnectionState.ReconnectInfo,
+    ) void {
+        const priv = self.private();
+        // Stop any existing timer first
+        self.stopCountdownTimer();
+        priv.countdown_target_ns = info.next_retry_ns;
+        priv.countdown_attempt = info.attempt;
+        priv.countdown_max_attempts = info.max_attempts;
+        priv.countdown_timer = glib.timeoutAdd(1000, &countdownTick, self);
+    }
+
+    fn stopCountdownTimer(self: *Self) void {
+        const priv = self.private();
+        if (priv.countdown_timer != 0) {
+            _ = glib.Source.remove(priv.countdown_timer);
+            priv.countdown_timer = 0;
+        }
+    }
+
+    fn countdownTick(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(data orelse return 0));
+        const priv = self.private();
+        const overlay = priv.connection_overlay;
+
+        const now = std.time.nanoTimestamp();
+        const remaining_ns = priv.countdown_target_ns - now;
+        if (remaining_ns <= 0) {
+            // Timer expired, stop ticking (state will change via mailbox)
+            priv.countdown_timer = 0;
+            return 0; // G_SOURCE_REMOVE
+        }
+
+        const remaining_s = @divFloor(remaining_ns, std.time.ns_per_s);
+        var buf: [128:0]u8 = @splat(0);
+        _ = std.fmt.bufPrint(&buf, "Reconnect failed, retrying in {d}s (attempt {d} of {d})", .{
+            remaining_s, priv.countdown_attempt, priv.countdown_max_attempts,
+        }) catch {};
+        overlay.setStatus(&buf);
+
+        return 1; // G_SOURCE_CONTINUE
     }
 
     /// Called when the user submits a password in the connection overlay.
@@ -1039,10 +1147,37 @@ pub const Surface = extern struct {
         priv.pending_auth_state = null;
     }
 
-    /// Called when the user clicks the action button on the connection overlay
-    /// (Cancel during reconnection or Close on failure). Closes the surface.
+    /// Called when the user clicks the action button on the connection overlay.
+    /// During reconnecting: cancels auto-reconnect. During disconnected: exits.
+    /// During failed: closes.
     fn onConnectionAction(_: *ConnectionOverlay, self: *Self) callconv(.c) void {
-        self.close();
+        const priv = self.private();
+        const overlay = priv.connection_overlay;
+        if (overlay.isDisconnected()) {
+            // "Exit" button during disconnected state → close the surface
+            self.close();
+            return;
+        }
+        // During reconnecting state: cancel the reconnect
+        if (self.getRemoteEntry()) |entry| {
+            SshConnectionManager.cancelReconnect(entry);
+        } else {
+            self.close();
+        }
+    }
+
+    /// Called when the user clicks the reconnect button or Escape during disconnected.
+    fn onReconnectAction(_: *ConnectionOverlay, self: *Self) callconv(.c) void {
+        if (self.getRemoteEntry()) |entry| {
+            SshConnectionManager.requestReconnect(entry);
+        }
+    }
+
+    /// Get the SSH connection entry for this surface, if it's a remote surface.
+    fn getRemoteEntry(self: *Self) ?*SshConnectionManager.Entry {
+        const core_surface = self.core() orelse return null;
+        if (core_surface.io.backend != .remote) return null;
+        return core_surface.io.backend.remote.conn_entry;
     }
 
     /// Handle a key sequence action from the apprt.
@@ -1979,6 +2114,13 @@ pub const Surface = extern struct {
             priv.connection_overlay,
             *Self,
             onConnectionAction,
+            self,
+            .{},
+        );
+        _ = ConnectionOverlay.signals.@"reconnect-triggered".connect(
+            priv.connection_overlay,
+            *Self,
+            onReconnectAction,
             self,
             .{},
         );
@@ -3723,6 +3865,18 @@ pub const Surface = extern struct {
     ) callconv(.c) void {
         const title = std.mem.span(title_ptr);
         self.setTitleOverride(if (title.len == 0) null else title);
+
+        // Sync the surface title to the remote daemon so it survives reconnect.
+        const core_surface = self.core() orelse return;
+        if (core_surface.io.backend != .remote) return;
+        const remote = &core_surface.io.backend.remote;
+        const entry = remote.conn_entry orelse return;
+        // Payload: [16 bytes surface_id][N bytes label]
+        var buf: [16 + 256]u8 = undefined;
+        @memcpy(buf[0..16], &remote.surface_id);
+        const label_len = @min(title.len, 256);
+        @memcpy(buf[16..][0..label_len], title[0..label_len]);
+        SshConnectionManager.enqueueWrite(entry, .surface_rename, remote.target_id, buf[0 .. 16 + label_len]);
     }
 
     fn searchStop(_: *SearchOverlay, self: *Self) callconv(.c) void {
