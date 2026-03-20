@@ -17,6 +17,7 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("signal.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/socket.h");
+    @cInclude("sys/stat.h");
     @cInclude("sys/un.h");
     @cInclude("sys/wait.h");
     @cInclude("termios.h");
@@ -187,6 +188,16 @@ fn daemonMain(alloc: Allocator) !void {
     defer alloc.free(state_dir);
     try std.fs.cwd().makePath(state_dir);
 
+    // Secure the state directory permissions
+    {
+        var dir = try std.fs.cwd().openDir(state_dir, .{});
+        defer dir.close();
+        const dir_fd = dir.fd;
+        if (c.fchmod(dir_fd, 0o700) != 0) {
+            log.warn("failed to set state dir permissions", .{});
+        }
+    }
+
     const socket_path = try session.shared.socketPath(alloc);
     defer alloc.free(socket_path);
 
@@ -214,6 +225,10 @@ fn daemonMain(alloc: Allocator) !void {
 
         if (pollfds[0].revents & c.POLLIN != 0) {
             const client_fd = try acceptUnixSocket(daemon.listener);
+            verifyPeerUid(client_fd) catch {
+                closeFd(client_fd);
+                continue;
+            };
             const client = try alloc.create(ClientThread);
             client.* = .{
                 .daemon = &daemon,
@@ -1222,6 +1237,42 @@ fn preExecPty(cmd: *Command) ?u8 {
 // Low-level helpers
 // ============================================================================
 
+/// Verify that the connecting peer has the same UID as us.
+/// Uses platform-specific mechanisms: SO_PEERCRED on Linux,
+/// getpeereid() on macOS/BSD.
+fn verifyPeerUid(fd: posix.fd_t) !void {
+    const our_uid = c.getuid();
+
+    if (comptime builtin.os.tag == .linux) {
+        // Use SO_PEERCRED on Linux
+        var cred: extern struct {
+            pid: c_int,
+            uid: c_uint,
+            gid: c_uint,
+        } = undefined;
+        var len: c.socklen_t = @sizeOf(@TypeOf(cred));
+        if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_PEERCRED, @ptrCast(&cred), &len) != 0) {
+            return error.PeerAuthFailed;
+        }
+        if (cred.uid != our_uid) {
+            log.warn("peer UID {d} != our UID {d}, rejecting", .{ cred.uid, our_uid });
+            return error.PeerAuthFailed;
+        }
+    } else if (comptime builtin.os.tag.isDarwin()) {
+        // Use getpeereid() on macOS
+        var peer_uid: c.uid_t = undefined;
+        var peer_gid: c.gid_t = undefined;
+        if (c.getpeereid(fd, &peer_uid, &peer_gid) != 0) {
+            return error.PeerAuthFailed;
+        }
+        if (peer_uid != our_uid) {
+            log.warn("peer UID {d} != our UID {d}, rejecting", .{ peer_uid, our_uid });
+            return error.PeerAuthFailed;
+        }
+    }
+    // On unsupported platforms, skip verification (Windows is excluded via comptime)
+}
+
 fn canConnect(path: []const u8) !bool {
     const fd = connectUnixSocket(path) catch return false;
     closeFd(fd);
@@ -1243,6 +1294,12 @@ fn bindUnixSocket(path: []const u8) !posix.fd_t {
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) {
         return error.BindFailed;
     }
+
+    // Restrict socket permissions to owner only (prevents local hijacking)
+    if (c.fchmod(fd, 0o700) != 0) {
+        return error.PermissionDenied;
+    }
+
     if (c.listen(fd, 64) != 0) return error.ListenFailed;
     return fd;
 }
@@ -1268,6 +1325,7 @@ fn connectUnixSocket(path: []const u8) !posix.fd_t {
 }
 
 fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
+    if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;
     var file: std.fs.File = .{ .handle = fd };
     var buf: [1024]u8 = undefined;
     var writer_ = file.writerStreaming(&buf);
@@ -1277,6 +1335,7 @@ fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, target: u16, payload
 }
 
 fn sendFrameFile(file: std.fs.File, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
+    if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;
     var header: [session.protocol.header_size]u8 = undefined;
     header[0] = @intFromEnum(kind);
     header[1] = 0;

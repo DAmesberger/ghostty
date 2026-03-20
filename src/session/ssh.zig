@@ -33,6 +33,7 @@ pub const Error = error{
     SshConnectFailed,
     SshDisconnected,
     SshAgentFailed,
+    SshHostKeyMismatch,
 };
 
 pub const ExecResult = struct {
@@ -67,6 +68,8 @@ pub const SshSession = struct {
         if (ssh2.libssh2_session_handshake(session, sock) != 0) {
             return error.SshHandshakeFailed;
         }
+
+        try verifyHostKey(alloc, session, host, port);
 
         return .{
             .alloc = alloc,
@@ -121,9 +124,15 @@ pub const SshSession = struct {
 
         // Handshake in non-blocking mode since the callbacks may
         // return EAGAIN when the tunnel channel isn't ready.
+        // Timeout after 30 seconds to avoid hanging indefinitely.
         ssh2.libssh2_session_set_blocking(inner, 0);
+        const handshake_deadline = std.time.nanoTimestamp() + 30 * std.time.ns_per_s;
         var handshake_iters: u32 = 0;
         while (true) {
+            if (std.time.nanoTimestamp() > handshake_deadline) {
+                _ = c.close(dummy_fd);
+                return error.SshHandshakeFailed;
+            }
             handshake_iters += 1;
             const rc = ssh2.libssh2_session_handshake(inner, dummy_fd);
             if (rc == 0) break;
@@ -152,6 +161,8 @@ pub const SshSession = struct {
         // blocking mode, libssh2 handles EAGAIN from our custom
         // callbacks internally by retrying.
         ssh2.libssh2_session_set_blocking(inner, 1);
+
+        try verifyHostKey(self.alloc, inner, target_host, target_port);
 
         return .{
             .alloc = self.alloc,
@@ -206,7 +217,10 @@ pub const SshSession = struct {
         const user_z = try allocSentinel(self.alloc, username);
         defer self.alloc.free(user_z);
         const pass_z = try allocSentinel(self.alloc, password);
-        defer self.alloc.free(pass_z);
+        defer {
+            @memset(@constCast(pass_z), 0);
+            self.alloc.free(pass_z);
+        }
 
         if (userauthPassword(
             self.session,
@@ -237,7 +251,10 @@ pub const SshSession = struct {
         if (pubkey_path) |p| pub_z = try allocSentinel(self.alloc, p);
 
         var pass_z: ?[:0]const u8 = null;
-        defer if (pass_z) |p| self.alloc.free(p);
+        defer if (pass_z) |p| {
+            @memset(@constCast(p), 0);
+            self.alloc.free(p);
+        };
         if (passphrase) |p| pass_z = try allocSentinel(self.alloc, p);
 
         const rc = ssh2.libssh2_userauth_publickey_fromfile(
@@ -722,6 +739,132 @@ fn tunnelSend(
 }
 
 // -- Helpers --
+
+/// Verify the server's host key against the local known_hosts file.
+/// Uses TOFU (Trust On First Use): unknown keys are auto-accepted and
+/// written to known_hosts with a warning. Mismatched keys are rejected
+/// to prevent MITM attacks.
+fn verifyHostKey(
+    alloc: Allocator,
+    session: *ssh2.LIBSSH2_SESSION,
+    host: []const u8,
+    port: u16,
+) !void {
+    // Get the server's host key
+    var key_len: usize = 0;
+    var key_type: c_int = 0;
+    const host_key = ssh2.libssh2_session_hostkey(session, &key_len, &key_type);
+    if (host_key == null or key_len == 0) {
+        log.warn("could not retrieve server host key", .{});
+        return;
+    }
+
+    // Initialize known hosts handle
+    const kh = ssh2.libssh2_knownhost_init(session) orelse {
+        log.warn("failed to init known hosts handle", .{});
+        return;
+    };
+    defer ssh2.libssh2_knownhost_free(kh);
+
+    // Build path to ~/.ssh/known_hosts
+    const home = posix.getenv("HOME") orelse {
+        log.warn("HOME not set, skipping host key verification", .{});
+        return;
+    };
+    const known_hosts_path = std.fs.path.join(alloc, &.{ home, ".ssh", "known_hosts" }) catch {
+        log.warn("failed to build known_hosts path", .{});
+        return;
+    };
+    defer alloc.free(known_hosts_path);
+    const kh_path_z = allocSentinel(alloc, known_hosts_path) catch {
+        log.warn("failed to allocate known_hosts path", .{});
+        return;
+    };
+    defer alloc.free(kh_path_z);
+
+    // Read existing known hosts (ignore errors — file may not exist yet)
+    _ = ssh2.libssh2_knownhost_readfile(kh, kh_path_z.ptr, ssh2.LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+
+    // Map libssh2 key type to knownhost key type constant
+    const kh_key_type: c_int = switch (key_type) {
+        ssh2.LIBSSH2_HOSTKEY_TYPE_RSA => ssh2.LIBSSH2_KNOWNHOST_KEY_SSHRSA,
+        ssh2.LIBSSH2_HOSTKEY_TYPE_DSS => ssh2.LIBSSH2_KNOWNHOST_KEY_SSHDSS,
+        ssh2.LIBSSH2_HOSTKEY_TYPE_ECDSA_256 => ssh2.LIBSSH2_KNOWNHOST_KEY_ECDSA_256,
+        ssh2.LIBSSH2_HOSTKEY_TYPE_ECDSA_384 => ssh2.LIBSSH2_KNOWNHOST_KEY_ECDSA_384,
+        ssh2.LIBSSH2_HOSTKEY_TYPE_ECDSA_521 => ssh2.LIBSSH2_KNOWNHOST_KEY_ECDSA_521,
+        ssh2.LIBSSH2_HOSTKEY_TYPE_ED25519 => ssh2.LIBSSH2_KNOWNHOST_KEY_ED25519,
+        else => ssh2.LIBSSH2_KNOWNHOST_KEY_UNKNOWN,
+    };
+
+    const typemask = ssh2.LIBSSH2_KNOWNHOST_TYPE_PLAIN |
+        ssh2.LIBSSH2_KNOWNHOST_KEYENC_RAW |
+        kh_key_type;
+
+    // Null-terminate host for C API
+    const host_z = allocSentinel(alloc, host) catch {
+        log.warn("failed to allocate host string for verification", .{});
+        return;
+    };
+    defer alloc.free(host_z);
+
+    // Check the key against known hosts
+    var kh_entry: ?*ssh2.struct_libssh2_knownhost = null;
+    const check_result = ssh2.libssh2_knownhost_checkp(
+        kh,
+        host_z.ptr,
+        @intCast(port),
+        host_key,
+        key_len,
+        typemask,
+        &kh_entry,
+    );
+
+    switch (check_result) {
+        ssh2.LIBSSH2_KNOWNHOST_CHECK_MATCH => {
+            // Host key matches — trusted host
+            log.info("host key verified for {s}", .{host});
+        },
+        ssh2.LIBSSH2_KNOWNHOST_CHECK_MISMATCH => {
+            // Key changed — potential MITM attack
+            log.err("HOST KEY MISMATCH for {s}:{d} — possible MITM attack! " ++
+                "Remove the old key from known_hosts to connect.", .{ host, port });
+            return error.SshHostKeyMismatch;
+        },
+        ssh2.LIBSSH2_KNOWNHOST_CHECK_NOTFOUND => {
+            // TOFU: auto-accept and write the key
+            log.warn("host key for {s}:{d} not found in known_hosts — " ++
+                "auto-accepting (TOFU). Verify the key fingerprint manually " ++
+                "for critical connections.", .{ host, port });
+
+            _ = ssh2.libssh2_knownhost_addc(
+                kh,
+                host_z.ptr,
+                null, // salt (not used for plain type)
+                host_key,
+                key_len,
+                null, // comment
+                0, // comment len
+                typemask,
+                null, // store (we don't need the entry back)
+            );
+
+            // Ensure ~/.ssh directory exists
+            const ssh_dir = std.fs.path.join(alloc, &.{ home, ".ssh" }) catch return;
+            defer alloc.free(ssh_dir);
+            std.fs.makeDirAbsolute(ssh_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return,
+            };
+
+            // Write updated known_hosts file
+            _ = ssh2.libssh2_knownhost_writefile(kh, kh_path_z.ptr, ssh2.LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+        },
+        else => {
+            // LIBSSH2_KNOWNHOST_CHECK_FAILURE or other
+            log.warn("host key check failed for {s} (result={d})", .{ host, check_result });
+        },
+    }
+}
 
 fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
     const host_z = try std.heap.page_allocator.allocSentinel(u8, host.len, 0);

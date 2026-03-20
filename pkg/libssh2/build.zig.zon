@@ -12,5 +12,7 @@
         },
 
         .apple_sdk = .{ .path = "../apple-sdk" },
+        .aws_lc = .{ .path = "../aws-lc" },
+        .zlib = .{ .path = "../zlib" },
     },
 }

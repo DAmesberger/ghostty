@@ -79,6 +79,7 @@
         .utfcpp = .{ .path = "./pkg/utfcpp", .lazy = true },
         .wuffs = .{ .path = "./pkg/wuffs", .lazy = true },
         .zlib = .{ .path = "./pkg/zlib", .lazy = true },
+        .aws_lc = .{ .path = "./pkg/aws-lc", .lazy = true },
         .libssh2 = .{ .path = "./pkg/libssh2", .lazy = true },
 
         // Shader translation

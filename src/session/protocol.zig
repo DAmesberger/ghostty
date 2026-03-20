@@ -137,7 +137,7 @@ pub const SessionOpen = struct {
         if (payload.len < 9 + uuid_size * 2) return error.InvalidSessionOpenPayload;
         return .{
             .resize = try Resize.parse(payload[0..8]),
-            .mode = std.meta.intToEnum(OpenMode, payload[8]) catch .new,
+            .mode = std.meta.intToEnum(OpenMode, payload[8]) catch return error.InvalidSessionOpenPayload,
             .surface_id = payload[9..][0..uuid_size].*,
             .group_id = payload[9 + uuid_size ..][0..uuid_size].*,
             .label = payload[9 + uuid_size * 2 ..],
@@ -174,7 +174,7 @@ pub const SurfaceOpen = struct {
         if (payload.len < payload_size) return error.InvalidSurfaceOpenPayload;
         return .{
             .resize = try Resize.parse(payload[0..8]),
-            .mode = std.meta.intToEnum(OpenMode, payload[8]) catch .new,
+            .mode = std.meta.intToEnum(OpenMode, payload[8]) catch return error.InvalidSurfaceOpenPayload,
             .group_id = payload[9..][0..uuid_size].*,
             .surface_id = payload[9 + uuid_size ..][0..uuid_size].*,
         };

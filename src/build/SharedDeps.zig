@@ -240,10 +240,27 @@ pub fn add(
         }
     }
 
-    // libssh2 (with OpenSSL backend) — used for native SSH transport
-    // in remote sessions via @cImport. Only needed on non-Windows platforms.
-    // Links system OpenSSL (libcrypto + libssl) for Ed25519 and other
-    // modern key type support.
+    // aws-lc (libcrypto) — vendored crypto backend for libssh2.
+    // Only needed when using the vendored libssh2 build (non-system-integration).
+    if (step.rootModuleTarget().os.tag != .windows) {
+        if (!b.systemIntegrationOption("libssh2", .{})) {
+            if (b.lazyDependency("aws_lc", .{
+                .target = target,
+                .optimize = optimize,
+            })) |awslc_dep| {
+                step.linkLibrary(awslc_dep.artifact("crypto"));
+                try static_libs.append(
+                    b.allocator,
+                    awslc_dep.artifact("crypto").getEmittedBin(),
+                );
+            }
+        }
+    }
+
+    // libssh2 with vendored aws-lc crypto backend — used for native SSH
+    // transport in remote sessions via @cImport. Only needed on non-Windows.
+    // The vendored build uses aws-lc (reports as OpenSSL 1.1.1g) for
+    // Ed25519, ECDSA, and other modern key types.
     if (step.rootModuleTarget().os.tag != .windows) {
         _ = b.systemIntegrationOption("libssh2", .{}); // Shows it in help
         if (b.systemIntegrationOption("libssh2", .{})) {

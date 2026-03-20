@@ -13,6 +13,13 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
 
 const log = std.log.scoped(.session_client);
 
+/// Zero-fill a buffer before freeing it, preventing sensitive data
+/// (passwords, keys) from lingering in deallocated memory.
+fn secureZeroAndFree(alloc: Allocator, buf: []u8) void {
+    @memset(buf, 0);
+    alloc.free(buf);
+}
+
 pub const Error = error{
     RemoteCommandFailed,
     RemotePlatformUnsupported,
@@ -80,7 +87,7 @@ pub const SshContext = struct {
                     try stderr.flush();
                     return error.RemoteAuthRequired;
                 };
-                defer self.alloc.free(pass);
+                defer secureZeroAndFree(self.alloc, pass);
                 jump_sess.authPassword(jump.user, pass) catch {
                     try stderr.writeAll("Authentication failed for jump host.\n");
                     try stderr.flush();
@@ -110,7 +117,7 @@ pub const SshContext = struct {
                     try stderr.flush();
                     return error.RemoteAuthRequired;
                 };
-                defer self.alloc.free(pass);
+                defer secureZeroAndFree(self.alloc, pass);
                 target_sess.authPassword(target.user, pass) catch {
                     try stderr.writeAll("Authentication failed for target host.\n");
                     try stderr.flush();
@@ -136,7 +143,7 @@ pub const SshContext = struct {
                     try stderr.flush();
                     return error.RemoteAuthRequired;
                 };
-                defer self.alloc.free(pass);
+                defer secureZeroAndFree(self.alloc, pass);
                 sess.authPassword(target.user, pass) catch {
                     try stderr.writeAll("Authentication failed.\n");
                     try stderr.flush();
@@ -275,12 +282,16 @@ pub fn ensureRemoteHelper(
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
 ) ![]const u8 {
-    const helper_path = try shared.remoteInstallPath(alloc);
-    errdefer alloc.free(helper_path);
-
     // Establish SSH connection
     try ctx.connect(stderr);
     var sess = &ctx.session.?;
+
+    // Resolve the remote HOME directory for secure path construction
+    const remote_home = try resolveRemoteHome(alloc, sess);
+    defer alloc.free(remote_home);
+
+    const helper_path = try shared.remoteInstallPath(alloc, remote_home);
+    errdefer alloc.free(helper_path);
 
     // Probe: run the helper's --version flag. If the binary is missing,
     // wrong arch, or a different protocol version, we re-upload.
@@ -292,14 +303,14 @@ pub fn ensureRemoteHelper(
     defer alloc.free(version_cmd);
 
     const result = sess.exec(version_cmd) catch {
-        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
+        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
         return helper_path;
     };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
     if (result.exit_code != 0) {
-        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
+        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
         return helper_path;
     }
 
@@ -309,20 +320,20 @@ pub fn ensureRemoteHelper(
     if (!std.mem.startsWith(u8, trimmed, prefix)) {
         try stderr.writeAll("Remote helper version unrecognized, re-uploading...\n");
         try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
+        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
         return helper_path;
     }
 
     const ver_str = trimmed[prefix.len..];
     const remote_version = std.fmt.parseInt(u16, ver_str, 10) catch {
-        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
+        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
         return helper_path;
     };
 
     if (remote_version != protocol.protocol_version) {
         try stderr.writeAll("Remote helper protocol version mismatch, re-uploading...\n");
         try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, stderr, mailbox);
+        try uploadHelper(alloc, sess, helper_path, remote_home, stderr, mailbox);
     }
 
     return helper_path;
@@ -391,6 +402,7 @@ pub fn runRemoteCapture(
 }
 
 /// Build a remote command string from separate arguments.
+/// Each argument is shell-escaped to prevent injection attacks.
 pub fn buildRemoteCommand(
     alloc: Allocator,
     args: []const []const u8,
@@ -399,9 +411,44 @@ pub fn buildRemoteCommand(
     defer cmd.deinit(alloc);
     for (args, 0..) |arg, i| {
         if (i > 0) try cmd.append(alloc, ' ');
-        try cmd.appendSlice(alloc, arg);
+        const escaped = try shellEscape(alloc, arg);
+        defer alloc.free(escaped);
+        try cmd.appendSlice(alloc, escaped);
     }
     return try cmd.toOwnedSlice(alloc);
+}
+
+/// Shell-escape a string for safe use in SSH commands.
+/// Wraps the string in single quotes, escaping any embedded single quotes
+/// using the '\'' technique (end quote, literal quote, restart quote).
+fn shellEscape(alloc: Allocator, s: []const u8) ![]u8 {
+    // Count single quotes to determine output size
+    var sq_count: usize = 0;
+    for (s) |ch| {
+        if (ch == '\'') sq_count += 1;
+    }
+
+    // Output: ' + content + '
+    // Each embedded ' becomes '\'' (4 chars instead of 1)
+    const out_len = 2 + s.len + sq_count * 3;
+    var out = try alloc.alloc(u8, out_len);
+    var i: usize = 0;
+    out[i] = '\'';
+    i += 1;
+    for (s) |ch| {
+        if (ch == '\'') {
+            out[i] = '\'';
+            out[i + 1] = '\\';
+            out[i + 2] = '\'';
+            out[i + 3] = '\'';
+            i += 4;
+        } else {
+            out[i] = ch;
+            i += 1;
+        }
+    }
+    out[i] = '\'';
+    return out[0 .. i + 1];
 }
 
 /// Open a multiplexed channel to the remote helper's stdio-attach mode.
@@ -429,6 +476,7 @@ fn uploadHelper(
     alloc: Allocator,
     sess: *ssh.SshSession,
     helper_path: []const u8,
+    remote_home: []const u8,
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
 ) !void {
@@ -438,11 +486,11 @@ fn uploadHelper(
     const exe_path = try std.fs.selfExePathAlloc(alloc);
     defer alloc.free(exe_path);
 
-    const install_dir = try shared.remoteInstallDir(alloc);
+    const install_dir = try shared.remoteInstallDir(alloc, remote_home);
     defer alloc.free(install_dir);
 
-    // Create the install directory
-    const mkdir_cmd = try std.fmt.allocPrint(alloc, "mkdir -p '{s}'", .{install_dir});
+    // Create the install directory and set restrictive permissions
+    const mkdir_cmd = try std.fmt.allocPrint(alloc, "mkdir -p '{s}' && chmod 700 '{s}'", .{ install_dir, install_dir });
     defer alloc.free(mkdir_cmd);
     const mkdir_result = try sess.exec(mkdir_cmd);
     defer alloc.free(mkdir_result.stdout);
@@ -523,6 +571,34 @@ fn pushConnectionState(mailbox: ?*Mailbox, state: protocol.ConnectionState) void
     if (mailbox) |m| {
         _ = m.push(.{ .connection_state = state }, .{ .forever = {} });
     }
+}
+
+/// Resolve the remote user's HOME directory by executing a command on the
+/// remote host. This is needed to construct secure per-user install paths
+/// for SCP uploads (shell variable expansion doesn't work in SCP paths).
+fn resolveRemoteHome(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
+    const result = try sess.exec("printf '%s' \"$HOME\"");
+    defer alloc.free(result.stderr);
+
+    if (result.exit_code != 0 or result.stdout.len == 0) {
+        alloc.free(result.stdout);
+        return error.RemoteCommandFailed;
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len == 0) {
+        alloc.free(result.stdout);
+        return error.RemoteCommandFailed;
+    }
+
+    // If the trimmed result is the same slice as stdout, return it directly.
+    // Otherwise, dupe the trimmed portion and free the original.
+    if (trimmed.ptr == result.stdout.ptr and trimmed.len == result.stdout.len) {
+        return result.stdout;
+    }
+    const home = try alloc.dupe(u8, trimmed);
+    alloc.free(result.stdout);
+    return home;
 }
 
 fn platformMatches(local_os: []const u8, remote_os: []const u8) bool {

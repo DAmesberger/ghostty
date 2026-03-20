@@ -218,6 +218,16 @@ pub fn enqueueWrite(entry: *Entry, kind: session.protocol.Kind, target_id: u16, 
     const owned_data = alloc.dupe(u8, data) catch return;
 
     entry.write_queue_mu.lock();
+
+    // Cap write queue to prevent unbounded memory growth (DoS protection)
+    const max_queue_size = 4096;
+    if (entry.write_queue.items.len >= max_queue_size) {
+        entry.write_queue_mu.unlock();
+        alloc.free(owned_data);
+        log.warn("write queue full ({d} entries), dropping frame", .{max_queue_size});
+        return;
+    }
+
     entry.write_queue.append(alloc, .{
         .kind = kind,
         .target_id = target_id,
@@ -263,8 +273,9 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
         }
         entry.write_queue.deinit(std.heap.page_allocator);
 
-        // Free password if one was provided
+        // Zero and free password if one was provided
         if (entry.auth_state.password) |pw| {
+            @memset(@constCast(pw), 0);
             std.heap.page_allocator.free(pw);
             entry.auth_state.password = null;
         }
@@ -687,6 +698,7 @@ fn findSurface(entry: *const Entry, target_id: u16) ?SurfaceSlot {
 // -- Protocol helpers --
 
 fn sendFrame(channel: *ssh.Channel, kind: session.protocol.Kind, target: u16, data: []const u8) !void {
+    if (data.len > session.protocol.max_payload) return error.PayloadTooLarge;
     var header: [session.protocol.header_size]u8 = undefined;
     header[0] = @intFromEnum(kind);
     header[1] = 0; // reserved

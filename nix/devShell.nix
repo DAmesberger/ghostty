@@ -58,7 +58,6 @@
   simdutf,
   zlib,
   libssh2,
-  openssl,
   alejandra,
   jq,
   minisign,
@@ -172,7 +171,6 @@ in
         simdutf
         zlib
         libssh2
-        openssl
 
         glslang
         spirv-cross

@@ -40,17 +40,23 @@ pub fn socketPath(alloc: Allocator) ![]const u8 {
     return try std.fs.path.join(alloc, &.{ dir, "daemon.sock" });
 }
 
-/// Fixed remote install paths under /tmp. This avoids depending on any
-/// particular remote user's home directory or XDG configuration.
-pub const remote_dir = "/tmp/ghostty-remote-session/bin";
-pub const remote_path = remote_dir ++ "/" ++ helper_binary_name;
+/// Relative suffix for the remote helper install directory under the
+/// user's home. Uses the XDG state convention (~/.local/state/) to
+/// avoid the world-writable /tmp (race conditions, binary replacement).
+pub const remote_base_suffix = ".local/state/ghostty/bin";
 
-pub fn remoteInstallDir(alloc: Allocator) ![]const u8 {
-    return try alloc.dupe(u8, remote_dir);
+/// Build the remote install directory path. The returned string
+/// contains "$HOME/" which must be expanded by a shell on the remote
+/// host. For SCP uploads, callers should resolve $HOME first via an
+/// SSH exec of `printf '%s' "$HOME"`.
+pub fn remoteInstallDir(alloc: Allocator, remote_home: []const u8) ![]const u8 {
+    return try std.fs.path.join(alloc, &.{ remote_home, remote_base_suffix });
 }
 
-pub fn remoteInstallPath(alloc: Allocator) ![]const u8 {
-    return try alloc.dupe(u8, remote_path);
+pub fn remoteInstallPath(alloc: Allocator, remote_home: []const u8) ![]const u8 {
+    const dir = try remoteInstallDir(alloc, remote_home);
+    defer alloc.free(dir);
+    return try std.fs.path.join(alloc, &.{ dir, helper_binary_name });
 }
 
 pub fn sanitizeLabelAlloc(alloc: Allocator, raw: []const u8) ![]u8 {

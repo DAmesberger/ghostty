@@ -19,12 +19,22 @@ pub fn build(b: *std.Build) !void {
         try apple_sdk.addPaths(b, lib);
     }
 
-    // Link system OpenSSL (libcrypto + libssl)
-    lib.linkSystemLibrary("libcrypto");
-    lib.linkSystemLibrary("libssl");
+    // Link vendored aws-lc (libcrypto) — reports as OpenSSL 1.1.1g,
+    // so the LIBSSH2_OPENSSL backend is the correct choice.
+    if (b.lazyDependency("aws_lc", .{
+        .target = target,
+        .optimize = optimize,
+    })) |awslc_dep| {
+        lib.linkLibrary(awslc_dep.artifact("crypto"));
+    }
 
-    // Link zlib for SSH compression (zlib@openssh.com)
-    lib.linkSystemLibrary("zlib");
+    // Link vendored zlib for SSH compression (zlib@openssh.com)
+    if (b.lazyDependency("zlib", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zlib_dep| {
+        lib.linkLibrary(zlib_dep.artifact("z"));
+    }
 
     // Add our generated config header
     lib.addIncludePath(b.path(""));

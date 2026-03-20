@@ -1,0 +1,15 @@
+.{
+    .name = .aws_lc,
+    .version = "1.71.0",
+    .fingerprint = 0x3a01333588d99831,
+    .paths = .{""},
+    .dependencies = .{
+        .aws_lc = .{
+            .url = "https://github.com/aws/aws-lc/archive/refs/tags/v1.71.0.tar.gz",
+            .hash = "N-V-__8AADRb8REcnm7BIQ9Do4CWS3TS75y9kIm0mjHX9LG_",
+            .lazy = true,
+        },
+
+        .apple_sdk = .{ .path = "../apple-sdk" },
+    },
+}

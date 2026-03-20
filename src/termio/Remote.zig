@@ -164,7 +164,12 @@ pub fn threadEnter(
             if (state == .failed) return error.SshConnectionFailed;
             std.Thread.sleep(1_000_000); // 1ms
         }
-        if (entry.channel == null) return error.SshConnectionFailed;
+        // Hold mutex when verifying channel after state transition
+        // to prevent race with reconnect nulling channel
+        self.connection_manager.mutex.lock();
+        const has_channel = entry.channel != null;
+        self.connection_manager.mutex.unlock();
+        if (!has_channel) return error.SshConnectionFailed;
     }
 
     // Allocate a target ID for this surface
@@ -258,8 +263,9 @@ fn setupConnection(
             return err;
         };
 
-        // Free the previous password after use (allocated by GTK thread via page_allocator)
+        // Zero and free the previous password after use (allocated by GTK thread via page_allocator)
         if (entry.auth_state.password) |pw| {
+            @memset(@constCast(pw), 0);
             std.heap.page_allocator.free(pw);
             entry.auth_state.password = null;
         }

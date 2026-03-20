@@ -173,6 +173,16 @@ pub const RemoteSession = struct {
                 },
                 .resize => {
                     const parsed = session.protocol.Resize.parse(payload) catch break;
+                    // Validate resize values — reject unreasonable sizes
+                    if (parsed.rows == 0 or parsed.cols == 0 or
+                        parsed.rows > 10000 or parsed.cols > 10000 or
+                        parsed.width_px > 100000 or parsed.height_px > 100000)
+                    {
+                        log.warn("invalid resize values: {}x{} ({}x{} px)", .{
+                            parsed.cols, parsed.rows, parsed.width_px, parsed.height_px,
+                        });
+                        continue; // Skip invalid resize, don't break connection
+                    }
                     self.pty.setSize(.{
                         .ws_row = parsed.rows,
                         .ws_col = parsed.cols,
@@ -181,6 +191,11 @@ pub const RemoteSession = struct {
                     }) catch {};
                 },
                 .layout_update => {
+                    // Validate layout blob size
+                    if (payload.len > session.protocol.max_payload or payload.len > 64 * 1024) {
+                        log.warn("layout_update too large: {d} bytes", .{payload.len});
+                        continue;
+                    }
                     // Store layout blob in the owning group (opaque, for reconnect)
                     if (self.group) |group| {
                         group.updateLayout(self.alloc, payload);
