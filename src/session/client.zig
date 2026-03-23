@@ -922,7 +922,7 @@ fn readPassword(alloc: Allocator) ![]u8 {
     const has_termios = c.tcgetattr(posix.STDIN_FILENO, &old_termios) == 0;
     if (has_termios) {
         var new_termios = old_termios;
-        new_termios.c_lflag &= @bitCast(~@as(c_uint, c.ECHO));
+        new_termios.c_lflag &= ~@as(@TypeOf(new_termios.c_lflag), c.ECHO);
         _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSANOW, &new_termios);
     }
     defer if (has_termios) {
