@@ -58,6 +58,26 @@ pub const TitleDialog = extern struct {
                 },
             );
         };
+
+        pub const @"initial-color" = struct {
+            pub const name = "initial-color";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                i8,
+                .{
+                    .default = -1,
+                    .minimum = -1,
+                    .maximum = 7,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "color",
+                    ),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -68,7 +88,7 @@ pub const TitleDialog = extern struct {
             const impl = gobject.ext.defineSignal(
                 name,
                 Self,
-                &.{[*:0]const u8},
+                &.{ [*:0]const u8, c_int },
                 void,
             );
         };
@@ -78,9 +98,13 @@ pub const TitleDialog = extern struct {
         /// The initial value of the entry field.
         initial_value: ?[:0]const u8 = null,
 
+        /// Selected color index. -1 = auto, 0-7 = manual color.
+        color: i8 = -1,
+
         // Template bindings
         target: Target,
         entry: *gtk.Entry,
+        color_box: *gtk.Box,
 
         pub var offset: c_int = 0;
     };
@@ -90,7 +114,15 @@ pub const TitleDialog = extern struct {
     }
 
     pub fn new(target: Target, initial_value: ?[:0]const u8) *Self {
-        return gobject.ext.newInstance(Self, .{ .target = target, .@"initial-value" = initial_value });
+        return newWithColor(target, initial_value, -1);
+    }
+
+    pub fn newWithColor(target: Target, initial_value: ?[:0]const u8, initial_color: i8) *Self {
+        return gobject.ext.newInstance(Self, .{
+            .target = target,
+            .@"initial-value" = initial_value,
+            .@"initial-color" = initial_color,
+        });
     }
 
     pub fn present(self: *Self, parent_: *gtk.Widget) void {
@@ -112,6 +144,11 @@ pub const TitleDialog = extern struct {
         const priv = self.private();
         if (priv.initial_value) |v| {
             priv.entry.getBuffer().setText(v, -1);
+        }
+
+        // Set up color buttons for tab target
+        if (priv.target == .tab) {
+            setupColorButtons(self);
         }
 
         // Set the title for the dialog
@@ -138,14 +175,83 @@ pub const TitleDialog = extern struct {
         // If we didn't hit "okay" then we do nothing.
         if (std.mem.orderZ(u8, "ok", response) != .eq) return;
 
-        // Emit our signal with the new title.
-        const title = std.mem.span(self.private().entry.getBuffer().getText());
+        // Emit our signal with the new title and color.
+        const priv = self.private();
+        const title = std.mem.span(priv.entry.getBuffer().getText());
+        const color: c_int = if (priv.target == .tab)
+            @as(c_int, self.readSelectedColor())
+        else
+            @as(c_int, -1);
         signals.set.impl.emit(
             self,
             null,
-            .{title.ptr},
+            .{ title.ptr, color },
             null,
         );
+    }
+
+    const color_labels = [8][:0]const u8{
+        "\xe2\x97\x8f", // ● (blue - styled via CSS)
+        "\xe2\x97\x8f", // ● (red)
+        "\xe2\x97\x8f", // ● (yellow)
+        "\xe2\x97\x8f", // ● (green)
+        "\xe2\x97\x8f", // ● (purple)
+        "\xe2\x97\x8f", // ● (orange)
+        "\xe2\x97\x8f", // ● (brown)
+        "\xe2\x97\x8f", // ● (gray)
+    };
+
+    const color_css_classes = [8][:0]const u8{
+        "color-blue",
+        "color-red",
+        "color-yellow",
+        "color-green",
+        "color-purple",
+        "color-orange",
+        "color-brown",
+        "color-gray",
+    };
+
+    fn setupColorButtons(self: *Self) void {
+        const priv = self.private();
+        const box = priv.color_box;
+
+        // "None" button (no color circle)
+        const auto_btn = gtk.ToggleButton.new();
+        auto_btn.as(gtk.Button).setLabel("None");
+        auto_btn.as(gtk.Widget).addCssClass("flat");
+        if (priv.color < 0) auto_btn.setActive(1);
+        box.append(auto_btn.as(gtk.Widget));
+
+        // Color buttons grouped with auto
+        for (0..8) |i| {
+            const btn = gtk.ToggleButton.new();
+            btn.as(gtk.Button).setLabel(color_labels[i]);
+            btn.as(gtk.Widget).addCssClass("flat");
+            btn.as(gtk.Widget).addCssClass("circular");
+            btn.as(gtk.Widget).addCssClass(color_css_classes[i]);
+            btn.setGroup(auto_btn);
+            if (priv.color >= 0 and @as(u8, @intCast(priv.color)) == i) {
+                btn.setActive(1);
+            }
+            box.append(btn.as(gtk.Widget));
+        }
+    }
+
+    /// Read the active color button from the color_box.
+    /// Returns -1 for auto, 0-7 for a color index.
+    fn readSelectedColor(self: *Self) i8 {
+        const box = self.private().color_box;
+        var child = box.as(gtk.Widget).getFirstChild();
+        var idx: i8 = -1; // first button = auto = -1
+        while (child) |c| {
+            if (gobject.ext.cast(gtk.ToggleButton, c)) |toggle| {
+                if (toggle.getActive() != 0) return idx;
+                idx += 1;
+            }
+            child = c.getNextSibling();
+        }
+        return -1;
     }
 
     fn dispose(self: *Self) callconv(.c) void {
@@ -199,10 +305,12 @@ pub const TitleDialog = extern struct {
 
             // Bindings
             class.bindTemplateChildPrivate("entry", .{});
+            class.bindTemplateChildPrivate("color_box", .{});
 
             // Properties
             gobject.ext.registerProperties(class, &.{
                 properties.@"initial-value".impl,
+                properties.@"initial-color".impl,
                 properties.target.impl,
             });
 

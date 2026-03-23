@@ -169,15 +169,19 @@ pub const uuid_size = 16;
 ///   [16] group_id  (zero = auto-generate)
 ///   [16] surface_id (zero = auto-generate or first-alive)
 ///   [8]  resize
+///   [4]  max_scrollback (u32 LE, 0 = use daemon default)
 ///   [N]  label (remaining bytes, UTF-8, may be empty)
 pub const Open = struct {
     open_type: OpenType,
     group_id: Uuid = zero_uuid,
     surface_id: Uuid = zero_uuid,
     resize: Resize,
+    max_scrollback: u32 = 0,
     label: []const u8 = "",
 
-    pub const min_payload_size = 1 + uuid_size * 2 + 8;
+    /// Old min size (without max_scrollback) for backward compat parsing.
+    const legacy_min_payload_size = 1 + uuid_size * 2 + 8;
+    pub const min_payload_size = legacy_min_payload_size + 4;
 
     pub fn encode(self: Open, alloc: Allocator) ![]u8 {
         const total = min_payload_size + self.label.len;
@@ -187,18 +191,26 @@ pub const Open = struct {
         @memcpy(buf[1 + uuid_size .. 1 + uuid_size * 2], &self.surface_id);
         const resize_bytes = self.resize.bytes();
         @memcpy(buf[1 + uuid_size * 2 .. 1 + uuid_size * 2 + 8], &resize_bytes);
+        std.mem.writeInt(u32, buf[legacy_min_payload_size..][0..4], self.max_scrollback, .little);
         @memcpy(buf[min_payload_size..], self.label);
         return buf;
     }
 
     pub fn parse(payload: []const u8) !Open {
-        if (payload.len < min_payload_size) return error.InvalidOpenPayload;
+        if (payload.len < legacy_min_payload_size) return error.InvalidOpenPayload;
         return .{
             .open_type = std.meta.intToEnum(OpenType, payload[0]) catch return error.InvalidOpenPayload,
             .group_id = payload[1..][0..uuid_size].*,
             .surface_id = payload[1 + uuid_size ..][0..uuid_size].*,
             .resize = try Resize.parse(payload[1 + uuid_size * 2 ..][0..8]),
-            .label = payload[min_payload_size..],
+            .max_scrollback = if (payload.len >= min_payload_size)
+                std.mem.readInt(u32, payload[legacy_min_payload_size..][0..4], .little)
+            else
+                0,
+            .label = if (payload.len >= min_payload_size)
+                payload[min_payload_size..]
+            else
+                payload[legacy_min_payload_size..],
         };
     }
 };
@@ -723,6 +735,7 @@ test "open encode/parse" {
         .group_id = gid,
         .surface_id = sid,
         .resize = .{ .rows = 24, .cols = 80, .width_px = 800, .height_px = 600 },
+        .max_scrollback = 10_000_000,
         .label = "test-session",
     };
     const encoded = try o.encode(testing.allocator);
@@ -734,7 +747,27 @@ test "open encode/parse" {
     try testing.expectEqual(@as(u16, 80), parsed.resize.cols);
     try testing.expectEqualSlices(u8, &sid, &parsed.surface_id);
     try testing.expectEqualSlices(u8, &gid, &parsed.group_id);
+    try testing.expectEqual(@as(u32, 10_000_000), parsed.max_scrollback);
     try testing.expectEqualStrings("test-session", parsed.label);
+}
+
+test "open backward compat (short payload without max_scrollback)" {
+    const testing = std.testing;
+    const shared = @import("shared.zig");
+    const gid = shared.generateUuid();
+    // Simulate an old-format payload with a short label (< 4 bytes so total < min_payload_size)
+    var buf: [Open.legacy_min_payload_size + 2]u8 = undefined;
+    buf[0] = @intFromEnum(OpenType.session_new);
+    @memcpy(buf[1..][0..uuid_size], &gid);
+    @memcpy(buf[1 + uuid_size ..][0..uuid_size], &shared.zero_uuid);
+    const resize_bytes = (Resize{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 }).bytes();
+    @memcpy(buf[1 + uuid_size * 2 ..][0..8], &resize_bytes);
+    @memcpy(buf[Open.legacy_min_payload_size..][0..2], "ab");
+
+    const parsed = try Open.parse(buf[0..Open.legacy_min_payload_size + 2]);
+    try testing.expectEqual(OpenType.session_new, parsed.open_type);
+    try testing.expectEqual(@as(u32, 0), parsed.max_scrollback); // default when missing
+    try testing.expectEqualStrings("ab", parsed.label); // label at legacy offset
 }
 
 test "open attach mode" {

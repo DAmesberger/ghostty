@@ -48,6 +48,10 @@ pub fn getTitle(self: *Self) ?[:0]const u8 {
     return self.surface.getTitle();
 }
 
+pub fn setScrollbackLoading(self: *Self, loading: bool) void {
+    self.surface.setScrollbackLoading(loading);
+}
+
 pub fn getContentScale(self: *const Self) !apprt.ContentScale {
     return self.surface.getContentScale();
 }

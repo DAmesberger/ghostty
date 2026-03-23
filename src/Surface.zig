@@ -643,6 +643,7 @@ pub fn init(
                 var io_remote = try termio.Remote.init(alloc, .{
                     .ssh_ctx = ssh_ctx,
                     .connection_manager = &app.ssh_connection_manager,
+                    .scrollback_limit = @intCast(@min(config.@"scrollback-limit", std.math.maxInt(u32))),
                 });
                 errdefer io_remote.deinit();
                 break :backend .{ .remote = io_remote };
@@ -1295,6 +1296,10 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .scrollback_progress => |sp| {
             self.scrollback_progress_received = sp.received;
             self.scrollback_progress_total = sp.total;
+            const loading = sp.total > 0 and sp.received < sp.total;
+            if (@hasDecl(apprt.runtime.Surface, "setScrollbackLoading")) {
+                self.rt_surface.setScrollbackLoading(loading);
+            }
         },
     }
 }

@@ -73,10 +73,11 @@ pub const SshSessionPicker = extern struct {
     pub fn new() ?*Self {
         const self = gobject.ext.newInstance(Self, .{});
 
-        // Sink ourselves so that we aren't floating anymore.
+        // Sink the floating ref so we own a single strong ref.
+        // dialogClosed will unref this when the dialog is dismissed.
         _ = self.refSink();
 
-        return self.ref();
+        return self;
     }
 
     //---------------------------------------------------------------

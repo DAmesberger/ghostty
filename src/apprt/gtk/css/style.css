@@ -205,3 +205,15 @@ label.resize-overlay {
   margin: 0;
   padding: 0;
 }
+
+/*
+ * Color picker buttons in the tab rename dialog
+ */
+button.color-blue { color: #4285f4; }
+button.color-red { color: #ea4335; }
+button.color-yellow { color: #fbbc04; }
+button.color-green { color: #34a853; }
+button.color-purple { color: #a142f4; }
+button.color-orange { color: #fa7b17; }
+button.color-brown { color: #a52714; }
+button.color-gray { color: #9e9e9e; }

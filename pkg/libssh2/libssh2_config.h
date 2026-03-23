@@ -16,7 +16,12 @@
 #define HAVE_GETTIMEOFDAY 1
 #define HAVE_STRTOLL 1
 #define HAVE_SNPRINTF 1
+/* Secure zero: explicit_bzero on Linux/glibc, memset_s on macOS */
+#if defined(__APPLE__)
+#define HAVE_MEMSET_S 1
+#else
 #define HAVE_EXPLICIT_BZERO 1
+#endif
 #define HAVE_POLL 1
 #define HAVE_SELECT 1
 

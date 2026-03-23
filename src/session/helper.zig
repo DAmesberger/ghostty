@@ -397,7 +397,7 @@ const Daemon = struct {
                 else
                     session.shared.generateUuid();
 
-                const sess = try self.createSurface(group, surface_id, open_data.resize);
+                const sess = try self.createSurface(group, surface_id, open_data.resize, open_data.max_scrollback);
 
                 // Send opened response with no layout (new session)
                 const opened = session.protocol.Opened{
@@ -557,7 +557,7 @@ const Daemon = struct {
                         open_data.surface_id
                     else
                         session.shared.generateUuid();
-                    const new_sess = self.createSurface(group, surface_id, open_data.resize) catch {
+                    const new_sess = self.createSurface(group, surface_id, open_data.resize, open_data.max_scrollback) catch {
                         sendFrameFd(fd, .eof, target, "") catch {};
                         return;
                     };
@@ -613,7 +613,7 @@ const Daemon = struct {
 
         switch (open_data.open_type) {
             .surface_new => {
-                const sess = try self.createSurface(group, open_data.surface_id, open_data.resize);
+                const sess = try self.createSurface(group, open_data.surface_id, open_data.resize, open_data.max_scrollback);
                 const opened = session.protocol.Opened{
                     .group_id = group.id,
                     .surface_id = open_data.surface_id,
@@ -835,6 +835,7 @@ const Daemon = struct {
         group: *SessionGroup,
         surface_id: Uuid,
         resize: session.protocol.Resize,
+        max_scrollback: u32,
     ) !*RemoteSession {
         const label = try self.alloc.dupe(u8, group.label);
         errdefer self.alloc.free(label);
@@ -880,6 +881,7 @@ const Daemon = struct {
         var t = try terminal.Terminal.init(self.alloc, .{
             .cols = resize.cols,
             .rows = resize.rows,
+            .max_scrollback = if (max_scrollback > 0) max_scrollback else 10_000_000,
         });
         errdefer t.deinit(self.alloc);
 

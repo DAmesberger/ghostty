@@ -50,12 +50,12 @@ restoring: bool = false,
 /// (which would kill the daemon-side surface we want to keep alive).
 detaching: bool = false,
 
+/// Client-side scrollback limit in bytes, sent to the daemon via the Open frame.
+scrollback_limit: u32 = 10_000_000,
+
 /// Initial grid size, stored from initTerminal
 grid_size: renderer.GridSize = .{ .columns = 80, .rows = 24 },
 screen_size: renderer.ScreenSize = .{ .width = 0, .height = 0 },
-
-// TODO: Scrollback — send buffer size with layout, allocate on client,
-// fill visible first then history in background for search support.
 
 pub fn init(
     alloc: Allocator,
@@ -76,6 +76,7 @@ pub fn init(
         .ssh_ctx = ssh_ctx,
         .restoring = restoring,
         .connection_manager = cfg.connection_manager,
+        .scrollback_limit = cfg.scrollback_limit,
     };
 }
 
@@ -189,6 +190,7 @@ pub fn threadEnter(
                 .resize = open_resize,
                 .group_id = self.ssh_ctx.group_id,
                 .surface_id = self.ssh_ctx.surface_id,
+                .max_scrollback = self.scrollback_limit,
             }).encode(alloc) catch return error.OutOfMemory;
             defer alloc.free(open_payload);
             SshConnectionManager.enqueueWrite(entry, .open, self.target_id, open_payload);
@@ -228,6 +230,7 @@ pub fn threadEnter(
                 // the first alive surface rather than looking up a specific one.
                 .surface_id = if (open_type == .session_attach) session.shared.zero_uuid else self.ssh_ctx.surface_id,
                 .group_id = self.ssh_ctx.group_id,
+                .max_scrollback = self.scrollback_limit,
                 .label = if (open_type == .session_attach) (self.ssh_ctx.session_id orelse label) else label,
             }).encode(alloc) catch return error.OutOfMemory;
             defer alloc.free(open_payload);
@@ -346,6 +349,7 @@ fn setupConnection(
     entry.max_reconnect_attempts = self.ssh_ctx.reconnect_attempts;
     entry.reconnect_backoff = self.ssh_ctx.reconnect_backoff;
     entry.reconnect_interval_ms = self.ssh_ctx.reconnect_interval_ms;
+    entry.scrollback_limit = self.scrollback_limit;
 
     // Create pipes for SSH thread communication
     entry.quit_pipe = try posix.pipe2(.{ .CLOEXEC = true });
@@ -492,4 +496,5 @@ pub const ThreadData = struct {
 pub const Config = struct {
     ssh_ctx: SshConnectionContext,
     connection_manager: *SshConnectionManager,
+    scrollback_limit: u32 = 10_000_000,
 };

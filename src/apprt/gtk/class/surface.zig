@@ -81,6 +81,19 @@ pub const Surface = extern struct {
             );
         };
 
+        pub const @"scrollback-loading" = struct {
+            pub const name = "scrollback-loading";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = C.privateShallowFieldAccessor("scrollback_loading"),
+                },
+            );
+        };
+
         pub const config = struct {
             pub const name = "config";
             const impl = gobject.ext.defineProperty(
@@ -669,6 +682,9 @@ pub const Surface = extern struct {
         // true) under various scenarios, but can also manually be set to
         // false by a parent widget.
         bell_ringing: bool = false,
+
+        // True while scrollback history is being loaded from a remote session.
+        scrollback_loading: bool = false,
 
         /// True if this surface is in an error state. This is currently
         /// a simple boolean with no additional information on WHAT the
@@ -2522,6 +2538,13 @@ pub const Surface = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"bell-ringing".impl.param_spec);
     }
 
+    pub fn setScrollbackLoading(self: *Self, loading: bool) void {
+        const priv = self.private();
+        if (priv.scrollback_loading == loading) return;
+        priv.scrollback_loading = loading;
+        self.as(gobject.Object).notifyByPspec(properties.@"scrollback-loading".impl.param_spec);
+    }
+
     pub fn setError(self: *Self, v: bool) void {
         const priv = self.private();
         priv.@"error" = v;
@@ -3856,6 +3879,7 @@ pub const Surface = extern struct {
     fn titleDialogSet(
         _: *TitleDialog,
         title_ptr: [*:0]const u8,
+        _: c_int,
         self: *Self,
     ) callconv(.c) void {
         const title = std.mem.span(title_ptr);
@@ -3990,6 +4014,7 @@ pub const Surface = extern struct {
             // Properties
             gobject.ext.registerProperties(class, &.{
                 properties.@"bell-ringing".impl,
+                properties.@"scrollback-loading".impl,
                 properties.config.impl,
                 properties.@"child-exited".impl,
                 properties.@"default-size".impl,

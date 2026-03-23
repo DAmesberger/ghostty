@@ -34,6 +34,9 @@ pub const SurfaceSlot = struct {
     surface_id: Uuid = session.shared.zero_uuid,
     /// Current tab/session label, synced from title changes. Used on reconnect.
     label: ?[]const u8 = null,
+    /// True after prependBlankPages has been called for this surface.
+    /// Prevents duplicate prepends on reconnect.
+    history_prepended: bool = false,
 };
 
 /// A group of surfaces sharing the same remote session (group_id).
@@ -115,6 +118,9 @@ pub const Entry = struct {
     /// Stale detection is only active when this is true, ensuring backward
     /// compatibility with older remote ghostty versions that don't support keepalive.
     keepalive_active: bool = false,
+
+    // Client scrollback limit (bytes), propagated to daemon via Open frame.
+    scrollback_limit: u32 = 10_000_000,
 
     // Reconnect configuration (set from config during setupConnection)
     max_reconnect_attempts: u32 = 5,
@@ -826,6 +832,12 @@ fn reopenSurfaces(entry: *Entry) void {
     while (it.next()) |kv| {
         const sess = kv.value_ptr.*;
         if (sess.surfaces.items.len == 0) continue;
+
+        // Reset history_prepended for all surfaces so reconnect can prepend fresh
+        for (sess.surfaces.items) |*surf| {
+            surf.history_prepended = false;
+        }
+
         const s = sess.surfaces.items[0];
 
         const open_payload = (session.protocol.Open{
@@ -833,6 +845,7 @@ fn reopenSurfaces(entry: *Entry) void {
             .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
             .surface_id = s.surface_id,
             .group_id = sess.group_id,
+            .max_scrollback = entry.scrollback_limit,
             .label = s.label orelse "reconnected",
         }).encode(entry.alloc) catch continue;
         defer entry.alloc.free(open_payload);
@@ -959,14 +972,19 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                 },
             }, .{ .forever = {} });
 
-            // Pre-allocate blank history pages for scrollback restore
+            // Pre-allocate blank history pages for scrollback restore.
+            // Guard with history_prepended to prevent duplicate prepends on reconnect.
             if (parsed.history_rows > 0) {
-                s.io.renderer_state.mutex.lock();
-                defer s.io.renderer_state.mutex.unlock();
-                const t = s.io.renderer_state.terminal;
-                t.screens.active.pages.prependBlankPages(parsed.history_rows) catch |err| {
-                    log.warn("failed to prepend history pages: {}", .{err});
-                };
+                const already = findSurfaceSlotPtr(entry, s.target_id);
+                if (already == null or !already.?.history_prepended) {
+                    s.io.renderer_state.mutex.lock();
+                    defer s.io.renderer_state.mutex.unlock();
+                    const t = s.io.renderer_state.terminal;
+                    t.screens.active.pages.prependBlankPages(parsed.history_rows) catch |err| {
+                        log.warn("failed to prepend history pages: {}", .{err});
+                    };
+                    if (already) |slot| slot.history_prepended = true;
+                }
             }
 
             // If layout blob is included, send it to surface for tree recreation.
@@ -1059,6 +1077,18 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
 
 /// Find a surface by target_id across all sessions. Returns a copy.
 /// Caller must hold surfaces_mutex.
+/// Find a surface slot by target ID, returning a mutable pointer.
+/// Caller must hold surfaces_mutex.
+fn findSurfaceSlotPtr(entry: *Entry, target_id: u16) ?*SurfaceSlot {
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.*.surfaces.items) |*s| {
+            if (s.target_id == target_id) return s;
+        }
+    }
+    return null;
+}
+
 fn findSurfaceAcrossSessions(entry: *const Entry, target_id: u16) ?SurfaceSlot {
     var it = entry.sessions.iterator();
     while (it.next()) |kv| {

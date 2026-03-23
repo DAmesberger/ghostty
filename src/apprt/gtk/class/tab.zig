@@ -140,6 +140,21 @@ pub const Tab = extern struct {
                 },
             );
         };
+
+        pub const @"tab-color" = struct {
+            pub const name = "tab-color";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                i8,
+                .{
+                    .default = -1,
+                    .minimum = -1,
+                    .maximum = 7,
+                    .accessor = C.privateShallowFieldAccessor("tab_color"),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -168,6 +183,9 @@ pub const Tab = extern struct {
 
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
+
+        /// Manual tab color override. -1 = auto (use session hash), 0-7 = manual color index.
+        tab_color: i8 = -1,
 
         // Template bindings
         split_tree: *SplitTree,
@@ -232,6 +250,10 @@ pub const Tab = extern struct {
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
 
+        // GObject zero-initializes private data, so tab_color starts as 0.
+        // Explicitly set to -1 (no color) before any bindings fire.
+        self.private().tab_color = -1;
+
         // Init our actions
         self.initActionMap();
     }
@@ -271,10 +293,19 @@ pub const Tab = extern struct {
     fn titleDialogSet(
         _: *TitleDialog,
         title_ptr: [*:0]const u8,
+        color: c_int,
         self: *Self,
     ) callconv(.c) void {
         const title = std.mem.span(title_ptr);
         self.setTitleOverride(if (title.len == 0) null else title);
+
+        // Update tab color
+        const priv = self.private();
+        const new_color: i8 = if (color >= -1 and color <= 7) @intCast(color) else -1;
+        if (priv.tab_color != new_color) {
+            priv.tab_color = new_color;
+            self.as(gobject.Object).notifyByPspec(properties.@"tab-color".impl.param_spec);
+        }
 
         // Tab titles are now persisted in the window-level layout blob,
         // so no separate rename needed here. The next layout send
@@ -282,7 +313,7 @@ pub const Tab = extern struct {
     }
     pub fn promptTabTitle(self: *Self) void {
         const priv = self.private();
-        const dialog = TitleDialog.new(.tab, priv.title_override orelse priv.title);
+        const dialog = TitleDialog.newWithColor(.tab, priv.title_override orelse priv.title, priv.tab_color);
         _ = TitleDialog.signals.set.connect(
             dialog,
             *Self,
@@ -331,6 +362,32 @@ pub const Tab = extern struct {
     fn getTabPage(self: *Self) ?*adw.TabPage {
         const tab_view = self.getTabView() orelse return null;
         return tab_view.getPage(self.as(gtk.Widget));
+    }
+
+    /// SVG templates for colored circle indicator icons.
+    const indicator_svgs = [8][]const u8{
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#4285f4\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#ea4335\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#fbbc04\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#34a853\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#a142f4\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#fa7b17\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#a52714\"/></svg>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\" fill=\"#9e9e9e\"/></svg>",
+    };
+
+    /// Update the adw.TabPage indicator icon based on the tab color.
+    fn updateTabIndicator(self: *Self, color: i8) void {
+        const page = self.getTabPage() orelse return;
+        if (color >= 0 and color <= 7) {
+            const svg = indicator_svgs[@intCast(@as(u8, @intCast(color)))];
+            const bytes = glib.ext.Bytes.newFromSlice(svg);
+            defer bytes.unref();
+            const icon = gio.BytesIcon.new(bytes);
+            page.setIndicatorIcon(icon.as(gio.Icon));
+        } else {
+            page.setIndicatorIcon(null);
+        }
     }
 
     //---------------------------------------------------------------
@@ -497,10 +554,13 @@ pub const Tab = extern struct {
         tab_override_: ?[*:0]const u8,
         zoomed_: c_int,
         bell_ringing_: c_int,
+        scrollback_loading_: c_int,
+        tab_color_: i8,
         _: *gobject.ParamSpec,
     ) callconv(.c) ?[*:0]const u8 {
         const zoomed = zoomed_ != 0;
         const bell_ringing = bell_ringing_ != 0;
+        const scrollback_loading = scrollback_loading_ != 0;
 
         // Our plain title is the manually tab overridden title if it exists,
         // otherwise the overridden title if it exists, otherwise
@@ -535,6 +595,24 @@ pub const Tab = extern struct {
 
         // If the connection is degraded, prefix with state indicator.
         const remote_info = self.getRemoteInfo();
+
+        // Auto-assign a color for SSH tabs that don't have one yet.
+        // Same group_id → same color; different sessions → different colors.
+        var effective_color = tab_color_;
+        if (tab_color_ < 0) {
+            if (remote_info.group_id) |gid| {
+                var h: u8 = 0;
+                for (gid) |b| h ^= b;
+                effective_color = @intCast(h & 0x7);
+                // Persist so it sticks across title updates
+                const priv = self.private();
+                priv.tab_color = effective_color;
+                self.as(gobject.Object).notifyByPspec(properties.@"tab-color".impl.param_spec);
+            }
+        }
+
+        // Update the tab page indicator icon for colored tabs.
+        self.updateTabIndicator(effective_color);
         if (remote_info.conn_state) |state| {
             switch (state) {
                 .reconnecting => buf.writer.writeAll("[reconnecting] ") catch {},
@@ -544,6 +622,11 @@ pub const Tab = extern struct {
                 .connecting => buf.writer.writeAll("[connecting] ") catch {},
                 else => {},
             }
+        }
+
+        // If scrollback history is loading, show a brief indicator.
+        if (scrollback_loading) {
+            buf.writer.writeAll("[loading history] ") catch {};
         }
 
         // If our bell is ringing, then we prefix the bell icon to the title.
@@ -558,11 +641,15 @@ pub const Tab = extern struct {
 
         buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
 
-        // Append SSH target info for remote surfaces.
-        // Session label is only shown in the window subtitle, not per-tab.
+        // Append SSH target and session label for remote surfaces.
         if (remote_info.ssh_target) |target| {
             buf.writer.writeAll(" \xe2\x80\x94 ") catch {}; // " — " (em dash)
             buf.writer.writeAll(target) catch {};
+            if (remote_info.label) |label| {
+                buf.writer.writeAll(" (") catch {};
+                buf.writer.writeAll(label) catch {};
+                buf.writer.writeAll(")") catch {};
+            }
         }
 
         return glib.ext.dupeZ(u8, buf.written());
@@ -572,6 +659,7 @@ pub const Tab = extern struct {
         ssh_target: ?[]const u8 = null,
         label: ?[]const u8 = null,
         conn_state: ?@import("../../../session.zig").protocol.ConnectionState = null,
+        group_id: ?session.shared.Uuid = null,
     };
 
     /// Get SSH remote info from the active surface, if any.
@@ -583,10 +671,12 @@ pub const Tab = extern struct {
         core.renderer_state.mutex.lock();
         const conn_state = core.renderer_state.connection_state;
         core.renderer_state.mutex.unlock();
+        const gid = ctx.group_id;
         return .{
             .ssh_target = ctx.target,
             .label = ctx.label,
             .conn_state = conn_state,
+            .group_id = if (session.shared.isZeroUuid(gid)) null else gid,
         };
     }
 
@@ -621,6 +711,7 @@ pub const Tab = extern struct {
                 properties.@"surface-tree".impl,
                 properties.title.impl,
                 properties.@"title-override".impl,
+                properties.@"tab-color".impl,
                 properties.tooltip.impl,
             });
 

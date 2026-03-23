@@ -12,7 +12,18 @@ template $GhosttyTitleDialog: Adw.AlertDialog {
   default-response: "ok";
   focus-widget: entry;
 
-  extra-child: Entry entry {
-    activates-default: true;
+  extra-child: Box {
+    orientation: vertical;
+    spacing: 8;
+
+    Entry entry {
+      activates-default: true;
+    }
+
+    Box color_box {
+      orientation: horizontal;
+      halign: center;
+      spacing: 4;
+    }
   };
 }
