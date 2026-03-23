@@ -7,6 +7,7 @@ pub const helper = @import("session/helper.zig");
 pub const ssh = @import("session/ssh.zig");
 pub const ssh_config = @import("session/ssh_config.zig");
 pub const remote_session = @import("session/remote_session.zig");
+pub const page_diff = @import("session/page_diff.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

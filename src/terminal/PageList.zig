@@ -3213,6 +3213,38 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     return next_node;
 }
 
+/// Prepend blank history rows at the top of the PageList.
+/// Used by the SSH remote session client to pre-allocate space for
+/// scrollback data that will be filled in by scrollback_response chunks.
+/// The viewport and active area remain at the bottom, unchanged.
+pub fn prependBlankPages(self: *PageList, total_new_rows: u32) Allocator.Error!void {
+    if (total_new_rows == 0) return;
+
+    const cap = initialCapacity(self.cols);
+    const rows_per_page = cap.rows;
+    var remaining: u32 = total_new_rows;
+
+    while (remaining > 0) {
+        const page_rows: size.CellCountInt = @intCast(@min(remaining, rows_per_page));
+        const node = try self.createPage(cap);
+        node.data.size.rows = page_rows;
+
+        // Prepend to front of list (oldest history at top)
+        self.pages.prepend(node);
+
+        self.total_rows += page_rows;
+        remaining -= page_rows;
+    }
+
+    // Update viewport pin offset if we have one cached, since we
+    // shifted everything down by total_new_rows.
+    if (self.viewport == .pin) {
+        if (self.viewport_pin_row_offset) |*v| {
+            v.* += total_new_rows;
+        }
+    }
+}
+
 /// Possible dimensions to increase capacity for.
 pub const IncreaseCapacity = enum {
     styles,

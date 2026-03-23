@@ -9,7 +9,8 @@ const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
-const session_layout = @import("../../../session.zig").layout;
+const session = @import("../../../session.zig");
+const session_layout = session.layout;
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -209,8 +210,7 @@ pub const SplitTree = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
-            ssh_target: ?[]const u8 = null,
-            ssh_session: ?[]const u8 = null,
+            ssh_ctx: ?session.shared.SshConnectionContext = null,
 
             pub const none: @This() = .{};
         },
@@ -222,8 +222,7 @@ pub const SplitTree = extern struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
-            .ssh_target = overrides.ssh_target,
-            .ssh_session = overrides.ssh_session,
+            .ssh_ctx = overrides.ssh_ctx,
         });
         defer surface.unref();
         _ = surface.refSink();
@@ -330,16 +329,39 @@ pub const SplitTree = extern struct {
     /// Restore a single tab's split layout from a TabInfo.
     /// Creates new surfaces for each leaf with the correct surface_id
     /// so they reattach to the right daemon-side PTYs.
-    /// `origin` is the surface used to inherit SSH connection properties.
-    pub fn restoreFromTabInfo(self: *Self, tab_info: session_layout.TabInfo, origin: *Surface) void {
-        const session = @import("../../../session.zig");
+    /// `origin` is reused for the leaf whose surface_id matches its
+    /// existing remote connection — this prevents the origin from being
+    /// destroyed (which would send close(surface) and kill the PTY).
+    /// `group_id` and `origin_sid` come from the `opened` response,
+    /// bundled through the layout_restore message to avoid racing
+    /// with the SSH thread that updates the Remote backend.
+    pub fn restoreFromTabInfo(
+        self: *Self,
+        tab_info: session_layout.TabInfo,
+        origin: *Surface,
+        group_id: session.shared.Uuid,
+        origin_sid: session.shared.Uuid,
+    ) void {
         const gpa = Application.default().allocator();
 
         if (tab_info.nodes.len == 0) return;
 
-        // Build a Surface.Tree with an arena allocator (same pattern as
-        // SplitTree.init). Each leaf gets a new Surface widget with the
-        // correct surface_id so it reattaches to the right daemon-side PTY.
+        // Get SSH context from origin so restored surfaces use the remote
+        // backend and connect to the same host.
+        const origin_ssh_ctx: ?session.shared.SshConnectionContext = if (origin.core()) |core|
+            (if (core.remoteContext()) |ctx| ctx.* else null)
+        else
+            null;
+
+        // Use the daemon-assigned surface_id from the message (not the
+        // Remote backend, which may not be updated yet due to threading).
+        const origin_surface_id: ?session.shared.Uuid = if (!session.shared.isZeroUuid(origin_sid))
+            origin_sid
+        else if (origin.core()) |core|
+            (if (core.remoteContext()) |ctx| ctx.surface_id else null)
+        else
+            null;
+
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const arena_alloc = arena.allocator();
@@ -347,30 +369,54 @@ pub const SplitTree = extern struct {
         const tree_nodes = arena_alloc.alloc(Surface.Tree.Node, tab_info.nodes.len) catch return;
 
         // Track created surfaces so we can unref them if something fails.
-        // Each surface gets one ref for the tree (viewRef equivalent).
         var created_surfaces: std.ArrayList(*Surface) = .empty;
         created_surfaces.ensureTotalCapacity(gpa, @intCast(tab_info.nodes.len)) catch return;
         defer {
-            // On error only — if we succeed, setTree/clone handles ownership.
             for (created_surfaces.items) |s| s.unref();
             created_surfaces.deinit(gpa);
         }
 
         var first_surface: ?*Surface = null;
+        var origin_used = false;
 
         for (tab_info.nodes, 0..) |node, i| {
             switch (node) {
                 .leaf => |leaf| {
-                    const sid_hex = session.shared.formatUuid(leaf.surface_id);
-                    const surface: *Surface = .new(.{
-                        .ssh_surface_id = &sid_hex,
-                    });
-                    _ = surface.refSink();
+                    // Reuse the origin surface for the leaf that matches
+                    // its surface_id. This prevents the origin from being
+                    // destroyed (which would kill its daemon-side PTY).
+                    const is_origin_leaf = !origin_used and origin_surface_id != null and
+                        std.mem.eql(u8, &leaf.surface_id, &origin_surface_id.?);
 
-                    // Inherit SSH connection properties from origin
-                    if (origin.core()) |core| {
-                        surface.setParent(core, .split);
-                    }
+                    const surface: *Surface = if (is_origin_leaf) blk: {
+                        origin_used = true;
+                        break :blk origin;
+                    } else blk: {
+                        const leaf_ssh_ctx: ?session.shared.SshConnectionContext = if (origin_ssh_ctx) |ctx| .{
+                            .target = ctx.target,
+                            .jump = ctx.jump,
+                            .session_id = ctx.session_id,
+                            .label = ctx.label,
+                            .group_id = group_id,
+                            .surface_id = leaf.surface_id,
+                            .reconnect_attempts = ctx.reconnect_attempts,
+                            .reconnect_backoff = ctx.reconnect_backoff,
+                            .reconnect_interval_ms = ctx.reconnect_interval_ms,
+                        } else null;
+                        const s: *Surface = .new(.{
+                            .ssh_ctx = leaf_ssh_ctx,
+                        });
+                        _ = s.refSink();
+
+                        if (origin.core()) |core| {
+                            s.setParent(core, .split);
+                        }
+
+                        // Track for cleanup
+                        created_surfaces.append(gpa, s) catch return;
+
+                        break :blk s;
+                    };
 
                     // Bind is-split property
                     _ = self.as(gobject.Object).bindProperty(
@@ -384,9 +430,6 @@ pub const SplitTree = extern struct {
                     _ = surface.as(gobject.Object).ref();
 
                     tree_nodes[i] = .{ .leaf = surface };
-
-                    // Track for cleanup; the unref in defer balances refSink.
-                    created_surfaces.append(gpa, surface) catch return;
 
                     if (first_surface == null) first_surface = surface;
                 },
@@ -411,7 +454,19 @@ pub const SplitTree = extern struct {
         };
         defer tree.deinit();
 
-        if (first_surface) |fs| {
+        // Determine which surface to focus: prefer focused_node from
+        // the layout, fall back to the first leaf surface.
+        const focus_surface: ?*Surface = if (tab_info.focused_node) |focus_idx| blk: {
+            if (focus_idx < tree_nodes.len) {
+                switch (tree_nodes[focus_idx]) {
+                    .leaf => |surface| break :blk surface,
+                    .split => {},
+                }
+            }
+            break :blk first_surface;
+        } else first_surface;
+
+        if (focus_surface) |fs| {
             self.private().last_focused.set(fs);
         }
 
@@ -419,6 +474,13 @@ pub const SplitTree = extern struct {
         created_surfaces.clearRetainingCapacity();
 
         self.setTree(&tree);
+
+        // Grab focus on the target surface after the tree is installed,
+        // so GTK's focus machinery picks up the correct widget.
+        if (focus_surface) |fs| {
+            fs.grabFocus();
+        }
+
         log.info("restored layout with {d} nodes from remote daemon", .{tab_info.nodes.len});
     }
 
@@ -721,19 +783,19 @@ pub const SplitTree = extern struct {
             return;
         };
 
-        // If the active surface is remote, inherit its SSH target so splits
+        // If the active surface is remote, inherit its SSH context so splits
         // stay on the same connection instead of opening a local terminal.
         const active = self.getActiveSurface();
-        const ssh_target: ?[]const u8 = if (active) |s| blk: {
+        const ssh_ctx: ?session.shared.SshConnectionContext = if (active) |s| blk: {
             const core = s.core() orelse break :blk null;
-            if (core.io.backend != .remote) break :blk null;
-            break :blk core.io.backend.remote.ssh_target;
+            const ctx = core.remoteContext() orelse break :blk null;
+            break :blk .{ .target = ctx.target };
         } else null;
 
         self.newSplit(
             direction,
             active,
-            .{ .ssh_target = ssh_target },
+            .{ .ssh_ctx = ssh_ctx },
         ) catch |err| {
             log.warn("new split failed error={}", .{err});
         };

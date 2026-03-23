@@ -8,6 +8,8 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
+const session = @import("../../../session.zig");
+const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
@@ -445,3 +447,311 @@ pub const SshSessionEntry = extern struct {
         }
     };
 };
+
+/// Spawn a background thread to query SSH sessions and populate the picker.
+/// The picker should already be presented (in loading state).
+pub fn queryAndPopulate(picker: *SshSessionPicker, target: [:0]const u8) void {
+    const alloc = Application.default().allocator();
+
+    const thread_data = alloc.create(SessionQueryData) catch return;
+    thread_data.* = .{
+        .picker = picker.ref(),
+        .ssh_target = alloc.dupeZ(u8, target) catch {
+            picker.unref();
+            alloc.destroy(thread_data);
+            return;
+        },
+    };
+
+    const thread = std.Thread.spawn(.{}, sessionQueryThread, .{thread_data}) catch {
+        picker.unref();
+        alloc.free(thread_data.ssh_target);
+        alloc.destroy(thread_data);
+        return;
+    };
+    thread.detach();
+}
+
+const SessionQueryData = struct {
+    picker: *SshSessionPicker,
+    ssh_target: [:0]const u8,
+};
+
+const QueryErrorData = struct {
+    picker: *SshSessionPicker,
+    msg: [:0]const u8,
+};
+
+fn sessionQueryThread(data: *SessionQueryData) void {
+    defer {
+        const alloc = Application.default().allocator();
+        data.picker.unref();
+        alloc.free(data.ssh_target);
+        alloc.destroy(data);
+    }
+
+    const alloc = Application.default().allocator();
+
+    // Query sessions from the remote host via SSH
+    const sessions = querySshSessions(alloc, data.ssh_target) catch |err| {
+        log.warn("failed to query SSH sessions: {}", .{err});
+        const msg: [:0]const u8 = switch (err) {
+            error.PasswordRequired => "Password authentication required. Open a regular SSH tab first, then retry.",
+            error.SessionQueryFailed => "Failed to query remote sessions. Check that the daemon is running.",
+            else => "Failed to connect or query sessions",
+        };
+        const err_data = alloc.create(QueryErrorData) catch return;
+        err_data.* = .{ .picker = data.picker.ref(), .msg = msg };
+        _ = glib.idleAdd(struct {
+            fn callback(ptr: ?*anyopaque) callconv(.c) c_int {
+                const d: *QueryErrorData = @ptrCast(@alignCast(ptr orelse return 0));
+                d.picker.setError(d.msg);
+                d.picker.unref();
+                Application.default().allocator().destroy(d);
+                return 0;
+            }
+        }.callback, err_data);
+        return;
+    };
+    defer {
+        for (sessions) |s| {
+            alloc.free(s.id);
+            alloc.free(s.label);
+            alloc.free(s.detail);
+            alloc.free(s.status);
+        }
+        alloc.free(sessions);
+    }
+
+    // Copy session data to owned strings for the idle callback
+    const callback_data = alloc.create(SessionResultData) catch return;
+    callback_data.* = .{
+        .picker = data.picker.ref(),
+        .ssh_target = alloc.dupeZ(u8, data.ssh_target) catch {
+            data.picker.unref();
+            alloc.destroy(callback_data);
+            return;
+        },
+        .sessions = blk: {
+            break :blk dupeSessionEntries(alloc, sessions) catch {
+                data.picker.unref();
+                alloc.destroy(callback_data);
+                return;
+            };
+        },
+    };
+
+    _ = glib.idleAdd(sessionResultCallback, @as(?*anyopaque, @ptrCast(callback_data)));
+}
+
+const SessionResultData = struct {
+    picker: *SshSessionPicker,
+    ssh_target: [:0]const u8,
+    sessions: []Entry,
+
+    const Entry = struct {
+        id: [:0]const u8,
+        label: [:0]const u8,
+        detail: [:0]const u8,
+        status: [:0]const u8,
+    };
+};
+
+fn dupeSessionEntries(alloc: Allocator, sessions: []const SessionQueryEntry) ![]SessionResultData.Entry {
+    const list = try alloc.alloc(SessionResultData.Entry, sessions.len);
+    errdefer alloc.free(list);
+    for (sessions, 0..) |s, i| {
+        errdefer for (list[0..i]) |*prev| {
+            if (prev.id.len > 0) alloc.free(prev.id);
+            if (prev.label.len > 0) alloc.free(prev.label);
+            if (prev.detail.len > 0) alloc.free(prev.detail);
+            if (prev.status.len > 0) alloc.free(prev.status);
+        };
+        list[i] = .{
+            .id = try alloc.dupeZ(u8, s.id),
+            .label = try alloc.dupeZ(u8, s.label),
+            .detail = try alloc.dupeZ(u8, s.detail),
+            .status = try alloc.dupeZ(u8, s.status),
+        };
+    }
+    return list;
+}
+
+fn sessionResultCallback(user_data: ?*anyopaque) callconv(.c) c_int {
+    const data: *SessionResultData = @ptrCast(@alignCast(user_data orelse return 0));
+    defer {
+        const alloc = Application.default().allocator();
+        data.picker.unref();
+        for (data.sessions) |s| {
+            if (s.id.len > 0) alloc.free(s.id);
+            if (s.label.len > 0) alloc.free(s.label);
+            if (s.detail.len > 0) alloc.free(s.detail);
+            if (s.status.len > 0) alloc.free(s.status);
+        }
+        alloc.free(data.sessions);
+        alloc.free(data.ssh_target);
+        alloc.destroy(data);
+    }
+
+    data.picker.setSshTarget(data.ssh_target);
+
+    if (data.sessions.len == 0) {
+        data.picker.setError("No detached sessions found on this host");
+        return 0;
+    }
+
+    for (data.sessions) |s| {
+        data.picker.addSession(s.id, s.label, s.detail, s.status);
+    }
+    data.picker.setLoaded();
+
+    return 0; // G_SOURCE_REMOVE
+}
+
+/// Query sessions from a remote host. First tries the existing multiplexed
+/// connection (fast). If none exists, establishes a temporary SSH connection
+/// using key-based auth and runs the remote `--list` command directly.
+fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEntry {
+    const raw_output = blk: {
+        // Fast path: use existing multiplexed connection if available
+        const mgr = &Application.default().core().ssh_connection_manager;
+        if (mgr.findEntry(ssh_target, null)) |entry| {
+            if (entry.conn_state.load(.seq_cst) == .ready) {
+                break :blk SshConnectionManager.querySessions(entry, alloc, 5000) orelse
+                    return error.SessionQueryFailed;
+            }
+        }
+
+        // Slow path: establish a temporary SSH connection for the query
+        var ctx: session.client.SshContext = .{
+            .alloc = alloc,
+            .ssh_target = ssh_target,
+            .jump = null,
+        };
+        defer ctx.deinit();
+
+        var stderr_buf: [1024]u8 = undefined;
+        var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
+        const stderr = &stderr_writer_.interface;
+
+        const connect_result = ctx.connectWithAuth(stderr, null, false) catch
+            return error.NoActiveConnection;
+        switch (connect_result) {
+            .success => {},
+            .password_required_target, .password_required_jump =>
+                return error.PasswordRequired,
+        }
+
+        log.info("session query: SSH connected, checking remote Ghostty...", .{});
+
+        const helper_result = session.client.ensureRemoteHelper(alloc, &ctx, stderr, null) catch |err| {
+            log.warn("session query: ensureRemoteHelper failed: {}", .{err});
+            return error.NoActiveConnection;
+        };
+        const helper_path = helper_result.path;
+        defer alloc.free(helper_path);
+
+        log.info("session query: remote Ghostty at {s}, starting daemon...", .{helper_path});
+
+        session.client.ensureRemoteDaemon(alloc, &ctx, helper_path, helper_result.uploaded) catch |err| {
+            log.warn("session query: ensureRemoteDaemon failed: {}", .{err});
+            return error.NoActiveConnection;
+        };
+
+        log.info("session query: daemon ready, listing sessions...", .{});
+
+        const cmd = std.fmt.allocPrint(
+            alloc,
+            "{s} " ++ session.shared.remote_subcommand ++ " --list",
+            .{helper_path},
+        ) catch return error.SessionQueryFailed;
+        defer alloc.free(cmd);
+
+        const result = session.client.runRemoteCapture(alloc, &ctx, cmd) catch
+            return error.SessionQueryFailed;
+        defer alloc.free(result.stderr);
+        if (result.exit_code != 0) {
+            alloc.free(result.stdout);
+            return error.SessionQueryFailed;
+        }
+        break :blk result.stdout;
+    };
+    defer alloc.free(raw_output);
+
+    // Parse the output: each line is a session entry
+    // Format: "uuid|label|N surfaces|timestamp|status"
+    // Lines starting with "  " are surface detail lines (skip them)
+    var entries: std.ArrayListUnmanaged(SessionQueryEntry) = .{};
+    errdefer {
+        for (entries.items) |e| {
+            alloc.free(e.id);
+            alloc.free(e.label);
+            alloc.free(e.detail);
+            alloc.free(e.status);
+        }
+        entries.deinit(alloc);
+    }
+
+    var lines = std.mem.splitScalar(u8, raw_output, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        // Skip surface detail lines (indented)
+        if (line.len > 2 and line[0] == ' ' and line[1] == ' ') continue;
+
+        // Parse: uuid|label|surfaces_info|timestamp|status
+        var parts = std.mem.splitScalar(u8, line, '|');
+        const id_raw = parts.next() orelse continue;
+        const label_raw = parts.next() orelse continue;
+        const surfaces_raw = parts.next() orelse continue;
+        const timestamp_raw = parts.next() orelse continue;
+        const status_raw = parts.next() orelse continue;
+
+        // Format detail with human-readable age
+        const created_at = std.fmt.parseInt(i64, timestamp_raw, 10) catch 0;
+        const now = std.time.timestamp();
+        const age_secs: u64 = if (created_at > 0) @intCast(@max(0, now - created_at)) else 0;
+        var age_buf: [32]u8 = undefined;
+        const detail = if (age_secs > 0)
+            std.fmt.allocPrint(alloc, "{s}, created {s} ago", .{ surfaces_raw, formatAge(&age_buf, age_secs) }) catch
+                try alloc.dupe(u8, surfaces_raw)
+        else
+            try alloc.dupe(u8, surfaces_raw);
+
+        try entries.append(alloc, .{
+            .id = try alloc.dupe(u8, id_raw),
+            .label = try alloc.dupe(u8, label_raw),
+            .detail = detail,
+            .status = try alloc.dupe(u8, status_raw),
+            .created_at = created_at,
+        });
+    }
+
+    // Sort descending by creation time (newest first)
+    std.mem.sortUnstable(SessionQueryEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: SessionQueryEntry, b: SessionQueryEntry) bool {
+            return a.created_at > b.created_at;
+        }
+    }.lessThan);
+
+    return try entries.toOwnedSlice(alloc);
+}
+
+const SessionQueryEntry = struct {
+    id: []const u8,
+    label: []const u8,
+    detail: []const u8,
+    status: []const u8,
+    created_at: i64,
+};
+
+fn formatAge(buf: *[32]u8, secs: u64) []const u8 {
+    if (secs < 60) {
+        return std.fmt.bufPrint(buf, "{d}s", .{secs}) catch "?";
+    } else if (secs < 3600) {
+        return std.fmt.bufPrint(buf, "{d}m", .{secs / 60}) catch "?";
+    } else if (secs < 86400) {
+        return std.fmt.bufPrint(buf, "{d}h{d}m", .{ secs / 3600, (secs % 3600) / 60 }) catch "?";
+    } else {
+        return std.fmt.bufPrint(buf, "{d}d{d}h", .{ secs / 86400, (secs % 86400) / 3600 }) catch "?";
+    }
+}

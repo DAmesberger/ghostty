@@ -2,12 +2,12 @@
 //!
 //! The daemon owns a full Terminal instance that is the source of truth
 //! for terminal state. PTY output is fed through HeadlessStreamHandler
-//! to keep this Terminal up to date. Raw PTY bytes are simultaneously
-//! forwarded to the attached client as .stdout frames — the client's
-//! own VT parser handles rendering independently.
+//! to keep this Terminal up to date. Raw PTY bytes are forwarded to the
+//! attached client as .data_out frames — the client's own VT parser
+//! handles rendering independently.
 //!
 //! On reconnect, the daemon's Terminal viewport is serialized as VT
-//! escape sequences and sent as a .state_full frame, allowing the new
+//! escape sequences and sent as a .data_out frame, allowing the new
 //! client to rebuild the screen naturally via processOutput.
 //!
 //! Threading model:
@@ -23,6 +23,7 @@ const Terminal = terminal.Terminal;
 const Screen = terminal.Screen;
 const page = terminal.page;
 const HeadlessHandler = @import("../termio/HeadlessStreamHandler.zig").HeadlessHandler;
+const page_diff = @import("page_diff.zig");
 const session = @import("../session.zig");
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
@@ -44,7 +45,7 @@ pub const RemoteSession = struct {
 
     /// Optional back-reference to the owning SessionGroup.
     /// Set when the session belongs to a multi-surface group.
-    /// Used by attachAndServe to store layout_update blobs.
+    /// Used by attachAndServe to store layout blobs.
     group: ?*SessionGroup = null,
 
     /// Protects: terminal_instance, attached_fd, attached_target, alive.
@@ -56,11 +57,26 @@ pub const RemoteSession = struct {
 
     created_at: i64,
     alive: bool = true,
-    /// Set to true when the client sends surface_close (permanent close, not detach).
+    /// Set to true when the client sends close(surface) (permanent close, not detach).
     closed: bool = false,
     reader_thread: std.Thread = undefined,
 
     pub const SessionGroup = @import("helper.zig").SessionGroup;
+
+    /// Number of rows to serialize per scrollback chunk. Targets ~64KB.
+    const scrollback_chunk_rows: u16 = 90;
+
+    /// Count the number of scrollback history rows in this session's terminal.
+    /// Must be called with mutex held.
+    pub fn computeHistoryRows(self: *RemoteSession) u32 {
+        const s: *Screen = self.terminal_instance.screens.active;
+        var total: u32 = 0;
+        var row_it = s.pages.rowIterator(.right_down, .{ .history = .{} }, null);
+        while (row_it.next()) |_| {
+            total += 1;
+        }
+        return total;
+    }
 
     pub fn deinit(self: *RemoteSession) void {
         self.stream.handler.deinit();
@@ -78,7 +94,7 @@ pub const RemoteSession = struct {
     }
 
     /// Reader thread: reads PTY output, feeds the headless Terminal,
-    /// and forwards raw bytes to the attached client as .stdout frames.
+    /// and forwards raw bytes to the attached client as .data_out frames.
     pub fn readerMain(self: *RemoteSession) void {
         var buf: [4096]u8 = undefined;
         while (true) {
@@ -94,8 +110,9 @@ pub const RemoteSession = struct {
             self.stream.nextSlice(buf[0..n]);
 
             // Forward raw bytes to attached client
+            // TODO: Replace with structured page diffs (Phase 4)
             if (self.attached_fd) |fd| {
-                sendFrameFd(fd, .stdout, self.attached_target, buf[0..n]) catch {
+                sendFrameFd(fd, .data_out, self.attached_target, buf[0..n]) catch {
                     self.attached_fd = null;
                 };
             }
@@ -143,37 +160,164 @@ pub const RemoteSession = struct {
         };
         defer self.alloc.free(vt_snapshot);
 
+        // Capture history state for background streaming
+        const total_history = self.computeHistoryRows();
+        const cols = self.terminal_instance.cols;
+
         if (vt_snapshot.len > 0) {
-            sendFrameFd(fd, .state_full, target, vt_snapshot) catch |err| {
+            sendFrameFd(fd, .data_out, target, vt_snapshot) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
         }
 
-        // NOW enable live forwarding — readerMain will start sending .stdout
+        // NOW enable live forwarding — readerMain will start sending .data_out
         self.attached_fd = fd;
         self.attached_target = target;
         self.mutex.unlock();
 
-        // Frame read loop: handle client input (runs WITHOUT mutex)
-        var file: std.fs.File = .{ .handle = fd };
-        var reader_buf: [1024]u8 = undefined;
-        var reader_ = file.readerStreaming(&reader_buf);
-        const reader = &reader_.interface;
+        var history_sent: u32 = 0;
+
+        // Frame read loop with interleaved scrollback streaming.
+        // Uses a read buffer and non-blocking check for client frames.
+        var frame_buf = std.ArrayList(u8).empty;
+        defer frame_buf.deinit(self.alloc);
 
         while (true) {
-            const header = session.protocol.readHeader(reader) catch break;
-            const payload = session.protocol.readPayloadAlloc(self.alloc, reader, header) catch break;
-            defer self.alloc.free(payload);
+            // Process any complete frames from the buffer first
+            if (self.processClientFrames(&frame_buf)) break;
 
-            switch (header.kind) {
-                .stdin => _ = posix.write(self.pty.master, payload) catch |err| {
+            // If scrollback streaming is not done, check if we can send a chunk.
+            // Use poll with timeout=0 to check for pending input without blocking.
+            if (history_sent < total_history) {
+                var pollfds = [1]posix.pollfd{
+                    .{ .fd = fd, .events = posix.POLL.IN, .revents = undefined },
+                };
+                const poll_result = posix.poll(&pollfds, 0) catch 0;
+
+                if (poll_result == 0) {
+                    // No pending input — send next scrollback chunk
+                    self.sendScrollbackChunk(fd, target, total_history, &history_sent, cols);
+                    continue;
+                }
+                // Fall through to read pending data
+            }
+
+            // Block waiting for client input
+            var read_buf: [4096]u8 = undefined;
+            const n = posix.read(fd, &read_buf) catch break;
+            if (n == 0) break;
+            frame_buf.appendSlice(self.alloc, read_buf[0..n]) catch break;
+        }
+
+        self.mutex.lock();
+        if (self.attached_fd == fd) self.attached_fd = null;
+        self.mutex.unlock();
+    }
+
+    /// Send one scrollback chunk to the client.
+    fn sendScrollbackChunk(
+        self: *RemoteSession,
+        fd: posix.fd_t,
+        target: u16,
+        total_history: u32,
+        history_sent: *u32,
+        cols: u16,
+    ) void {
+        self.mutex.lock();
+        const chunk = page_diff.serializeScrollbackChunk(
+            self.alloc,
+            &self.terminal_instance,
+            history_sent.*,
+            scrollback_chunk_rows,
+        ) catch {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+        defer self.alloc.free(chunk.data);
+
+        if (chunk.rows_serialized == 0) {
+            // Send done marker
+            history_sent.* = total_history;
+            const done_resp = session.protocol.ScrollbackResponse{
+                .total_history_rows = total_history,
+                .chunk_start_row = history_sent.*,
+                .row_count = 0,
+                .cols = cols,
+                .chunk_data = "",
+            };
+            const done_payload = done_resp.encode(self.alloc) catch return;
+            defer self.alloc.free(done_payload);
+            sendFrameFd(fd, .scrollback_response, target, done_payload) catch {};
+            return;
+        }
+
+        const resp = session.protocol.ScrollbackResponse{
+            .total_history_rows = total_history,
+            .chunk_start_row = history_sent.*,
+            .row_count = chunk.rows_serialized,
+            .cols = cols,
+            .chunk_data = chunk.data,
+        };
+        const resp_payload = resp.encode(self.alloc) catch return;
+        defer self.alloc.free(resp_payload);
+        sendFrameFd(fd, .scrollback_response, target, resp_payload) catch {};
+
+        history_sent.* += chunk.rows_serialized;
+
+        // If we just finished, send done marker
+        if (history_sent.* >= total_history) {
+            const done_resp = session.protocol.ScrollbackResponse{
+                .total_history_rows = total_history,
+                .chunk_start_row = history_sent.*,
+                .row_count = 0,
+                .cols = cols,
+                .chunk_data = "",
+            };
+            const done_payload = done_resp.encode(self.alloc) catch return;
+            defer self.alloc.free(done_payload);
+            sendFrameFd(fd, .scrollback_response, target, done_payload) catch {};
+        }
+    }
+
+    /// Process complete frames from the client input buffer.
+    /// Returns true if the connection should be closed.
+    fn processClientFrames(
+        self: *RemoteSession,
+        frame_buf: *std.ArrayList(u8),
+    ) bool {
+        while (frame_buf.items.len >= session.protocol.header_size) {
+            const header = session.protocol.Header.parseFromBuf(
+                frame_buf.items[0..session.protocol.header_size],
+            ) catch {
+                shiftBuf(frame_buf, session.protocol.header_size);
+                continue;
+            };
+            const total = session.protocol.header_size + header.len;
+            if (frame_buf.items.len < total) break;
+
+            if (header.len > session.protocol.max_payload) {
+                shiftBuf(frame_buf, total);
+                continue;
+            }
+
+            const kind = header.kind;
+            const payload = frame_buf.items[session.protocol.header_size..total];
+
+            switch (kind) {
+                .data_in => _ = posix.write(self.pty.master, payload) catch |err| {
                     log.warn("session write failed id={s} err={}", .{ self.id, err });
-                    break;
+                    shiftBuf(frame_buf, total);
+                    return true;
                 },
                 .resize => {
-                    const parsed = session.protocol.Resize.parse(payload) catch break;
-                    // Validate resize values — reject unreasonable sizes
+                    const parsed = session.protocol.Resize.parse(payload) catch {
+                        shiftBuf(frame_buf, total);
+                        return true;
+                    };
+                    // width_px and height_px are allowed to be 0 ("unknown"), used
+                    // during reconnect and by terminals that don't report pixel size.
                     if (parsed.rows == 0 or parsed.cols == 0 or
                         parsed.rows > 10000 or parsed.cols > 10000 or
                         parsed.width_px > 100000 or parsed.height_px > 100000)
@@ -181,39 +325,48 @@ pub const RemoteSession = struct {
                         log.warn("invalid resize values: {}x{} ({}x{} px)", .{
                             parsed.cols, parsed.rows, parsed.width_px, parsed.height_px,
                         });
-                        continue; // Skip invalid resize, don't break connection
-                    }
-                    self.pty.setSize(.{
-                        .ws_row = parsed.rows,
-                        .ws_col = parsed.cols,
-                        .ws_xpixel = parsed.width_px,
-                        .ws_ypixel = parsed.height_px,
-                    }) catch {};
-                },
-                .layout_update => {
-                    // Validate layout blob size
-                    if (payload.len > session.protocol.max_payload or payload.len > 64 * 1024) {
-                        log.warn("layout_update too large: {d} bytes", .{payload.len});
-                        continue;
-                    }
-                    // Store layout blob in the owning group (opaque, for reconnect)
-                    if (self.group) |group| {
-                        group.updateLayout(self.alloc, payload);
+                    } else {
+                        self.pty.setSize(.{
+                            .ws_row = parsed.rows,
+                            .ws_col = parsed.cols,
+                            .ws_xpixel = parsed.width_px,
+                            .ws_ypixel = parsed.height_px,
+                        }) catch {};
                     }
                 },
-                .surface_close => {
-                    self.closed = true;
-                    break;
+                .layout => {
+                    if (payload.len <= 64 * 1024) {
+                        if (self.group) |group| {
+                            group.updateLayout(self.alloc, payload);
+                        }
+                    }
                 },
-                .detach => break,
+                .close => {
+                    const close_data = session.protocol.Close.parse(payload) catch {
+                        shiftBuf(frame_buf, total);
+                        return true;
+                    };
+                    switch (close_data.mode) {
+                        .surface, .session => {
+                            self.closed = true;
+                            shiftBuf(frame_buf, total);
+                            return true;
+                        },
+                        .detach => {
+                            shiftBuf(frame_buf, total);
+                            return true;
+                        },
+                    }
+                },
                 else => {},
             }
-        }
 
-        self.mutex.lock();
-        if (self.attached_fd == fd) self.attached_fd = null;
-        self.mutex.unlock();
+            shiftBuf(frame_buf, total);
+        }
+        return false;
     }
+
+    const shiftBuf = session.shared.shiftBuffer;
 };
 
 /// Serialize the Terminal's viewport as VT escape sequences.

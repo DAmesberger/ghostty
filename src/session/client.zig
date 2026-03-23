@@ -493,7 +493,7 @@ fn shellEscape(alloc: Allocator, s: []const u8) ![]u8 {
 
 /// Open a multiplexed channel to the remote helper's stdio-attach mode.
 /// Returns a Channel shared by all sessions to this host. Session creation
-/// happens via session_open frames, not CLI args.
+/// happens via open frames, not CLI args.
 pub fn openMultiplexChannel(
     alloc: Allocator,
     ctx: *const SshContext,

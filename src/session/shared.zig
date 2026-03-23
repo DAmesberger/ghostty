@@ -13,13 +13,6 @@ pub const ControlCommand = enum {
     reconnect,
 };
 
-pub fn controlSequence(comptime cmd: ControlCommand) []const u8 {
-    return switch (cmd) {
-        .detach => "\x1bP9999;ghostty-session-control;detach\x1b\\",
-        .reconnect => "\x1bP9999;ghostty-session-control;reconnect\x1b\\",
-    };
-}
-
 pub fn stateDir(alloc: Allocator) ![]const u8 {
     return try internal_os.xdg.state(alloc, .{ .subdir = helper_subdir });
 }
@@ -189,6 +182,121 @@ pub fn generateReadableName(alloc: Allocator, uuid: Uuid) ![]u8 {
     const adj_idx = uuid[0] & 0x3F;
     const noun_idx = uuid[1] & 0x3F;
     return try std.fmt.allocPrint(alloc, "{s}-{s}", .{ adjectives[adj_idx], nouns[noun_idx] });
+}
+
+/// Unified SSH connection context that bundles all SSH properties into a
+/// single value type. Replaces threading individual optional fields through
+/// multiple layers (ssh_target, ssh-session, _ssh-group-id, _ssh-surface-id,
+/// ssh-jump, reconnect config).
+pub const SshConnectionContext = struct {
+    target: []const u8,
+    jump: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    group_id: Uuid = zero_uuid,
+    surface_id: Uuid = zero_uuid,
+    reconnect_attempts: u32 = 5,
+    reconnect_backoff: SshReconnectBackoff = .exponential,
+    reconnect_interval_ms: u32 = 1000,
+
+    pub const SshReconnectBackoff = @import("../config.zig").Config.SshReconnectBackoff;
+
+    /// Construct from config fields. Returns null if ssh-target is not set.
+    pub fn fromConfig(config: anytype) ?SshConnectionContext {
+        const ssh_target = config.@"ssh-target" orelse return null;
+
+        const group_id = if (config.@"_ssh-group-id") |gid_hex|
+            parseUuid(gid_hex) catch zero_uuid
+        else
+            zero_uuid;
+
+        const surface_id = if (config.@"_ssh-surface-id") |sid_hex|
+            parseUuid(sid_hex) catch zero_uuid
+        else
+            zero_uuid;
+
+        return .{
+            .target = ssh_target,
+            .jump = config.@"ssh-jump",
+            .session_id = config.@"ssh-session",
+            .group_id = group_id,
+            .surface_id = surface_id,
+            .reconnect_attempts = config.@"ssh-reconnect-attempts",
+            .reconnect_backoff = config.@"ssh-reconnect-backoff",
+            .reconnect_interval_ms = config.@"ssh-reconnect-interval",
+        };
+    }
+
+    /// Apply this context's properties to a config, allocating strings
+    /// in the config's arena.
+    pub fn applyToConfig(self: SshConnectionContext, config: anytype) !void {
+        const alloc = config.arenaAlloc();
+        config.@"ssh-target" = try alloc.dupe(u8, self.target);
+        if (self.jump) |j| {
+            config.@"ssh-jump" = try alloc.dupe(u8, j);
+        }
+        if (self.session_id) |s| {
+            config.@"ssh-session" = try alloc.dupe(u8, s);
+        }
+        if (!isZeroUuid(self.group_id)) {
+            const hex = formatUuid(self.group_id);
+            config.@"_ssh-group-id" = try alloc.dupe(u8, &hex);
+        }
+        if (!isZeroUuid(self.surface_id)) {
+            const hex = formatUuid(self.surface_id);
+            config.@"_ssh-surface-id" = try alloc.dupe(u8, &hex);
+        }
+        config.@"ssh-reconnect-attempts" = self.reconnect_attempts;
+        config.@"ssh-reconnect-backoff" = self.reconnect_backoff;
+        config.@"ssh-reconnect-interval" = self.reconnect_interval_ms;
+    }
+
+    /// Deep copy all owned strings.
+    pub fn dupe(self: SshConnectionContext, alloc: Allocator) !SshConnectionContext {
+        return .{
+            .target = try alloc.dupe(u8, self.target),
+            .jump = if (self.jump) |j| try alloc.dupe(u8, j) else null,
+            .session_id = if (self.session_id) |s| try alloc.dupe(u8, s) else null,
+            .label = if (self.label) |l| try alloc.dupe(u8, l) else null,
+            .group_id = self.group_id,
+            .surface_id = self.surface_id,
+            .reconnect_attempts = self.reconnect_attempts,
+            .reconnect_backoff = self.reconnect_backoff,
+            .reconnect_interval_ms = self.reconnect_interval_ms,
+        };
+    }
+
+    /// Free owned string copies.
+    pub fn deinit(self: *SshConnectionContext, alloc: Allocator) void {
+        alloc.free(self.target);
+        if (self.jump) |j| alloc.free(j);
+        if (self.session_id) |s| alloc.free(s);
+        if (self.label) |l| alloc.free(l);
+        self.* = undefined;
+    }
+};
+
+/// Thread-safe authentication state for interactive password prompts.
+/// Shared between the SSH thread (waits on cond) and the UI thread
+/// (signals password/cancel).
+pub const AuthState = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    /// Password provided by the UI thread. null = not yet provided.
+    password: ?[]const u8 = null,
+    /// True if the user cancelled the password prompt.
+    cancelled: bool = false,
+};
+
+/// Shift an ArrayList buffer forward, discarding the first `amount` bytes.
+/// Used by protocol frame parsers to consume processed data.
+pub fn shiftBuffer(buf: *std.ArrayList(u8), amount: usize) void {
+    if (amount >= buf.items.len) {
+        buf.shrinkRetainingCapacity(0);
+    } else {
+        std.mem.copyForwards(u8, buf.items, buf.items[amount..]);
+        buf.shrinkRetainingCapacity(buf.items.len - amount);
+    }
 }
 
 pub const Platform = struct {

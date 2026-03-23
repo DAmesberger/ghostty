@@ -24,36 +24,16 @@ const SshConnectionManager = @import("SshConnectionManager.zig");
 const log = std.log.scoped(.io_remote);
 
 const Uuid = session.shared.Uuid;
+const SshConnectionContext = session.shared.SshConnectionContext;
 
 /// Allocator used to own copied config strings.
 alloc: Allocator,
 
-/// The SSH target (e.g. "user@host:port") — owned copy.
-ssh_target: []const u8,
-
-/// Optional jump host — owned copy.
-jump: ?[]const u8,
-
-/// Label for the remote session — owned copy.
-label: ?[]const u8,
-
-/// Session ID for reconnecting to an existing session — owned copy.
-session_id: ?[]const u8,
-
-/// Stable surface UUID, generated at init. Survives reconnects.
-surface_id: Uuid,
-
-/// Group UUID, inherited from parent for splits or generated for first surface.
-/// Zero UUID means this is the first surface (will create a new group).
-group_id: Uuid,
+/// SSH connection context — owns all SSH-related strings.
+ssh_ctx: SshConnectionContext,
 
 /// Reference to the shared connection manager
 connection_manager: *SshConnectionManager,
-
-/// Reconnect configuration (plumbed from config)
-reconnect_attempts: u32 = 5,
-reconnect_backoff: @import("../config.zig").Config.SshReconnectBackoff = .exponential,
-reconnect_interval_ms: u32 = 1000,
 
 /// The connection entry from the manager (set during threadEnter)
 conn_entry: ?*SshConnectionManager.Entry = null,
@@ -62,11 +42,11 @@ conn_entry: ?*SshConnectionManager.Entry = null,
 target_id: u16 = 0,
 
 /// True if this surface was created from a layout restore (has a specific
-/// surface_id from ssh-surface-id config). Used to select attach mode
-/// in surface_open so the daemon reattaches to the existing PTY.
+/// surface_id from _ssh-surface-id config). Used to select attach mode
+/// in open so the daemon reattaches to the existing PTY.
 restoring: bool = false,
 
-/// Set by the detach flow so threadExit skips sending surface_close
+/// Set by the detach flow so threadExit skips sending close
 /// (which would kill the daemon-side surface we want to keep alive).
 detaching: bool = false,
 
@@ -74,39 +54,28 @@ detaching: bool = false,
 grid_size: renderer.GridSize = .{ .columns = 80, .rows = 24 },
 screen_size: renderer.ScreenSize = .{ .width = 0, .height = 0 },
 
+// TODO: Scrollback — send buffer size with layout, allocate on client,
+// fill visible first then history in background for search support.
+
 pub fn init(
     alloc: Allocator,
     cfg: Config,
 ) !Remote {
-    // Copy config strings — the config memory is NOT stable after init.
-    const ssh_target = try alloc.dupe(u8, cfg.ssh_target);
-    errdefer alloc.free(ssh_target);
-    const jump = if (cfg.jump) |j| try alloc.dupe(u8, j) else null;
-    errdefer if (jump) |j| alloc.free(j);
-    const label = if (cfg.label) |l| try alloc.dupe(u8, l) else null;
-    errdefer if (label) |l| alloc.free(l);
-    const session_id = if (cfg.session_id) |s| try alloc.dupe(u8, s) else null;
+    // Deep copy the context — the config memory is NOT stable after init.
+    var ssh_ctx = try cfg.ssh_ctx.dupe(alloc);
+    errdefer ssh_ctx.deinit(alloc);
 
     // Surface ID: use the configured one (from layout restore) or generate fresh.
-    const restoring = !session.shared.isZeroUuid(cfg.surface_id);
-    const surface_id = if (restoring) cfg.surface_id else session.shared.generateUuid();
-
-    // Group ID: inherited from parent (for splits) or zero (will create new group)
-    const group_id = cfg.group_id;
+    const restoring = !session.shared.isZeroUuid(ssh_ctx.surface_id);
+    if (!restoring) {
+        ssh_ctx.surface_id = session.shared.generateUuid();
+    }
 
     return .{
         .alloc = alloc,
-        .ssh_target = ssh_target,
-        .jump = jump,
-        .label = label,
-        .session_id = session_id,
-        .surface_id = surface_id,
-        .group_id = group_id,
+        .ssh_ctx = ssh_ctx,
         .restoring = restoring,
         .connection_manager = cfg.connection_manager,
-        .reconnect_attempts = cfg.reconnect_attempts,
-        .reconnect_backoff = cfg.reconnect_backoff,
-        .reconnect_interval_ms = cfg.reconnect_interval_ms,
     };
 }
 
@@ -122,15 +91,11 @@ pub fn deinit(self: *Remote) void {
 
     // Release our reference to the connection (safety net if threadExit wasn't called)
     if (self.conn_entry != null) {
-        self.connection_manager.release(self.ssh_target, self.jump);
+        self.connection_manager.release(self.ssh_ctx.target, self.ssh_ctx.jump);
         self.conn_entry = null;
     }
 
-    // Free owned string copies
-    self.alloc.free(self.ssh_target);
-    if (self.jump) |j| self.alloc.free(j);
-    if (self.label) |l| self.alloc.free(l);
-    if (self.session_id) |s| self.alloc.free(s);
+    self.ssh_ctx.deinit(self.alloc);
 }
 
 pub fn initTerminal(self: *Remote, term: *terminal.Terminal) void {
@@ -154,10 +119,10 @@ pub fn threadEnter(
     _ = td.surface_mailbox.push(.{ .connection_state = .connecting }, .{ .forever = {} });
 
     // Acquire a connection from the pool
-    const entry = try self.connection_manager.acquire(self.ssh_target, self.jump);
+    const entry = try self.connection_manager.acquire(self.ssh_ctx.target, self.ssh_ctx.jump);
     self.conn_entry = entry;
     errdefer {
-        self.connection_manager.release(self.ssh_target, self.jump);
+        self.connection_manager.release(self.ssh_ctx.target, self.ssh_ctx.jump);
         self.conn_entry = null;
     }
 
@@ -192,7 +157,7 @@ pub fn threadEnter(
     self.target_id = self.connection_manager.allocateTarget(entry);
 
     // Register surface for frame dispatch from the SSH thread
-    if (!SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox, self.surface_id, self.group_id, self.label)) {
+    if (!SshConnectionManager.registerSurface(entry, self.target_id, io, &td.surface_mailbox, self.ssh_ctx.surface_id, self.ssh_ctx.group_id, self.ssh_ctx.label)) {
         _ = td.surface_mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
         return error.MaxSurfacesExceeded;
     }
@@ -200,7 +165,7 @@ pub fn threadEnter(
 
     _ = td.surface_mailbox.push(.{ .connection_state = .setup }, .{ .forever = {} });
 
-    // Send session_open or surface_open frame via write queue.
+    // Send unified open frame via write queue.
     {
         const open_resize: session.protocol.Resize = .{
             .rows = @intCast(self.grid_size.rows),
@@ -209,54 +174,59 @@ pub fn threadEnter(
             .height_px = @intCast(self.screen_size.height),
         };
 
-        if (!session.shared.isZeroUuid(self.group_id)) {
-            // Split/restored surface: join existing group via surface_open.
-            // Use attach mode if restoring from a layout blob (ssh-surface-id
+        if (!session.shared.isZeroUuid(self.ssh_ctx.group_id)) {
+            // Split/restored surface: join existing group via surface open.
+            // Use attach mode if restoring from a layout blob (_ssh-surface-id
             // was set), so the daemon reattaches to the existing PTY.
-            const mode: session.protocol.OpenMode = if (self.session_id != null or self.restoring) .attach else .new;
-            const open_payload = (session.protocol.SurfaceOpen{
+            const open_type: session.protocol.OpenType = if (self.ssh_ctx.session_id != null or self.restoring) .surface_attach else .surface_new;
+            const open_payload = (session.protocol.Open{
+                .open_type = open_type,
                 .resize = open_resize,
-                .mode = mode,
-                .group_id = self.group_id,
-                .surface_id = self.surface_id,
+                .group_id = self.ssh_ctx.group_id,
+                .surface_id = self.ssh_ctx.surface_id,
             }).encode(alloc) catch return error.OutOfMemory;
             defer alloc.free(open_payload);
-            SshConnectionManager.enqueueWrite(entry, .surface_open, self.target_id, open_payload);
+            SshConnectionManager.enqueueWrite(entry, .open, self.target_id, open_payload);
         } else {
-            // First surface: generate group_id and create new group
-            self.group_id = session.shared.generateUuid();
+            const open_type: session.protocol.OpenType = if (self.ssh_ctx.session_id != null) .session_attach else .session_new;
+
+            if (open_type == .session_attach) {
+                // Attach mode: use the daemon's group_id so child surfaces
+                // (from layout restore) send open with the correct
+                // group_id that the daemon recognizes.
+                if (self.ssh_ctx.session_id) |sid| {
+                    self.ssh_ctx.group_id = session.shared.parseUuid(sid) catch
+                        session.shared.parseUuidDashed(sid) catch
+                        session.shared.generateUuid();
+                } else {
+                    self.ssh_ctx.group_id = session.shared.generateUuid();
+                }
+            } else {
+                // New session: generate a fresh group_id
+                self.ssh_ctx.group_id = session.shared.generateUuid();
+            }
+
             // Update the registered slot so detach/reconnect can find us by group.
-            SshConnectionManager.updateSurfaceGroupId(entry, self.target_id, self.group_id);
+            SshConnectionManager.updateSurfaceGroupId(entry, self.target_id, self.ssh_ctx.group_id);
 
             // Generate a readable session name if no explicit label was provided.
-            if (self.label == null) {
-                self.label = session.shared.generateReadableName(self.alloc, self.group_id) catch null;
+            if (self.ssh_ctx.label == null) {
+                self.ssh_ctx.label = session.shared.generateReadableName(self.alloc, self.ssh_ctx.group_id) catch null;
             }
 
-            const mode: session.protocol.OpenMode = if (self.session_id != null) .attach else .new;
-            const label = self.label orelse self.ssh_target;
+            const label = self.ssh_ctx.label orelse self.ssh_ctx.target;
 
-            // For attach mode with session_id, try to parse it as UUID for group lookup
-            var attach_group_id = self.group_id;
-            if (mode == .attach) {
-                if (self.session_id) |sid| {
-                    attach_group_id = session.shared.parseUuid(sid) catch
-                        session.shared.parseUuidDashed(sid) catch
-                        self.group_id;
-                }
-            }
-
-            const open_payload = (session.protocol.SessionOpen{
+            const open_payload = (session.protocol.Open{
+                .open_type = open_type,
                 .resize = open_resize,
-                .mode = mode,
                 // For attach mode, send zero surface_id so the daemon picks
                 // the first alive surface rather than looking up a specific one.
-                .surface_id = if (mode == .attach) session.shared.zero_uuid else self.surface_id,
-                .group_id = if (mode == .attach) attach_group_id else self.group_id,
-                .label = if (mode == .attach) (self.session_id orelse label) else label,
+                .surface_id = if (open_type == .session_attach) session.shared.zero_uuid else self.ssh_ctx.surface_id,
+                .group_id = self.ssh_ctx.group_id,
+                .label = if (open_type == .session_attach) (self.ssh_ctx.session_id orelse label) else label,
             }).encode(alloc) catch return error.OutOfMemory;
             defer alloc.free(open_payload);
-            SshConnectionManager.enqueueWrite(entry, .session_open, self.target_id, open_payload);
+            SshConnectionManager.enqueueWrite(entry, .open, self.target_id, open_payload);
         }
     }
 
@@ -340,15 +310,20 @@ fn setupConnection(
         return err;
     };
 
-    self.connection_manager.mutex.lock();
+    entry.surfaces_mutex.lock();
     if (entry.helper_path.len > 0) self.connection_manager.alloc.free(entry.helper_path);
     entry.helper_path = helper_path;
-    self.connection_manager.mutex.unlock();
+    entry.surfaces_mutex.unlock();
+
+    // Copy helper_path for use below so we don't read the field after
+    // releasing the lock (another thread could modify it).
+    const helper_path_local = self.alloc.dupe(u8, helper_path) catch return error.OutOfMemory;
+    defer self.alloc.free(helper_path_local);
 
     const channel = session.client.openMultiplexChannel(
         alloc,
         &entry.ctx,
-        entry.helper_path,
+        helper_path_local,
     ) catch |err| {
         _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
         return err;
@@ -363,9 +338,9 @@ fn setupConnection(
     self.connection_manager.mutex.unlock();
 
     // Store reconnect config into the entry (first surface only)
-    entry.max_reconnect_attempts = self.reconnect_attempts;
-    entry.reconnect_backoff = self.reconnect_backoff;
-    entry.reconnect_interval_ms = self.reconnect_interval_ms;
+    entry.max_reconnect_attempts = self.ssh_ctx.reconnect_attempts;
+    entry.reconnect_backoff = self.ssh_ctx.reconnect_backoff;
+    entry.reconnect_interval_ms = self.ssh_ctx.reconnect_interval_ms;
 
     // Create pipes for SSH thread communication
     entry.quit_pipe = try posix.pipe2(.{ .CLOEXEC = true });
@@ -393,23 +368,33 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     _ = td;
     const entry = self.conn_entry orelse return;
 
+    const has_group = !session.shared.isZeroUuid(self.ssh_ctx.group_id);
+
     if (self.detaching) {
-        // Detach flow: the detach frame was already sent by sendSessionControl.
-        // Don't send surface_close — the daemon-side surface must stay alive
+        // Detach flow: the close(detach) frame was already sent by sendDetach.
+        // Don't send close(surface) — the daemon-side surface must stay alive
         // so the session can be reattached later.
-    } else if (!session.shared.isZeroUuid(self.group_id)) {
-        // Grouped surface: send surface_close with our UUID
-        SshConnectionManager.enqueueWrite(entry, .surface_close, self.target_id, &self.surface_id);
+    } else if (has_group) {
+        // Grouped surface: send close(surface) to kill this surface's PTY.
+        if ((session.protocol.Close{
+            .mode = .surface,
+            .id = self.ssh_ctx.surface_id,
+        }).encode(entry.alloc)) |close_payload| {
+            defer entry.alloc.free(close_payload);
+            SshConnectionManager.enqueueWrite(entry, .close, self.target_id, close_payload);
+        } else |_| {
+            SshConnectionManager.enqueueWrite(entry, .close, self.target_id, &.{@intFromEnum(session.protocol.CloseMode.surface)});
+        }
     } else {
-        // Standalone: send session_close (detach, keeps session alive)
-        SshConnectionManager.enqueueWrite(entry, .session_close, self.target_id, "");
+        // Standalone: send close(detach) to keep session alive
+        SshConnectionManager.enqueueWrite(entry, .close, self.target_id, &.{@intFromEnum(session.protocol.CloseMode.detach)});
     }
 
-    // Unregister surface — after this returns, SSH thread won't access our io
+    // Unregister surface from the SSH connection entry.
     SshConnectionManager.unregisterSurface(entry, self.target_id);
 
     // Release connection reference (may shut down SSH thread if last ref)
-    self.connection_manager.release(self.ssh_target, self.jump);
+    self.connection_manager.release(self.ssh_ctx.target, self.ssh_ctx.jump);
     self.conn_entry = null;
 }
 
@@ -459,13 +444,13 @@ pub fn queueWrite(
             const byte = data[i];
             i += 1;
             if (byte == '\r') {
-                SshConnectionManager.enqueueWrite(entry, .stdin, self.target_id, "\r\n");
+                SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, "\r\n");
             } else {
-                SshConnectionManager.enqueueWrite(entry, .stdin, self.target_id, data[i - 1 .. i]);
+                SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, data[i - 1 .. i]);
             }
         }
     } else {
-        SshConnectionManager.enqueueWrite(entry, .stdin, self.target_id, data);
+        SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, data);
     }
 }
 
@@ -500,17 +485,6 @@ pub const ThreadData = struct {
 };
 
 pub const Config = struct {
-    ssh_target: []const u8,
-    jump: ?[]const u8 = null,
-    label: ?[]const u8 = null,
-    session_id: ?[]const u8 = null,
-    /// Inherited from parent surface for splits, zero for first surface.
-    group_id: Uuid = session.shared.zero_uuid,
-    /// Pre-assigned surface UUID, or zero to auto-generate.
-    surface_id: Uuid = session.shared.zero_uuid,
+    ssh_ctx: SshConnectionContext,
     connection_manager: *SshConnectionManager,
-    // Reconnect config
-    reconnect_attempts: u32 = 5,
-    reconnect_backoff: @import("../config.zig").Config.SshReconnectBackoff = .exponential,
-    reconnect_interval_ms: u32 = 1000,
 };

@@ -192,8 +192,7 @@ pub const Tab = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
-        ssh_target: ?[]const u8 = null,
-        ssh_session: ?[]const u8 = null,
+        ssh_ctx: ?session.shared.SshConnectionContext = null,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -217,8 +216,7 @@ pub const Tab = extern struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
-            .ssh_target = overrides.ssh_target,
-            .ssh_session = overrides.ssh_session,
+            .ssh_ctx = overrides.ssh_ctx,
         }) catch |err| switch (err) {
             error.OutOfMemory => {
                 // TODO: We should make our "no surfaces" state more aesthetically
@@ -279,7 +277,7 @@ pub const Tab = extern struct {
         self.setTitleOverride(if (title.len == 0) null else title);
 
         // Tab titles are now persisted in the window-level layout blob,
-        // so no separate session_rename needed here. The next layout_update
+        // so no separate rename needed here. The next layout send
         // from the Window will include the new title.
     }
     pub fn promptTabTitle(self: *Self) void {
@@ -581,18 +579,14 @@ pub const Tab = extern struct {
         const split_tree = self.private().split_tree;
         const surface = split_tree.getActiveSurface() orelse return .{};
         const core = surface.core() orelse return .{};
-        return switch (core.io.backend) {
-            .remote => |remote| blk: {
-                core.renderer_state.mutex.lock();
-                const conn_state = core.renderer_state.connection_state;
-                core.renderer_state.mutex.unlock();
-                break :blk .{
-                    .ssh_target = remote.ssh_target,
-                    .label = remote.label,
-                    .conn_state = conn_state,
-                };
-            },
-            else => .{},
+        const ctx = core.remoteContext() orelse return .{};
+        core.renderer_state.mutex.lock();
+        const conn_state = core.renderer_state.connection_state;
+        core.renderer_state.mutex.unlock();
+        return .{
+            .ssh_target = ctx.target,
+            .label = ctx.label,
+            .conn_state = conn_state,
         };
     }
 

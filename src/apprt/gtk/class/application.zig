@@ -40,6 +40,7 @@ const Tab = @import("tab.zig").Tab;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
+const session = @import("../../../session.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -661,7 +662,7 @@ pub const Application = extern struct {
     /// Open a new window with an SSH remote session to the given target.
     pub fn newSshWindow(self: *Self, ssh_target: []const u8) void {
         Action.newWindow(self, null, .{
-            .ssh_target = ssh_target,
+            .ssh_ctx = .{ .target = ssh_target },
         }) catch |err| {
             log.warn("failed to create SSH window: {}", .{err});
         };
@@ -670,8 +671,7 @@ pub const Application = extern struct {
     /// Open a new window that attaches to an existing SSH remote session.
     pub fn newSshAttachWindow(self: *Self, ssh_target: []const u8, ssh_session: []const u8) void {
         Action.newWindow(self, null, .{
-            .ssh_target = ssh_target,
-            .ssh_session = ssh_session,
+            .ssh_ctx = .{ .target = ssh_target, .session_id = ssh_session },
         }) catch |err| {
             log.warn("failed to create SSH attach window: {}", .{err});
         };
@@ -2252,8 +2252,7 @@ const Action = struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
-            ssh_target: ?[]const u8 = null,
-            ssh_session: ?[]const u8 = null,
+            ssh_ctx: ?session.shared.SshConnectionContext = null,
 
             pub const none: @This() = .{};
         },
@@ -2276,8 +2275,7 @@ const Action = struct {
                 .command = overrides.command,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
-                .ssh_target = overrides.ssh_target,
-                .ssh_session = overrides.ssh_session,
+                .ssh_ctx = overrides.ssh_ctx,
             },
         );
     }
@@ -2290,8 +2288,7 @@ const Action = struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
-            ssh_target: ?[]const u8 = null,
-            ssh_session: ?[]const u8 = null,
+            ssh_ctx: ?session.shared.SshConnectionContext = null,
 
             pub const none: @This() = .{};
         },
@@ -2312,8 +2309,7 @@ const Action = struct {
             .command = overrides.command,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
-            .ssh_target = overrides.ssh_target,
-            .ssh_session = overrides.ssh_session,
+            .ssh_ctx = overrides.ssh_ctx,
         });
 
         // Estimate the initial window size before presenting so the window
@@ -2625,7 +2621,12 @@ const Action = struct {
                     Window,
                     surface.as(gtk.Widget),
                 ) orelse return false;
-                window.restoreFromBlob(blob, surface);
+                window.restoreFromBlob(
+                    blob,
+                    surface,
+                    core.pending_layout_group_id,
+                    core.pending_layout_surface_id,
+                );
                 return true;
             },
         }
@@ -2648,7 +2649,17 @@ const Action = struct {
                 // tree-changed signal fired before the surface had a core.
                 if (conn_state == null) {
                     if (ext.getAncestor(Window, gtk_surface.as(gtk.Widget))) |window| {
-                        window.sendRemoteLayoutUpdate();
+                        window.scheduleLayoutUpdate();
+                    }
+
+                    // Grab focus when remote surface finishes connecting,
+                    // but only if its tab is currently selected.
+                    const tab = ext.getAncestor(Tab, gtk_surface.as(gtk.Widget)) orelse return true;
+                    const tv = ext.getAncestor(adw.TabView, tab.as(gtk.Widget)) orelse return true;
+                    const selected = tv.getSelectedPage() orelse return true;
+                    const our_page = tv.getPage(tab.as(gtk.Widget));
+                    if (selected == our_page) {
+                        gtk_surface.grabFocus();
                     }
                 }
                 return true;

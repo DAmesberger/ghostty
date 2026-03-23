@@ -95,7 +95,7 @@ fn killDaemon(alloc: Allocator) !void {
     const socket_path = try session.shared.socketPath(alloc);
     defer alloc.free(socket_path);
 
-    // Try to connect and send a session_close to trigger graceful shutdown
+    // Try to connect to trigger graceful shutdown
     const fd = connectUnixSocket(socket_path) catch {
         // Can't connect — daemon not running, just clean up socket
         std.fs.cwd().deleteFile(socket_path) catch {};
@@ -220,9 +220,6 @@ fn daemonMain(alloc: Allocator) !void {
             return error.PollFailed;
         }
 
-        // Periodically reap groups that have been empty past grace period
-        daemon.reapEmptyGroups();
-
         if (pollfds[0].revents & c.POLLIN != 0) {
             const client_fd = try acceptUnixSocket(daemon.listener);
             verifyPeerUid(client_fd) catch {
@@ -259,42 +256,46 @@ const ClientThread = struct {
         var header_buf: [session.protocol.header_size]u8 = undefined;
         readAllRaw(self.fd, &header_buf) catch return;
 
-        const kind = std.meta.intToEnum(session.protocol.Kind, header_buf[0]) catch return;
-        const target = std.mem.readInt(u16, header_buf[2..4], .little);
-        const payload_len = std.mem.readInt(u32, header_buf[4..8], .little);
+        const header = session.protocol.Header.parseFromBuf(&header_buf) catch return;
+        const kind = header.kind;
+        const target = header.target;
 
-        if (payload_len > session.protocol.max_payload) return;
-        const payload = try self.daemon.alloc.alloc(u8, payload_len);
+        if (header.len > session.protocol.max_payload) return;
+        const payload = try self.daemon.alloc.alloc(u8, header.len);
         defer self.daemon.alloc.free(payload);
         readAllRaw(self.fd, payload) catch return;
 
         switch (kind) {
-            .session_open => {
-                self.daemon.handleSessionOpen(self.fd, target, payload) catch {
-                    sendFrameFd(self.fd, .err, target, "session open failed") catch {};
+            .open => {
+                const open_data = session.protocol.Open.parse(payload) catch {
+                    sendFrameFd(self.fd, .err, target, "invalid open payload") catch {};
+                    return;
                 };
+                switch (open_data.open_type) {
+                    .session_new, .session_attach => {
+                        self.daemon.handleSessionOpen(self.fd, target, open_data) catch {
+                            sendFrameFd(self.fd, .err, target, "session open failed") catch {};
+                        };
+                    },
+                    .surface_new, .surface_attach => {
+                        self.daemon.handleSurfaceOpen(self.fd, target, open_data) catch {
+                            sendFrameFd(self.fd, .err, target, "surface open failed") catch {};
+                        };
+                    },
+                }
             },
-            .surface_open => {
-                self.daemon.handleSurfaceOpen(self.fd, target, payload) catch {
-                    sendFrameFd(self.fd, .err, target, "surface open failed") catch {};
-                };
+            .close => {
+                const close_data = session.protocol.Close.parse(payload) catch return;
+                self.daemon.handleClose(close_data);
             },
-            .session_list_request => {
+            .list_request => {
                 self.daemon.handleSessionList(self.fd) catch |err| {
                     log.warn("session_list failed err={}", .{err});
                 };
             },
-            .session_close => {
-                self.daemon.handleSessionClose(payload);
-            },
-            .surface_close => {
-                self.daemon.handleSurfaceClose(payload);
-            },
-            .session_rename => {
-                self.daemon.handleSessionRename(payload);
-            },
-            .surface_rename => {
-                self.daemon.handleSurfaceRename(payload);
+            .rename => {
+                const rename_data = session.protocol.Rename.parse(payload) catch return;
+                self.daemon.handleRename(rename_data);
             },
             else => {},
         }
@@ -313,9 +314,6 @@ pub const SessionGroup = struct {
     surfaces: std.AutoArrayHashMap(Uuid, *RemoteSession),
     layout_blob: ?[]u8 = null,
     created_at: i64,
-    /// Timestamp when the group became empty (all surfaces removed).
-    /// Used for grace-period reaping. Reset to null when a surface is added.
-    last_empty_at: ?i64 = null,
     mutex: std.Thread.Mutex = .{},
 
     pub fn deinit(self: *SessionGroup) void {
@@ -382,12 +380,10 @@ const Daemon = struct {
         self: *Daemon,
         fd: posix.fd_t,
         target: u16,
-        payload: []const u8,
+        open_data: session.protocol.Open,
     ) !void {
-        const open_data = try session.protocol.SessionOpen.parse(payload);
-
-        switch (open_data.mode) {
-            .new => {
+        switch (open_data.open_type) {
+            .session_new => {
                 // Create group with client-provided group_id + first surface
                 const raw_label = if (open_data.label.len > 0) open_data.label else "session";
                 const group_id = if (!session.shared.isZeroUuid(open_data.group_id))
@@ -403,8 +399,16 @@ const Daemon = struct {
 
                 const sess = try self.createSurface(group, surface_id, open_data.resize);
 
-                const gid_hex = session.shared.formatUuid(group.id);
-                sendFrameFd(fd, .session_opened, target, &gid_hex) catch {};
+                // Send opened response with no layout (new session)
+                const opened = session.protocol.Opened{
+                    .group_id = group.id,
+                    .surface_id = surface_id,
+                };
+                const opened_payload = opened.encode(self.alloc) catch null;
+                defer if (opened_payload) |p| self.alloc.free(p);
+                if (opened_payload) |p| {
+                    sendFrameFd(fd, .opened, target, p) catch {};
+                }
 
                 sess.attachAndServe(fd, target, open_data.resize) catch {};
 
@@ -414,11 +418,11 @@ const Daemon = struct {
                     group.mutex.lock();
                     _ = group.surfaces.orderedRemove(surface_id);
                     group.mutex.unlock();
-                    maybeMarkGroupEmpty(group);
+                    self.maybeRemoveEmptyGroup(group);
                     self.mutex.unlock();
                 }
             },
-            .attach => {
+            .session_attach => {
                 // Find group by UUID or label, or create a new one if
                 // the label was provided but no matching group exists
                 // (named session create-or-attach).
@@ -453,22 +457,79 @@ const Daemon = struct {
                 };
                 if (!created_new) self.mutex.unlock();
 
-                const gid_hex = session.shared.formatUuid(group.id);
-                sendFrameFd(fd, .session_opened, target, &gid_hex) catch {};
-
-                // Send layout_restore if available
-                group.mutex.lock();
-                if (group.layout_blob) |blob| {
-                    sendFrameFd(fd, .layout_restore, target, blob) catch {};
-                }
-                group.mutex.unlock();
-
-                // Find the surface to attach to
+                // Find the surface to attach to BEFORE sending opened,
+                // so we can include the attached surface_id.
+                // When no specific surface_id is requested, prefer the
+                // first leaf from the serialized layout (preserves tab
+                // order) and fall back to firstAliveSurface() if layout
+                // parsing fails or the surface isn't found.
                 const sess = if (!session.shared.isZeroUuid(open_data.surface_id)) blk: {
                     group.mutex.lock();
                     defer group.mutex.unlock();
                     break :blk group.surfaces.get(open_data.surface_id);
-                } else group.firstAliveSurface();
+                } else blk: {
+                    // Try layout-aware lookup first.
+                    // Dupe the blob under mutex to avoid use-after-free
+                    // (another thread could free group.layout_blob).
+                    const layout_blob_dupe = lbl: {
+                        group.mutex.lock();
+                        defer group.mutex.unlock();
+                        break :lbl if (group.layout_blob) |blob|
+                            (self.alloc.dupe(u8, blob) catch null)
+                        else
+                            null;
+                    };
+                    defer if (layout_blob_dupe) |d| self.alloc.free(d);
+                    if (layout_blob_dupe) |blob| {
+                        if (session.layout.findFirstLeafId(blob)) |first_id| {
+                            group.mutex.lock();
+                            const candidate = group.surfaces.get(first_id);
+                            group.mutex.unlock();
+                            if (candidate) |cand| {
+                                cand.mutex.lock();
+                                const alive = cand.alive;
+                                cand.mutex.unlock();
+                                if (alive) break :blk candidate;
+                            }
+                        }
+                    }
+                    // Fall back to arbitrary alive surface
+                    break :blk group.firstAliveSurface();
+                };
+
+                // Send opened response with layout and attached surface_id.
+                // Dupe the blob under mutex to avoid use-after-free.
+                const layout_blob_owned = lbl: {
+                    group.mutex.lock();
+                    defer group.mutex.unlock();
+                    break :lbl if (group.layout_blob) |blob|
+                        (self.alloc.dupe(u8, blob) catch null)
+                    else
+                        null;
+                };
+                defer if (layout_blob_owned) |d| self.alloc.free(d);
+                const layout_blob = layout_blob_owned;
+
+                const attached_sid = if (sess) |s| s.surface_id else session.shared.zero_uuid;
+
+                // Compute history rows for the attached surface
+                const history_rows: u32 = if (sess) |s| blk: {
+                    s.mutex.lock();
+                    defer s.mutex.unlock();
+                    break :blk s.computeHistoryRows();
+                } else 0;
+
+                const opened = session.protocol.Opened{
+                    .group_id = group.id,
+                    .surface_id = attached_sid,
+                    .history_rows = history_rows,
+                    .layout_blob = layout_blob,
+                };
+                const opened_payload = opened.encode(self.alloc) catch null;
+                defer if (opened_payload) |p| self.alloc.free(p);
+                if (opened_payload) |p| {
+                    sendFrameFd(fd, .opened, target, p) catch {};
+                }
 
                 if (sess) |s| {
                     s.attachAndServe(fd, target, open_data.resize) catch |err| {
@@ -479,6 +540,17 @@ const Daemon = struct {
                         sendFrameFd(fd, .err, target, msg) catch {};
                         sendFrameFd(fd, .eof, target, "") catch {};
                     };
+
+                    // Clean up surface if client sent close(surface/session).
+                    if (s.closed) {
+                        s.kill();
+                        self.mutex.lock();
+                        group.mutex.lock();
+                        _ = group.surfaces.orderedRemove(attached_sid);
+                        group.mutex.unlock();
+                        self.maybeRemoveEmptyGroup(group);
+                        self.mutex.unlock();
+                    }
                 } else if (created_new) {
                     // New group via create-or-attach: create the first surface.
                     const surface_id = if (!session.shared.isZeroUuid(open_data.surface_id))
@@ -500,7 +572,7 @@ const Daemon = struct {
                         group.mutex.lock();
                         _ = group.surfaces.orderedRemove(surface_id);
                         group.mutex.unlock();
-                        maybeMarkGroupEmpty(group);
+                        self.maybeRemoveEmptyGroup(group);
                         self.mutex.unlock();
                     }
                 } else {
@@ -520,6 +592,7 @@ const Daemon = struct {
                     sendFrameFd(fd, .eof, target, "") catch {};
                 }
             },
+            else => unreachable, // surface types handled in handleSurfaceOpen
         }
     }
 
@@ -527,9 +600,8 @@ const Daemon = struct {
         self: *Daemon,
         fd: posix.fd_t,
         target: u16,
-        payload: []const u8,
+        open_data: session.protocol.Open,
     ) !void {
-        const open_data = try session.protocol.SurfaceOpen.parse(payload);
 
         self.mutex.lock();
         const group = self.groups.get(open_data.group_id) orelse {
@@ -539,11 +611,18 @@ const Daemon = struct {
         };
         self.mutex.unlock();
 
-        switch (open_data.mode) {
-            .new => {
+        switch (open_data.open_type) {
+            .surface_new => {
                 const sess = try self.createSurface(group, open_data.surface_id, open_data.resize);
-                const gid_hex = session.shared.formatUuid(group.id);
-                sendFrameFd(fd, .session_opened, target, &gid_hex) catch {};
+                const opened = session.protocol.Opened{
+                    .group_id = group.id,
+                    .surface_id = open_data.surface_id,
+                };
+                const opened_payload = opened.encode(self.alloc) catch null;
+                defer if (opened_payload) |p| self.alloc.free(p);
+                if (opened_payload) |p| {
+                    sendFrameFd(fd, .opened, target, p) catch {};
+                }
                 sess.attachAndServe(fd, target, open_data.resize) catch {};
 
                 if (sess.closed) {
@@ -552,49 +631,95 @@ const Daemon = struct {
                     group.mutex.lock();
                     _ = group.surfaces.orderedRemove(open_data.surface_id);
                     group.mutex.unlock();
-                    maybeMarkGroupEmpty(group);
+                    self.maybeRemoveEmptyGroup(group);
                     self.mutex.unlock();
                 }
             },
-            .attach => {
+            .surface_attach => {
                 group.mutex.lock();
                 const sess = group.surfaces.get(open_data.surface_id);
                 group.mutex.unlock();
 
                 if (sess) |s| {
-                    const gid_hex = session.shared.formatUuid(group.id);
-                    sendFrameFd(fd, .session_opened, target, &gid_hex) catch {};
+                    // Compute history rows for the attached surface
+                    s.mutex.lock();
+                    const surf_history = s.computeHistoryRows();
+                    s.mutex.unlock();
+
+                    const opened = session.protocol.Opened{
+                        .group_id = group.id,
+                        .surface_id = open_data.surface_id,
+                        .history_rows = surf_history,
+                    };
+                    const opened_payload = opened.encode(self.alloc) catch null;
+                    defer if (opened_payload) |p| self.alloc.free(p);
+                    if (opened_payload) |p| {
+                        sendFrameFd(fd, .opened, target, p) catch {};
+                    }
                     s.attachAndServe(fd, target, open_data.resize) catch {};
+
+                    // Clean up surface if client sent close.
+                    if (s.closed) {
+                        s.kill();
+                        self.mutex.lock();
+                        group.mutex.lock();
+                        _ = group.surfaces.orderedRemove(open_data.surface_id);
+                        group.mutex.unlock();
+                        self.maybeRemoveEmptyGroup(group);
+                        self.mutex.unlock();
+                    }
                 } else {
                     sendFrameFd(fd, .eof, target, "") catch {};
                 }
             },
+            else => unreachable, // session types handled in handleSessionOpen
         }
     }
 
-    fn handleSurfaceClose(self: *Daemon, payload: []const u8) void {
-        if (payload.len < 16) return;
-        const surface_id: Uuid = payload[0..16].*;
+    /// Unified close handler. Dispatches based on Close.mode.
+    fn handleClose(self: *Daemon, close_data: session.protocol.Close) void {
+        switch (close_data.mode) {
+            .surface => {
+                self.mutex.lock();
+                defer self.mutex.unlock();
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+                for (self.groups.values()) |group| {
+                    group.mutex.lock();
+                    if (group.surfaces.get(close_data.id)) |sess| {
+                        sess.kill();
+                        _ = group.surfaces.orderedRemove(close_data.id);
+                        group.mutex.unlock();
+                        self.maybeRemoveEmptyGroup(group);
+                        return;
+                    }
+                    group.mutex.unlock();
+                }
+            },
+            .session => {
+                self.mutex.lock();
+                defer self.mutex.unlock();
 
-        for (self.groups.values()) |group| {
-            group.mutex.lock();
-            if (group.surfaces.get(surface_id)) |sess| {
-                sess.kill();
-                _ = group.surfaces.orderedRemove(surface_id);
-                group.mutex.unlock();
-                maybeMarkGroupEmpty(group);
-                return;
-            }
-            group.mutex.unlock();
+                if (self.groups.get(close_data.id)) |group| {
+                    group.mutex.lock();
+                    for (group.surfaces.values()) |sess| sess.kill();
+                    group.surfaces.clearRetainingCapacity();
+                    group.mutex.unlock();
+                    self.maybeRemoveEmptyGroup(group);
+                }
+            },
+            .detach => {
+                // Detach is handled at the multiplexer level; no daemon action needed.
+            },
         }
     }
 
     fn handleSessionList(self: *Daemon, fd: posix.fd_t) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Build structured ListResponse
+        var entries: std.ArrayList(session.protocol.ListEntry) = .empty;
+        defer entries.deinit(self.alloc);
 
         for (self.groups.values()) |group| {
             group.mutex.lock();
@@ -612,164 +737,76 @@ const Daemon = struct {
             }
             group.mutex.unlock();
 
-            const gid_hex = session.shared.formatUuid(group.id);
-            var entry_buf: [512]u8 = undefined;
-            const status: []const u8 = if (alive_count == 0)
-                "dead"
+            const status: session.protocol.ListStatus = if (alive_count == 0)
+                .dead
             else if (attached_count > 0)
-                "attached"
+                .attached
             else
-                "detached";
-            const entry = std.fmt.bufPrint(&entry_buf, "{s}|{s}|{d} surfaces ({d} alive)|{d}|{s}", .{
-                &gid_hex,
-                group.label,
-                surface_count,
-                alive_count,
-                created_at,
-                status,
+                .detached;
+
+            entries.append(self.alloc, .{
+                .group_id = group.id,
+                .status = status,
+                .surface_count = @intCast(surface_count),
+                .alive_count = @intCast(alive_count),
+                .created_at = created_at,
+                .label = group.label,
             }) catch continue;
-            sendFrameFd(fd, .session_list_entry, 0, entry) catch {};
-
-            // Also list individual surfaces
-            group.mutex.lock();
-            for (group.surfaces.keys(), group.surfaces.values()) |sid, sess| {
-                sess.mutex.lock();
-                const s_alive = sess.alive;
-                const s_attached = sess.attached_fd != null;
-                sess.mutex.unlock();
-
-                const sid_hex = session.shared.formatUuid(sid);
-                const surface_entry = std.fmt.bufPrint(&entry_buf, "  {s}|{s}|{s}|{s}", .{
-                    &sid_hex,
-                    sess.label,
-                    if (s_alive) "alive" else "dead",
-                    if (s_attached) "attached" else "detached",
-                }) catch continue;
-                sendFrameFd(fd, .session_list_entry, 0, surface_entry) catch {};
-            }
-            group.mutex.unlock();
         }
+
+        const resp = session.protocol.ListResponse{ .entries = entries.items };
+        const payload = resp.encode(self.alloc) catch return;
+        defer self.alloc.free(payload);
+        sendFrameFd(fd, .list_response, 0, payload) catch {};
     }
 
-    fn handleSessionClose(self: *Daemon, payload: []const u8) void {
-        const id = std.mem.trim(u8, payload, " \t\r\n");
+    /// Unified rename handler. Dispatches based on Rename.scope.
+    fn handleRename(self: *Daemon, rename_data: session.protocol.Rename) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Try as group UUID
-        const uuid = session.shared.parseUuid(id) catch
-            session.shared.parseUuidDashed(id) catch null;
-
-        if (uuid) |u| {
-            if (self.groups.get(u)) |group| {
+        switch (rename_data.scope) {
+            .group => {
+                const group = self.groups.get(rename_data.id) orelse return;
+                const new_label = session.shared.sanitizeLabelAlloc(self.alloc, rename_data.label) catch return;
                 group.mutex.lock();
-                for (group.surfaces.values()) |sess| sess.kill();
+                self.alloc.free(group.label);
+                group.label = new_label;
                 group.mutex.unlock();
-                return;
-            }
-        }
-
-        // Try as label
-        for (self.groups.values()) |group| {
-            if (std.mem.eql(u8, group.label, id)) {
-                group.mutex.lock();
-                for (group.surfaces.values()) |sess| sess.kill();
-                group.mutex.unlock();
-                return;
-            }
-        }
-    }
-
-    /// Rename a session group. Payload: [16] group_id + [N] new_label.
-    fn handleSessionRename(self: *Daemon, payload: []const u8) void {
-        if (payload.len < 17) return; // need at least UUID + 1 byte label
-        const group_id: Uuid = payload[0..16].*;
-        const new_label_raw = payload[16..];
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const group = self.groups.get(group_id) orelse return;
-        const new_label = session.shared.sanitizeLabelAlloc(self.alloc, new_label_raw) catch return;
-        group.mutex.lock();
-        self.alloc.free(group.label);
-        group.label = new_label;
-        group.mutex.unlock();
-        log.info("renamed group to '{s}'", .{new_label});
-    }
-
-    /// Rename a surface. Payload: [16] surface_id + [N] new_label.
-    fn handleSurfaceRename(self: *Daemon, payload: []const u8) void {
-        if (payload.len < 17) return; // need at least UUID + 1 byte label
-        const surface_id: Uuid = payload[0..16].*;
-        const new_label_raw = payload[16..];
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Find the surface across all groups.
-        for (self.groups.values()) |group| {
-            group.mutex.lock();
-            defer group.mutex.unlock();
-            if (group.surfaces.get(surface_id)) |sess| {
-                const new_label = session.shared.sanitizeLabelAlloc(self.alloc, new_label_raw) catch return;
-                sess.mutex.lock();
-                self.alloc.free(sess.label);
-                sess.label = new_label;
-                sess.mutex.unlock();
-                log.info("renamed surface to '{s}'", .{new_label});
-                return;
-            }
+                log.info("renamed group to '{s}'", .{new_label});
+            },
+            .surface => {
+                // Find the surface across all groups.
+                for (self.groups.values()) |group| {
+                    group.mutex.lock();
+                    defer group.mutex.unlock();
+                    if (group.surfaces.get(rename_data.id)) |sess| {
+                        const new_label = session.shared.sanitizeLabelAlloc(self.alloc, rename_data.label) catch return;
+                        sess.mutex.lock();
+                        self.alloc.free(sess.label);
+                        sess.label = new_label;
+                        sess.mutex.unlock();
+                        log.info("renamed surface to '{s}'", .{new_label});
+                        return;
+                    }
+                }
+            },
         }
     }
 
-    /// Grace period before reaping empty groups (5 minutes).
-    const group_reap_grace_s: i64 = 5 * 60;
-
-    /// Check if a group is empty after a surface was removed, and mark
-    /// it for reaping if so. Also clears the mark if the group is non-empty.
+    /// If the group has no surfaces left, remove it immediately from the
+    /// daemon's group map and free it. Otherwise clear the reap mark.
     /// Caller must hold daemon.mutex. Group mutex should NOT be held.
-    fn maybeMarkGroupEmpty(group: *SessionGroup) void {
+    /// After this returns, `group` may be dangling — caller must not use it.
+    fn maybeRemoveEmptyGroup(self: *Daemon, group: *SessionGroup) void {
         group.mutex.lock();
-        defer group.mutex.unlock();
-        if (group.surfaces.count() == 0) {
-            if (group.last_empty_at == null) {
-                group.last_empty_at = std.time.timestamp();
-                log.info("group {s} is now empty, scheduled for reaping", .{group.label});
-            }
-        } else {
-            group.last_empty_at = null;
-        }
-    }
+        const is_empty = group.surfaces.count() == 0;
+        group.mutex.unlock();
+        if (!is_empty) return;
 
-    /// Remove groups that have been empty longer than the grace period.
-    /// Must be called without holding daemon.mutex (acquires it internally).
-    fn reapEmptyGroups(self: *Daemon) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const now = std.time.timestamp();
-        var i: usize = 0;
-        while (i < self.groups.count()) {
-            const group = self.groups.values()[i];
-            group.mutex.lock();
-            const should_reap = if (group.last_empty_at) |t|
-                (now - t) > group_reap_grace_s
-            else
-                false;
-            group.mutex.unlock();
-
-            if (should_reap) {
-                log.info("reaping empty group {s} (empty for >{d}s)", .{
-                    group.label, group_reap_grace_s,
-                });
-                self.groups.swapRemoveAt(i);
-                group.deinit();
-                // Don't increment i — the swap moved a new element here
-            } else {
-                i += 1;
-            }
-        }
+        log.info("group {s} is empty, removing immediately", .{group.label});
+        _ = self.groups.swapRemove(group.id);
+        group.deinit();
     }
 
     fn createGroup(self: *Daemon, raw_label: []const u8, group_id: Uuid) !*SessionGroup {
@@ -872,7 +909,6 @@ const Daemon = struct {
 
         group.mutex.lock();
         try group.surfaces.put(surface_id, sess);
-        group.last_empty_at = null; // Group is no longer empty
         group.mutex.unlock();
 
         return sess;
@@ -883,7 +919,7 @@ const Daemon = struct {
 // Multiplexer — pure passthrough between SSH stdin/stdout and daemon socket
 // ============================================================================
 
-const MAX_MUX_SESSIONS = 64;
+const max_mux_sessions = 64;
 
 const MuxSession = struct {
     target: u16,
@@ -904,7 +940,7 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     const socket_path = try session.shared.socketPath(alloc);
     defer alloc.free(socket_path);
 
-    var sessions: [MAX_MUX_SESSIONS]?MuxSession = .{null} ** MAX_MUX_SESSIONS;
+    var sessions: [max_mux_sessions]?MuxSession = .{null} ** max_mux_sessions;
     var stdin_buf = std.ArrayList(u8).empty;
     defer stdin_buf.deinit(alloc);
 
@@ -927,14 +963,14 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
     while (true) {
         // Build poll fds: [0] = stdin, [1..] = daemon sockets
-        var pollfds: [1 + MAX_MUX_SESSIONS]c.struct_pollfd = undefined;
+        var pollfds: [1 + max_mux_sessions]c.struct_pollfd = undefined;
         pollfds[0] = .{
             .fd = stdin_fd,
             .events = c.POLLIN,
             .revents = 0,
         };
 
-        var poll_session_idx: [MAX_MUX_SESSIONS]usize = undefined;
+        var poll_session_idx: [max_mux_sessions]usize = undefined;
         var n_fds: usize = 1;
         for (&sessions, 0..) |*slot, i| {
             if (slot.* != null) {
@@ -985,18 +1021,17 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
             const payload = stdin_buf.items[session.protocol.header_size..total];
 
             switch (kind) {
-                .keepalive => {
+                .ping => {
                     last_keepalive_received = std.time.nanoTimestamp();
+                    sendFrameFile(stdout_file, .pong, 0, "") catch {};
                 },
-                .session_open, .surface_open => {
+                .open => {
                     handleOpenFrame(
-                        alloc,
                         &sessions,
                         kind,
                         target,
                         payload,
                         socket_path,
-                        stdout_file,
                     ) catch |err| {
                         const msg = std.fmt.allocPrint(alloc, "open failed: {}", .{err}) catch {
                             sendFrameFile(stdout_file, .err, target, "open failed") catch {};
@@ -1007,28 +1042,39 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                         sendFrameFile(stdout_file, .err, target, msg) catch {};
                     };
                 },
-                .session_close => {
-                    closeMuxSession(&sessions, alloc, target);
-                },
-                .surface_close => {
-                    // Forward to daemon so it can kill the surface process
-                    if (findMuxSession(&sessions, target)) |s| {
-                        sendFrameFd(s.daemon_fd, .surface_close, 0, payload) catch {};
+                .close => {
+                    const close_data = session.protocol.Close.parse(payload) catch {
+                        shiftBuffer(&stdin_buf, total);
+                        continue;
+                    };
+                    switch (close_data.mode) {
+                        .surface => {
+                            // Forward to daemon so it can kill the surface process
+                            if (findMuxSession(&sessions, target)) |s| {
+                                sendFrameFd(s.daemon_fd, .close, 0, payload) catch {};
+                            }
+                            closeMuxSession(&sessions, alloc, target);
+                        },
+                        .session => {
+                            // Forward to daemon for session-level kill
+                            if (findMuxSession(&sessions, target)) |s| {
+                                sendFrameFd(s.daemon_fd, .close, 0, payload) catch {};
+                            }
+                            closeMuxSession(&sessions, alloc, target);
+                        },
+                        .detach => {
+                            if (findMuxSession(&sessions, target)) |s| {
+                                sendFrameFd(s.daemon_fd, .close, 0, payload) catch {};
+                            }
+                            closeMuxSession(&sessions, alloc, target);
+                        },
                     }
-                    closeMuxSession(&sessions, alloc, target);
-                },
-                .detach => {
-                    if (findMuxSession(&sessions, target)) |s| {
-                        sendFrameFd(s.daemon_fd, .detach, 0, "") catch {};
-                    }
-                    closeMuxSession(&sessions, alloc, target);
                 },
                 // All other frames: passthrough to the daemon socket
-                .stdin,
+                .data_in,
                 .resize,
-                .layout_update,
-                .session_rename,
-                .surface_rename,
+                .layout,
+                .rename,
                 => {
                     if (findMuxSession(&sessions, target)) |s| {
                         sendFrameFd(s.daemon_fd, kind, target, payload) catch {
@@ -1037,8 +1083,8 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                         };
                     }
                 },
-                .session_list_request => {
-                    handleSessionListRequest(alloc, socket_path, stdout_file) catch |err| {
+                .list_request => {
+                    handleSessionListRequest(socket_path, stdout_file) catch |err| {
                         log.warn("session_list failed err={}", .{err});
                     };
                 },
@@ -1095,26 +1141,16 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
                     // Rewrite target ID and forward to client
                     sendFrameFile(stdout_file, dkind, s.target, dpayload) catch {};
-
-                    if (dkind == .eof) {
-                        shiftBuffer(&s.read_buf, dtotal);
-                        s.deinit(alloc);
-                        slot.* = null;
-                        break;
-                    }
-
                     shiftBuffer(&s.read_buf, dtotal);
                 }
             }
         }
 
-        // Keepalive: send if interval elapsed
+        // Keepalive: send ping if interval elapsed
         {
             const ka_now = std.time.nanoTimestamp();
             if (ka_now - last_keepalive_sent >= session.protocol.keepalive_interval_ns) {
-                var ts_buf: [8]u8 = undefined;
-                std.mem.writeInt(u64, &ts_buf, @intCast(@as(u128, @bitCast(ka_now)) & 0xFFFFFFFFFFFFFFFF), .little);
-                sendFrameFile(stdout_file, .keepalive, 0, &ts_buf) catch {};
+                sendFrameFile(stdout_file, .ping, 0, "") catch {};
                 last_keepalive_sent = ka_now;
             }
 
@@ -1145,16 +1181,14 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 }
 
 fn handleOpenFrame(
-    alloc: Allocator,
-    sessions: *[MAX_MUX_SESSIONS]?MuxSession,
+    sessions: *[max_mux_sessions]?MuxSession,
     kind: session.protocol.Kind,
     target: u16,
     payload: []const u8,
     socket_path: []const u8,
-    stdout_file: std.fs.File,
 ) !void {
     var free_idx: ?usize = null;
-    for (0..MAX_MUX_SESSIONS) |i| {
+    for (0..max_mux_sessions) |i| {
         if (sessions[i] == null) {
             free_idx = i;
             break;
@@ -1175,22 +1209,17 @@ fn handleOpenFrame(
         .daemon_fd = daemon_fd,
         .read_buf = std.ArrayList(u8).empty,
     };
-
-    _ = alloc;
-    _ = stdout_file;
 }
 
 fn handleSessionListRequest(
-    alloc: Allocator,
     socket_path: []const u8,
     stdout_file: std.fs.File,
 ) !void {
-    _ = alloc;
     const fd = try connectUnixSocket(socket_path);
     defer closeFd(fd);
 
-    // Send session_list_request frame to daemon
-    sendFrameFd(fd, .session_list_request, 0, "") catch return;
+    // Send list_request frame to daemon
+    sendFrameFd(fd, .list_request, 0, "") catch return;
 
     // Read and forward response frames
     var buf: [8192]u8 = undefined;
@@ -1201,7 +1230,7 @@ fn handleSessionListRequest(
     }
 }
 
-fn findMuxSession(sessions: *[MAX_MUX_SESSIONS]?MuxSession, target: u16) ?*MuxSession {
+fn findMuxSession(sessions: *[max_mux_sessions]?MuxSession, target: u16) ?*MuxSession {
     for (sessions) |*slot| {
         if (slot.*) |*s| {
             if (s.target == target) return s;
@@ -1210,7 +1239,7 @@ fn findMuxSession(sessions: *[MAX_MUX_SESSIONS]?MuxSession, target: u16) ?*MuxSe
     return null;
 }
 
-fn closeMuxSession(sessions: *[MAX_MUX_SESSIONS]?MuxSession, alloc: Allocator, target: u16) void {
+fn closeMuxSession(sessions: *[max_mux_sessions]?MuxSession, alloc: Allocator, target: u16) void {
     for (sessions) |*slot| {
         if (slot.*) |*s| {
             if (s.target == target) {
@@ -1232,8 +1261,8 @@ fn listSessions(
     const fd = try connectUnixSocket(socket_path);
     defer closeFd(fd);
 
-    // Send session_list_request frame
-    sendFrameFd(fd, .session_list_request, 0, "") catch return;
+    // Send list_request frame
+    sendFrameFd(fd, .list_request, 0, "") catch return;
 
     // Read response frames
     var buf: [8192]u8 = undefined;
@@ -1258,9 +1287,30 @@ fn listSessions(
             };
             const dpayload = read_buf.items[session.protocol.header_size..dtotal];
 
-            if (dkind == .session_list_entry) {
-                try writer.writeAll(dpayload);
-                try writer.writeAll("\n");
+            if (dkind == .list_response) {
+                // Parse structured binary list response
+                const entries = session.protocol.ListResponse.parse(alloc, dpayload) catch {
+                    shiftBuffer(&read_buf, dtotal);
+                    continue;
+                };
+                defer alloc.free(entries);
+
+                for (entries) |entry| {
+                    const gid_hex = session.shared.formatUuid(entry.group_id);
+                    const status_str: []const u8 = switch (entry.status) {
+                        .dead => "dead",
+                        .attached => "attached",
+                        .detached => "detached",
+                    };
+                    writer.print("{s}|{s}|{d} surfaces ({d} alive)|{d}|{s}\n", .{
+                        &gid_hex,
+                        entry.label,
+                        entry.surface_count,
+                        entry.alive_count,
+                        entry.created_at,
+                        status_str,
+                    }) catch {};
+                }
             }
 
             shiftBuffer(&read_buf, dtotal);
@@ -1281,7 +1331,23 @@ fn killSession(
     const fd = try connectUnixSocket(socket_path);
     defer closeFd(fd);
 
-    sendFrameFd(fd, .session_close, 0, id) catch return;
+    // Parse id as UUID for the Close struct
+    const uuid = session.shared.parseUuid(id) catch
+        session.shared.parseUuidDashed(id) catch {
+        // Fall back: try as label — find via list first
+        // For simplicity, just send the raw bytes (daemon will handle it)
+        const close_data = session.protocol.Close{ .mode = .session, .id = session.shared.zero_uuid };
+        const close_payload = close_data.encode(alloc) catch return;
+        defer alloc.free(close_payload);
+        sendFrameFd(fd, .close, 0, close_payload) catch return;
+        try writer.writeAll("OK\n");
+        try writer.flush();
+        return;
+    };
+    const close_data = session.protocol.Close{ .mode = .session, .id = uuid };
+    const close_payload = close_data.encode(alloc) catch return;
+    defer alloc.free(close_payload);
+    sendFrameFd(fd, .close, 0, close_payload) catch return;
     try writer.writeAll("OK\n");
     try writer.flush();
 }
@@ -1395,11 +1461,11 @@ fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, target: u16, payload
 
 fn sendFrameFile(file: std.fs.File, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
     if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;
-    var header: [session.protocol.header_size]u8 = undefined;
-    header[0] = @intFromEnum(kind);
-    header[1] = 0;
-    std.mem.writeInt(u16, header[2..4], target, .little);
-    std.mem.writeInt(u32, header[4..8], @intCast(payload.len), .little);
+    const header = (session.protocol.Header{
+        .kind = kind,
+        .target = target,
+        .len = @intCast(payload.len),
+    }).encodeToBuf();
     try file.writeAll(&header);
     try file.writeAll(payload);
 }
@@ -1422,14 +1488,7 @@ fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-fn shiftBuffer(buf: *std.ArrayList(u8), amount: usize) void {
-    if (amount >= buf.items.len) {
-        buf.shrinkRetainingCapacity(0);
-    } else {
-        std.mem.copyForwards(u8, buf.items, buf.items[amount..]);
-        buf.shrinkRetainingCapacity(buf.items.len - amount);
-    }
-}
+const shiftBuffer = session.shared.shiftBuffer;
 
 fn closeFd(fd: posix.fd_t) void {
     posix.close(fd);

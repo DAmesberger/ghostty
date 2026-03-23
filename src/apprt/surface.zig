@@ -106,6 +106,11 @@ pub const Message = union(enum) {
     /// SSH connection state change for overlay display.
     connection_state: session.protocol.ConnectionState,
 
+    /// The remote daemon acknowledged our open request. Carries the
+    /// daemon-assigned group_id and surface_id so the GTK thread can
+    /// update ssh_ctx without racing the SSH thread.
+    remote_opened: RemoteOpened,
+
     /// Layout restore from remote daemon — the client should recreate
     /// its split tree from this blob. The blob is heap-allocated via
     /// page_allocator and must be freed by the receiver.
@@ -117,10 +122,22 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    pub const RemoteOpened = struct {
+        group_id: session.shared.Uuid,
+        surface_id: session.shared.Uuid,
+    };
+
     pub const LayoutRestore = struct {
         /// Heap-allocated layout blob (via page_allocator). Receiver frees.
         blob: [*]const u8,
         len: u32,
+        /// The daemon-assigned group_id and surface_id from the `opened`
+        /// response. Bundled here to avoid a race: the SSH thread updates
+        /// the Remote backend and pushes this message, but the GTK thread
+        /// might read stale values from the backend. Passing them in the
+        /// message guarantees correctness.
+        group_id: session.shared.Uuid = session.shared.zero_uuid,
+        surface_id: session.shared.Uuid = session.shared.zero_uuid,
 
         pub fn slice(self: LayoutRestore) []const u8 {
             return self.blob[0..self.len];
@@ -223,9 +240,9 @@ pub fn newConfig(
         // config yet at this point.
         switch (p.io.backend) {
             .remote => |remote| {
-                if (!session.shared.isZeroUuid(remote.group_id)) {
-                    const hex = session.shared.formatUuid(remote.group_id);
-                    copy.@"ssh-group-id" = try alloc.dupe(u8, &hex);
+                if (!session.shared.isZeroUuid(remote.ssh_ctx.group_id)) {
+                    const hex = session.shared.formatUuid(remote.ssh_ctx.group_id);
+                    copy.@"_ssh-group-id" = try alloc.dupe(u8, &hex);
                 }
             },
             else => {},

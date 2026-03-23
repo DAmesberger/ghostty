@@ -147,6 +147,12 @@ child_exited: bool = false,
 /// Heap-allocated via page_allocator, freed after the action completes.
 pending_layout_restore: ?[]const u8 = null,
 
+/// Daemon-assigned IDs bundled with the layout_restore message.
+/// These are the authoritative values from the `opened` response,
+/// passed through the message to avoid a race with the SSH thread.
+pending_layout_group_id: session.shared.Uuid = session.shared.zero_uuid,
+pending_layout_surface_id: session.shared.Uuid = session.shared.zero_uuid,
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -628,28 +634,11 @@ pub fn init(
     {
         // Determine the IO backend based on config
         const io_backend: termio.Backend = backend: {
-            if (config.@"ssh-target") |ssh_target| {
+            if (session.shared.SshConnectionContext.fromConfig(config)) |ssh_ctx| {
                 // Remote SSH backend
-                const group_id = if (config.@"ssh-group-id") |gid_hex|
-                    session.shared.parseUuid(gid_hex) catch session.shared.zero_uuid
-                else
-                    session.shared.zero_uuid;
-
-                const surface_id = if (config.@"ssh-surface-id") |sid_hex|
-                    session.shared.parseUuid(sid_hex) catch session.shared.zero_uuid
-                else
-                    session.shared.zero_uuid;
-
                 var io_remote = try termio.Remote.init(alloc, .{
-                    .ssh_target = ssh_target,
-                    .jump = config.@"ssh-jump",
-                    .session_id = config.@"ssh-session",
-                    .group_id = group_id,
-                    .surface_id = surface_id,
+                    .ssh_ctx = ssh_ctx,
                     .connection_manager = &app.ssh_connection_manager,
-                    .reconnect_attempts = config.@"ssh-reconnect-attempts",
-                    .reconnect_backoff = config.@"ssh-reconnect-backoff",
-                    .reconnect_interval_ms = config.@"ssh-reconnect-interval",
                 });
                 errdefer io_remote.deinit();
                 break :backend .{ .remote = io_remote };
@@ -810,6 +799,15 @@ pub fn init(
     app.first = false;
 }
 
+/// Returns the SSH connection context if this surface uses a remote backend,
+/// null otherwise.
+pub fn remoteContext(self: *const Surface) ?*const session.shared.SshConnectionContext {
+    return switch (self.io.backend) {
+        .remote => |*remote| &remote.ssh_ctx,
+        else => null,
+    };
+}
+
 pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
@@ -901,57 +899,21 @@ fn isRemoteSurface(self: *const Surface) bool {
     return self.io.backend == .remote;
 }
 
-fn sendSessionControl(self: *Surface, comptime cmd: session.shared.ControlCommand) bool {
+fn sendDetach(self: *Surface) bool {
     if (!isRemoteSurface(self)) return false;
-    switch (cmd) {
-        .detach => {
-            // Detach the entire SSH connection — all tabs and splits on this
-            // host. Send a detach frame for each surface, then close them all.
-            const remote = &self.io.backend.remote;
-            const entry = remote.conn_entry orelse {
-                self.close();
-                return true;
-            };
 
-            // Collect ALL surfaces on this connection entry.
-            entry.surfaces_mutex.lock();
-            var targets: [termio.SshConnectionManager.MAX_SURFACES]struct {
-                target_id: u16,
-                io: *termio.Termio,
-                mailbox: *apprt.surface.Mailbox,
-            } = undefined;
-            var count: usize = 0;
-            for (entry.surfaces) |slot| {
-                if (slot) |s| {
-                    targets[count] = .{
-                        .target_id = s.target_id,
-                        .io = s.io,
-                        .mailbox = s.surface_mailbox,
-                    };
-                    count += 1;
-                }
-            }
-            entry.surfaces_mutex.unlock();
+    // Detach the entire SSH connection — all tabs and splits on this
+    // host. Delegates to SshConnectionManager.detachAll which marks
+    // each surface as detaching, sends close(detach) frames, and
+    // closes all surface mailboxes.
+    const remote = &self.io.backend.remote;
+    const entry = remote.conn_entry orelse {
+        self.close();
+        return true;
+    };
 
-            // Mark all surfaces as detaching so threadExit won't send
-            // surface_close (which would kill the daemon-side session).
-            // Then send detach frames and close all surfaces.
-            for (targets[0..count]) |t| {
-                t.io.backend.remote.detaching = true;
-                termio.SshConnectionManager.enqueueWrite(entry, .detach, t.target_id, "");
-                _ = t.mailbox.push(.close, .{ .forever = {} });
-            }
-            return true;
-        },
-        .reconnect => {
-            const remote = &self.io.backend.remote;
-            if (remote.conn_entry) |entry| {
-                termio.SshConnectionManager.requestReconnect(entry);
-                return true;
-            }
-            return false;
-        },
-    }
+    termio.SshConnectionManager.detachAll(entry);
+    return true;
 }
 
 /// Forces the surface to render. This is useful for when the surface
@@ -1065,18 +1027,21 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     // Update local slot label for reconnect
                     termio.SshConnectionManager.updateSurfaceLabel(entry, remote.target_id, slice);
 
-                    // Send session_rename frame to daemon.
-                    // Payload: [16 bytes group_id][N bytes label].
-                    var buf: [16 + 256]u8 = undefined;
-                    @memcpy(buf[0..16], &remote.group_id);
+                    // Send rename frame to daemon.
                     const label_len = @min(slice.len, 256);
-                    @memcpy(buf[16..][0..label_len], slice[0..label_len]);
-                    termio.SshConnectionManager.enqueueWrite(
-                        entry,
-                        .session_rename,
-                        remote.target_id,
-                        buf[0 .. 16 + label_len],
-                    );
+                    if ((session.protocol.Rename{
+                        .scope = .group,
+                        .id = remote.ssh_ctx.group_id,
+                        .label = slice[0..label_len],
+                    }).encode(entry.alloc)) |rename_payload| {
+                        defer entry.alloc.free(rename_payload);
+                        termio.SshConnectionManager.enqueueWrite(
+                            entry,
+                            .rename,
+                            remote.target_id,
+                            rename_payload,
+                        );
+                    } else |_| {}
                 }
             }
         },
@@ -1286,13 +1251,25 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             ) catch {};
         },
 
+        .remote_opened => |ro| {
+            if (self.io.backend == .remote) {
+                self.io.backend.remote.ssh_ctx.group_id = ro.group_id;
+                if (!session.shared.isZeroUuid(ro.surface_id)) {
+                    self.io.backend.remote.ssh_ctx.surface_id = ro.surface_id;
+                }
+            }
+        },
+
         .layout_restore => |lr| {
-            // Store blob for the apprt handler to consume, then trigger action.
+            // Store blob + daemon IDs for the apprt handler to consume.
             self.pending_layout_restore = lr.slice();
+            self.pending_layout_group_id = lr.group_id;
+            self.pending_layout_surface_id = lr.surface_id;
             defer {
-                // Free the blob after the action handler has consumed it
                 lr.deinit();
                 self.pending_layout_restore = null;
+                self.pending_layout_group_id = session.shared.zero_uuid;
+                self.pending_layout_surface_id = session.shared.zero_uuid;
             }
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -1449,7 +1426,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
-        .remote => |*remote| &.{remote.ssh_target},
+        .remote => |*remote| &.{remote.ssh_ctx.target},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -5941,9 +5918,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .ssh_session_detach => return sendSessionControl(self, .detach),
+        .ssh_session_detach => return sendDetach(self),
 
-        .ssh_session_reconnect => return sendSessionControl(self, .reconnect),
+        .ssh_session_reconnect => {
+            if (!isRemoteSurface(self)) return false;
+            const remote = &self.io.backend.remote;
+            if (remote.conn_entry) |entry| {
+                termio.SshConnectionManager.requestReconnect(entry);
+                return true;
+            }
+            return false;
+        },
 
         .toggle_background_opacity => return try self.rt_app.performAction(
             .{ .surface = self },

@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const session = @import("../session.zig");
+const page_diff = session.page_diff;
 const ssh = session.ssh;
 const termio = @import("../termio.zig");
 const apprt = @import("../apprt.zig");
@@ -17,7 +18,7 @@ const config = @import("../config.zig").Config;
 
 const log = std.log.scoped(.ssh_connection_manager);
 
-pub const MAX_SURFACES: usize = 64;
+pub const max_surfaces: usize = 64;
 
 mutex: std.Thread.Mutex = .{},
 connections: std.StringArrayHashMap(Entry),
@@ -40,10 +41,10 @@ pub const SurfaceSlot = struct {
 pub const WriteRequest = struct {
     kind: session.protocol.Kind,
     target_id: u16,
-    data: []const u8, // owned by page_allocator, freed after send
+    data: []const u8, // owned by entry allocator, freed after send
 };
 
-pub const ConnState = enum(u8) {
+pub const EntryState = enum(u8) {
     uninitialized,
     connecting,
     ready,
@@ -51,6 +52,7 @@ pub const ConnState = enum(u8) {
 };
 
 pub const Entry = struct {
+    alloc: Allocator,
     ctx: session.client.SshContext,
     helper_path: []const u8,
     ref_count: u32,
@@ -59,13 +61,12 @@ pub const Entry = struct {
     /// Next target ID to assign for multiplexing.
     next_target: u16 = 1,
 
-    // -- SSH thread fields --
     ssh_thread: ?std.Thread = null,
     quit_pipe: [2]posix.fd_t = .{ -1, -1 },
     write_pipe: [2]posix.fd_t = .{ -1, -1 },
 
     // Registered surfaces for frame dispatch
-    surfaces: [MAX_SURFACES]?SurfaceSlot = [_]?SurfaceSlot{null} ** MAX_SURFACES,
+    surfaces: [max_surfaces]?SurfaceSlot = [_]?SurfaceSlot{null} ** max_surfaces,
     surfaces_mutex: std.Thread.Mutex = .{},
 
     // Write queue (thread-safe)
@@ -73,11 +74,11 @@ pub const Entry = struct {
     write_queue: std.ArrayList(WriteRequest) = .empty,
 
     // Connection state for race prevention between surfaces
-    conn_state: std.atomic.Value(ConnState) = .{ .raw = .uninitialized },
+    conn_state: std.atomic.Value(EntryState) = .{ .raw = .uninitialized },
 
     // Keepalive tracking (written/read only by the SSH thread)
     last_keepalive_received: i128 = 0,
-    /// Set to true after receiving the first keepalive from the remote.
+    /// Set to true after receiving the first pong from the remote.
     /// Stale detection is only active when this is true, ensuring backward
     /// compatibility with old helpers that don't support keepalive.
     keepalive_active: bool = false,
@@ -100,14 +101,7 @@ pub const Entry = struct {
     // Session list query state (set by requester, collected by SSH thread)
     session_list: SessionListState = .{},
 
-    pub const AuthState = struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
-        /// Password provided by the GTK thread. null = not yet provided.
-        password: ?[]const u8 = null,
-        /// True if the user cancelled the password prompt.
-        cancelled: bool = false,
-    };
+    pub const AuthState = session.shared.AuthState;
 
     pub const SessionListState = struct {
         mutex: std.Thread.Mutex = .{},
@@ -135,9 +129,9 @@ pub fn deinit(self: *SshConnectionManager) void {
         if (entry.value_ptr.helper_path.len > 0) self.alloc.free(entry.value_ptr.helper_path);
         if (entry.value_ptr.channel) |*ch| ch.close();
         for (entry.value_ptr.write_queue.items) |req| {
-            std.heap.page_allocator.free(req.data);
+            entry.value_ptr.alloc.free(req.data);
         }
-        entry.value_ptr.write_queue.deinit(std.heap.page_allocator);
+        entry.value_ptr.write_queue.deinit(entry.value_ptr.alloc);
         entry.value_ptr.ctx.deinit();
     }
     self.connections.deinit();
@@ -180,6 +174,7 @@ pub fn acquire(
     }
 
     const entry: Entry = .{
+        .alloc = self.alloc,
         .ctx = .{
             .alloc = self.alloc,
             .ssh_target = ssh_target,
@@ -215,7 +210,7 @@ pub fn registerSurface(
     initial_label: ?[]const u8,
 ) bool {
     const owned_label = if (initial_label) |l|
-        (std.heap.page_allocator.dupe(u8, l) catch null)
+        (entry.alloc.dupe(u8, l) catch null)
     else
         null;
 
@@ -234,27 +229,27 @@ pub fn registerSurface(
             return true;
         }
     }
-    if (owned_label) |l| std.heap.page_allocator.free(l);
-    log.err("max surfaces ({d}) exceeded for SSH connection", .{MAX_SURFACES});
+    if (owned_label) |l| entry.alloc.free(l);
+    log.err("max surfaces ({d}) exceeded for SSH connection", .{max_surfaces});
     return false;
 }
 
 /// Update the label for a registered surface (e.g. after a title change).
 /// The new label is duplicated; the old one is freed.
 pub fn updateSurfaceLabel(entry: *Entry, target_id: u16, new_label: []const u8) void {
-    const owned = std.heap.page_allocator.dupe(u8, new_label) catch return;
+    const owned = entry.alloc.dupe(u8, new_label) catch return;
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
     for (&entry.surfaces) |*slot| {
         if (slot.*) |*s| {
             if (s.target_id == target_id) {
-                if (s.label) |old| std.heap.page_allocator.free(old);
+                if (s.label) |old| entry.alloc.free(old);
                 s.label = owned;
                 return;
             }
         }
     }
-    std.heap.page_allocator.free(owned);
+    entry.alloc.free(owned);
 }
 
 /// Update the group_id for a registered surface (e.g. after group creation).
@@ -279,7 +274,7 @@ pub fn unregisterSurface(entry: *Entry, target_id: u16) void {
     for (&entry.surfaces) |*slot| {
         if (slot.*) |s| {
             if (s.target_id == target_id) {
-                if (s.label) |l| std.heap.page_allocator.free(l);
+                if (s.label) |l| entry.alloc.free(l);
                 slot.* = null;
                 return;
             }
@@ -290,7 +285,7 @@ pub fn unregisterSurface(entry: *Entry, target_id: u16) void {
 /// Enqueue a write request for the SSH thread to send.
 /// The data is duplicated internally; the caller retains ownership of the input.
 pub fn enqueueWrite(entry: *Entry, kind: session.protocol.Kind, target_id: u16, data: []const u8) void {
-    const alloc = std.heap.page_allocator;
+    const alloc = entry.alloc;
     const owned_data = alloc.dupe(u8, data) catch return;
 
     entry.write_queue_mu.lock();
@@ -319,8 +314,22 @@ pub fn enqueueWrite(entry: *Entry, kind: session.protocol.Kind, target_id: u16, 
     _ = posix.write(entry.write_pipe[1], "w") catch {};
 }
 
+/// Detach all surfaces on this entry. Marks each as detaching, sends
+/// close(detach) frames, and closes all surface mailboxes.
+pub fn detachAll(entry: *Entry) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    for (&entry.surfaces) |*slot| {
+        if (slot.*) |s| {
+            s.io.backend.remote.detaching = true;
+            enqueueWrite(entry, .close, s.target_id, &.{@intFromEnum(session.protocol.CloseMode.detach)});
+            _ = s.surface_mailbox.push(.close, .{ .forever = {} });
+        }
+    }
+}
+
 /// Query available sessions on the remote host via the existing multiplexed
-/// connection. Sends a session_list_request frame and collects session_list_entry
+/// connection. Sends a list_request frame and collects list_response
 /// responses. Returns the raw text (newline-delimited). Caller owns the result.
 /// Times out after `timeout_ms`. Returns null on timeout or if no connection.
 pub fn querySessions(entry: *Entry, alloc: Allocator, timeout_ms: u64) ?[]const u8 {
@@ -334,7 +343,7 @@ pub fn querySessions(entry: *Entry, alloc: Allocator, timeout_ms: u64) ?[]const 
     state.mutex.unlock();
 
     // Send the request through the write queue
-    enqueueWrite(entry, .session_list_request, 0, "");
+    enqueueWrite(entry, .list_request, 0, "");
 
     // Wait for responses with timeout. The multiplexer sends all entries
     // synchronously, so we wait for a brief quiet period after the last entry.
@@ -401,14 +410,14 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
 
         // Clean up remaining write queue
         for (entry.write_queue.items) |req| {
-            std.heap.page_allocator.free(req.data);
+            entry.alloc.free(req.data);
         }
-        entry.write_queue.deinit(std.heap.page_allocator);
+        entry.write_queue.deinit(entry.alloc);
 
         // Zero and free password if one was provided
         if (entry.auth_state.password) |pw| {
             @memset(@constCast(pw), 0);
-            std.heap.page_allocator.free(pw);
+            entry.alloc.free(pw);
             entry.auth_state.password = null;
         }
 
@@ -421,11 +430,8 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
     }
 }
 
-// =========================================================================
 // SSH thread — exclusively owns all libssh2 calls for one connection.
 // Modeled after Exec.ReadThread: blocks in posix.poll when idle, zero CPU.
-// =========================================================================
-
 pub fn sshThreadMain(entry: *Entry) void {
 
     // Close read ends of pipes on exit
@@ -448,12 +454,12 @@ pub fn sshThreadMain(entry: *Entry) void {
     };
 
     var frame_buf: std.ArrayList(u8) = .empty;
-    defer frame_buf.deinit(std.heap.page_allocator);
+    defer frame_buf.deinit(entry.alloc);
 
     var read_buf: [4096]u8 = undefined;
 
     // Keepalive state.
-    // Stale detection only activates after receiving the first keepalive
+    // Stale detection only activates after receiving the first pong
     // from the remote (entry.keepalive_active). This ensures backward
     // compatibility with old helpers that don't support keepalive.
     const now_init = std.time.nanoTimestamp();
@@ -470,7 +476,7 @@ pub fn sshThreadMain(entry: *Entry) void {
             const rc = channel.readNonBlock(&read_buf);
             if (rc > 0) {
                 frame_buf.appendSlice(
-                    std.heap.page_allocator,
+                    entry.alloc,
                     read_buf[0..@intCast(rc)],
                 ) catch break;
             } else break;
@@ -493,7 +499,7 @@ pub fn sshThreadMain(entry: *Entry) void {
                 sendFrame(channel, req.kind, req.target_id, req.data) catch |err| {
                     log.warn("ssh write failed: {}", .{err});
                 };
-                std.heap.page_allocator.free(req.data);
+                entry.alloc.free(req.data);
             }
             entry.write_queue.clearRetainingCapacity();
             entry.write_queue_mu.unlock();
@@ -502,13 +508,11 @@ pub fn sshThreadMain(entry: *Entry) void {
         // Drain write pipe notification bytes
         drainPipe(entry.write_pipe[0]);
 
-        // 4. Keepalive: send if interval elapsed, detect stale
+        // 4. Keepalive: send ping if interval elapsed, detect stale via pong
         const now = std.time.nanoTimestamp();
         if (now - last_keepalive_sent >= session.protocol.keepalive_interval_ns) {
-            var ts_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &ts_buf, @intCast(@as(u128, @bitCast(now)) & 0xFFFFFFFFFFFFFFFF), .little);
-            sendFrame(channel, .keepalive, 0, &ts_buf) catch |err| {
-                log.warn("keepalive send failed: {}", .{err});
+            sendFrame(channel, .ping, 0, "") catch |err| {
+                log.warn("ping send failed: {}", .{err});
             };
             last_keepalive_sent = now;
         }
@@ -516,7 +520,7 @@ pub fn sshThreadMain(entry: *Entry) void {
         if (entry.keepalive_active and
             now - entry.last_keepalive_received > session.protocol.keepalive_stale_ns)
         {
-            log.warn("ssh connection stale (no keepalive for {d}s)", .{
+            log.warn("ssh connection stale (no pong for {d}s)", .{
                 @as(i64, @intCast(@divFloor(now - entry.last_keepalive_received, std.time.ns_per_s))),
             });
             // Attempt reconnection
@@ -544,7 +548,7 @@ pub fn sshThreadMain(entry: *Entry) void {
         pollfds[0].events = posix.POLL.IN;
         if (sess.needsWrite()) pollfds[0].events |= posix.POLL.OUT;
 
-        // 6. Compute poll timeout: wake up in time to send the next keepalive
+        // 6. Compute poll timeout: wake up in time to send the next ping
         const elapsed_since_send = now - last_keepalive_sent;
         const remaining_ns = session.protocol.keepalive_interval_ns - elapsed_since_send;
         const timeout_ms: i32 = if (remaining_ns <= 0)
@@ -561,6 +565,24 @@ pub fn sshThreadMain(entry: *Entry) void {
         // 8. Check quit pipe
         if (pollfds[1].revents & posix.POLL.IN != 0) {
             log.info("ssh thread got quit signal", .{});
+            // Drain write queue one final time so close frames are sent
+            entry.write_queue_mu.lock();
+            for (entry.write_queue.items) |req| {
+                sendFrame(channel, req.kind, req.target_id, req.data) catch |err| {
+                    log.warn("final write failed: {}", .{err});
+                };
+                entry.alloc.free(req.data);
+            }
+            entry.write_queue.clearRetainingCapacity();
+            entry.write_queue_mu.unlock();
+
+            // Flush SSH transport so close frames reach the remote.
+            // In non-blocking mode, channel.write() may leave data in
+            // libssh2's internal buffer. Switch to blocking and poll
+            // until the transport has no more outbound data.
+            sess.setBlocking(1);
+            sess.pollTransport(500);
+
             return;
         }
     }
@@ -712,7 +734,7 @@ fn attemptReconnect(entry: *Entry) bool {
 /// Re-open sessions for registered surfaces using their stable IDs after reconnect.
 fn reopenSurfaces(entry: *Entry) void {
     entry.surfaces_mutex.lock();
-    var group_sent = std.AutoArrayHashMap(session.shared.Uuid, void).init(std.heap.page_allocator);
+    var group_sent = std.AutoArrayHashMap(session.shared.Uuid, void).init(entry.alloc);
     defer group_sent.deinit();
     for (entry.surfaces) |slot| {
         if (slot) |s| {
@@ -721,15 +743,15 @@ fn reopenSurfaces(entry: *Entry) void {
                 group_sent.put(s.group_id, {}) catch continue;
             }
 
-            const open_payload = (session.protocol.SessionOpen{
+            const open_payload = (session.protocol.Open{
+                .open_type = .session_attach,
                 .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
-                .mode = .attach,
                 .surface_id = s.surface_id,
                 .group_id = s.group_id,
                 .label = s.label orelse "reconnected",
-            }).encode(std.heap.page_allocator) catch continue;
-            defer std.heap.page_allocator.free(open_payload);
-            sendFrame(&entry.channel.?, .session_open, s.target_id, open_payload) catch {
+            }).encode(entry.alloc) catch continue;
+            defer entry.alloc.free(open_payload);
+            sendFrame(&entry.channel.?, .open, s.target_id, open_payload) catch {
                 log.warn("reconnect: failed to re-open surface target={d}", .{s.target_id});
                 _ = s.surface_mailbox.push(.{
                     .child_exited = .{ .exit_code = 1, .runtime_ms = 0 },
@@ -743,7 +765,7 @@ fn reopenSurfaces(entry: *Entry) void {
 /// Try to open a multiplexed channel, restarting the daemon if needed.
 /// Copies helper_path under surfaces_mutex to avoid racing with setupConnection.
 fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
-    const alloc = std.heap.page_allocator;
+    const alloc = entry.alloc;
 
     // Copy helper_path under mutex — setupConnection writes it from another thread.
     entry.surfaces_mutex.lock();
@@ -765,18 +787,6 @@ fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     return session.client.openMultiplexChannel(alloc, &entry.ctx, helper_path) catch null;
 }
 
-fn notifyAllSurfacesStale(entry: *Entry) void {
-    entry.surfaces_mutex.lock();
-    defer entry.surfaces_mutex.unlock();
-    for (entry.surfaces) |slot| {
-        if (slot) |s| {
-            _ = s.surface_mailbox.push(.{
-                .connection_state = .stale,
-            }, .{ .forever = {} });
-        }
-    }
-}
-
 fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
     while (frame_buf.items.len >= session.protocol.header_size) {
         const kind_byte = frame_buf.items[0];
@@ -791,24 +801,20 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
         };
         const payload = frame_buf.items[session.protocol.header_size..total];
 
-        // Handle keepalive: update timestamp, don't dispatch to surfaces
-        if (kind == .keepalive) {
+        // Handle pong: update timestamp, don't dispatch to surfaces
+        if (kind == .pong) {
             entry.last_keepalive_received = std.time.nanoTimestamp();
             entry.keepalive_active = true;
             shiftBuffer(frame_buf, total);
             continue;
         }
 
-        // Collect session_list_entry frames into the query buffer
-        if (kind == .session_list_entry) {
+        // Collect list_response frames into the query buffer
+        if (kind == .list_response) {
             entry.session_list.mutex.lock();
             if (entry.session_list.active) {
-                entry.session_list.buf.appendSlice(std.heap.page_allocator, payload) catch {};
-                entry.session_list.buf.append(std.heap.page_allocator, '\n') catch {};
-                // The multiplexer sends all entries then closes the internal
-                // socket, producing no explicit "end" marker. We signal done
-                // after a short delay in the main loop. For now, signal on
-                // each entry so the waiter can poll.
+                entry.session_list.buf.appendSlice(entry.alloc, payload) catch {};
+                entry.session_list.buf.append(entry.alloc, '\n') catch {};
                 entry.session_list.cond.signal();
             }
             entry.session_list.mutex.unlock();
@@ -821,12 +827,12 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
         entry.surfaces_mutex.lock();
         if (frame_target == 0) {
             // Broadcast to all surfaces
-            for (entry.surfaces) |slot| {
-                if (slot) |s| dispatchFrame(kind, s, payload);
+            for (&entry.surfaces) |*slot| {
+                if (slot.*) |_| dispatchFrame(kind, slot, payload);
             }
         } else {
-            if (findSurface(entry, frame_target)) |s| {
-                dispatchFrame(kind, s, payload);
+            if (findSurfacePtr(entry, frame_target)) |slot| {
+                dispatchFrame(kind, slot, payload);
             }
         }
         entry.surfaces_mutex.unlock();
@@ -835,22 +841,102 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
     }
 }
 
-fn dispatchFrame(kind: session.protocol.Kind, slot: SurfaceSlot, payload: []const u8) void {
+fn dispatchFrame(kind: session.protocol.Kind, slot: *?SurfaceSlot, payload: []const u8) void {
+    const s = slot.* orelse return;
     switch (kind) {
-        .stdout, .state_full => {
-            @call(.always_inline, termio.Termio.processOutput, .{ slot.io, payload });
+        .data_out => {
+            @call(.always_inline, termio.Termio.processOutput, .{ s.io, payload });
         },
-        .session_opened => {
-            log.info("remote session opened id={s}", .{payload});
-        },
-        .layout_restore => {
-            log.info("received layout_restore blob len={d}", .{payload.len});
-            // Copy blob to heap and send to surface for tree recreation
-            const blob_copy = std.heap.page_allocator.dupe(u8, payload) catch {
-                log.err("failed to allocate layout_restore blob", .{});
+        .opened => {
+            // Parse the bundled opened response
+            const parsed = session.protocol.Opened.parseHeader(payload) catch {
+                log.warn("opened: invalid payload", .{});
                 return;
             };
-            _ = slot.surface_mailbox.push(.{
+            log.info("remote session opened history_rows={d}", .{parsed.history_rows});
+
+            // Update IDs in the slot (surfaces_mutex is held by caller).
+            slot.*.?.group_id = parsed.group_id;
+            if (!session.shared.isZeroUuid(parsed.surface_id)) {
+                slot.*.?.surface_id = parsed.surface_id;
+            }
+
+            // Send IDs to GTK thread via mailbox so it can update ssh_ctx
+            // without racing this (SSH) thread. All GTK-thread readers see
+            // the update before any subsequent messages (data_out,
+            // layout_restore) because the mailbox is FIFO.
+            _ = s.surface_mailbox.push(.{
+                .remote_opened = .{
+                    .group_id = parsed.group_id,
+                    .surface_id = parsed.surface_id,
+                },
+            }, .{ .forever = {} });
+
+            // Pre-allocate blank history pages for scrollback restore
+            if (parsed.history_rows > 0) {
+                s.io.renderer_state.mutex.lock();
+                defer s.io.renderer_state.mutex.unlock();
+                const t = s.io.renderer_state.terminal;
+                t.screens.active.pages.prependBlankPages(parsed.history_rows) catch |err| {
+                    log.warn("failed to prepend history pages: {}", .{err});
+                };
+            }
+
+            // If layout blob is included, send it to surface for tree recreation.
+            // Bundle group_id/surface_id in the message to avoid a race:
+            // the GTK thread must not read these from the Remote backend
+            // since we just wrote them on this (SSH) thread.
+            if (parsed.layout_blob) |layout_blob| {
+                log.info("received layout blob in opened response len={d}", .{layout_blob.len});
+                const blob_copy = std.heap.page_allocator.dupe(u8, layout_blob) catch {
+                    log.err("failed to allocate layout blob", .{});
+                    return;
+                };
+                _ = s.surface_mailbox.push(.{
+                    .layout_restore = .{
+                        .blob = blob_copy.ptr,
+                        .len = @intCast(blob_copy.len),
+                        .group_id = parsed.group_id,
+                        .surface_id = parsed.surface_id,
+                    },
+                }, .{ .forever = {} });
+            }
+        },
+        .scrollback_response => {
+            // Parse scrollback chunk header
+            const resp = session.protocol.ScrollbackResponse.parse(payload) catch {
+                log.warn("scrollback_response: invalid payload", .{});
+                return;
+            };
+
+            // row_count == 0 is the done marker
+            if (resp.row_count == 0) {
+                log.info("scrollback restore complete ({d} history rows)", .{resp.total_history_rows});
+                return;
+            }
+
+            // Apply the chunk to the client's terminal
+            s.io.renderer_state.mutex.lock();
+            defer s.io.renderer_state.mutex.unlock();
+            const t = s.io.renderer_state.terminal;
+
+            page_diff.applyScrollbackChunk(
+                t,
+                resp.chunk_start_row,
+                resp.row_count,
+                resp.chunk_data,
+            );
+        },
+        .layout => {
+            log.info("received layout blob len={d}", .{payload.len});
+            // page_allocator is used intentionally: this blob crosses thread
+            // boundaries via the surface mailbox. The receiver (GTK thread)
+            // frees it and does not have access to entry.alloc.
+            const blob_copy = std.heap.page_allocator.dupe(u8, payload) catch {
+                log.err("failed to allocate layout blob", .{});
+                return;
+            };
+            _ = s.surface_mailbox.push(.{
                 .layout_restore = .{
                     .blob = blob_copy.ptr,
                     .len = @intCast(blob_copy.len),
@@ -860,8 +946,8 @@ fn dispatchFrame(kind: session.protocol.Kind, slot: SurfaceSlot, payload: []cons
         .info => log.info("remote info: {s}", .{payload}),
         .err => log.err("remote error: {s}", .{payload}),
         .eof => {
-            log.info("remote session EOF target={d}", .{slot.target_id});
-            _ = slot.surface_mailbox.push(.{
+            log.info("remote session EOF target={d}", .{s.target_id});
+            _ = s.surface_mailbox.push(.{
                 .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
             }, .{ .forever = {} });
         },
@@ -878,27 +964,27 @@ fn findSurface(entry: *const Entry, target_id: u16) ?SurfaceSlot {
     return null;
 }
 
-// -- Protocol helpers --
+fn findSurfacePtr(entry: *Entry, target_id: u16) ?*?SurfaceSlot {
+    for (&entry.surfaces) |*slot| {
+        if (slot.*) |s| {
+            if (s.target_id == target_id) return slot;
+        }
+    }
+    return null;
+}
 
 fn sendFrame(channel: *ssh.Channel, kind: session.protocol.Kind, target: u16, data: []const u8) !void {
     if (data.len > session.protocol.max_payload) return error.PayloadTooLarge;
-    var header: [session.protocol.header_size]u8 = undefined;
-    header[0] = @intFromEnum(kind);
-    header[1] = 0; // reserved
-    std.mem.writeInt(u16, header[2..4], target, .little);
-    std.mem.writeInt(u32, header[4..8], @intCast(data.len), .little);
+    const header = (session.protocol.Header{
+        .kind = kind,
+        .target = target,
+        .len = @intCast(data.len),
+    }).encodeToBuf();
     try channel.write(&header);
     if (data.len > 0) try channel.write(data);
 }
 
-fn shiftBuffer(buf: *std.ArrayList(u8), amount: usize) void {
-    if (amount >= buf.items.len) {
-        buf.shrinkRetainingCapacity(0);
-    } else {
-        std.mem.copyForwards(u8, buf.items, buf.items[amount..]);
-        buf.shrinkRetainingCapacity(buf.items.len - amount);
-    }
-}
+const shiftBuffer = session.shared.shiftBuffer;
 
 fn setNonBlocking(fd: posix.fd_t) void {
     const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
@@ -912,9 +998,7 @@ fn drainPipe(fd: posix.fd_t) void {
     }
 }
 
-// =========================================================================
 // Public reconnect/cancel API — called from the GTK thread.
-// =========================================================================
 
 /// Signal the SSH thread to (re-)attempt reconnection.
 /// Works during backoff wait ("Retry Now") and after exhaustion ("Reconnect").

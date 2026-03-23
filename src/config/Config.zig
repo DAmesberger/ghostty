@@ -1214,16 +1214,6 @@ command: ?Command = null,
 /// sends a snapshot of the current terminal state.
 @"ssh-session": ?[]const u8 = null,
 
-/// Internal: group UUID inherited from parent surface for splits.
-/// Not user-facing. Set automatically when creating split surfaces
-/// from an SSH remote session.
-@"ssh-group-id": ?[]const u8 = null,
-
-/// Internal: surface UUID for layout restore. When reconnecting to a
-/// remote session, each surface needs a specific UUID to reattach to
-/// the correct daemon-side PTY.
-@"ssh-surface-id": ?[]const u8 = null,
-
 /// Maximum number of automatic reconnect attempts after an SSH
 /// disconnect (e.g. laptop sleep). Once exhausted, the overlay shows
 /// Reconnect/Exit buttons for manual retry. Set to 0 to disable
@@ -3848,6 +3838,16 @@ _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
 
 /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
 @"_xdg-terminal-exec": bool = false,
+
+/// Internal: group UUID inherited from parent surface for splits.
+/// Not user-facing. Set automatically when creating split surfaces
+/// from an SSH remote session.
+@"_ssh-group-id": ?[]const u8 = null,
+
+/// Internal: surface UUID for layout restore. When reconnecting to a
+/// remote session, each surface needs a specific UUID to reattach to
+/// the correct daemon-side PTY.
+@"_ssh-surface-id": ?[]const u8 = null,
 
 pub fn deinit(self: *Config) void {
     if (self._arena) |arena| arena.deinit();

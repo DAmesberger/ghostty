@@ -37,6 +37,7 @@ const Window = @import("window.zig").Window;
 const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 const i18n = @import("../../../os/i18n.zig");
 const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
+const session = @import("../../../session.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -648,10 +649,10 @@ pub const Surface = extern struct {
         /// True when the child has exited.
         child_exited: bool = false,
 
-        /// Opaque pointer to SshConnectionManager.AuthState for password prompts.
+        /// Typed pointer to shared AuthState for password prompts.
         /// Set when the connection overlay shows a password prompt, cleared after
         /// the user submits or cancels.
-        pending_auth_state: ?*anyopaque = null,
+        pending_auth_state: ?*session.shared.AuthState = null,
 
         /// GLib timer source ID for the reconnect countdown (1-second tick).
         countdown_timer: c_uint = 0,
@@ -726,9 +727,9 @@ pub const Surface = extern struct {
         overrides: struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
-            ssh_surface_id: ?[]const u8 = null,
-            ssh_target: ?[]const u8 = null,
-            ssh_session: ?[]const u8 = null,
+            /// SSH connection context for remote surfaces. Carries binary
+            /// UUIDs directly — no string roundtrip through config fields.
+            ssh_ctx: ?session.shared.SshConnectionContext = null,
 
             pub const none: @This() = .{};
         } = .none,
@@ -740,9 +741,7 @@ pub const Surface = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
-        ssh_surface_id: ?[]const u8 = null,
-        ssh_target: ?[]const u8 = null,
-        ssh_session: ?[]const u8 = null,
+        ssh_ctx: ?session.shared.SshConnectionContext = null,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -751,12 +750,11 @@ pub const Surface = extern struct {
         });
         const alloc = Application.default().allocator();
         const priv: *Private = self.private();
+
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
-            .ssh_surface_id = if (overrides.ssh_surface_id) |sid| alloc.dupe(u8, sid) catch null else null,
-            .ssh_target = if (overrides.ssh_target) |t| alloc.dupe(u8, t) catch null else null,
-            .ssh_session = if (overrides.ssh_session) |s| alloc.dupe(u8, s) catch null else null,
+            .ssh_ctx = if (overrides.ssh_ctx) |ctx| ctx.dupe(alloc) catch null else null,
         };
         return self;
     }
@@ -918,6 +916,15 @@ pub const Surface = extern struct {
         if (priv.inspector) |v| v.queueRender();
     }
 
+    /// Reset all overlay properties to their default (hidden) state.
+    fn resetOverlayDefaults(overlay: *ConnectionOverlay) void {
+        overlay.setShowPassword(false);
+        overlay.setShowProgress(false);
+        overlay.setActionButton(null);
+        overlay.setReconnectButton(null);
+        overlay.setDisconnected(false);
+    }
+
     /// Update the connection overlay from a connection state message.
     /// Called on the GTK main thread when the core surface receives
     /// a connection_state message from the termio backend.
@@ -934,30 +941,19 @@ pub const Surface = extern struct {
         const s = state orelse {
             // null = connected/dismissed
             priv.pending_auth_state = null;
+            resetOverlayDefaults(overlay);
             overlay.setStatus(null);
-            overlay.setShowProgress(false);
-            overlay.setShowPassword(false);
-            overlay.setActionButton(null);
-            overlay.setReconnectButton(null);
-            overlay.setDisconnected(false);
             return;
         };
 
         switch (s) {
             .connecting => {
-                overlay.setShowPassword(false);
-                overlay.setShowProgress(false);
-                overlay.setActionButton(null);
-                overlay.setReconnectButton(null);
-                overlay.setDisconnected(false);
+                resetOverlayDefaults(overlay);
                 overlay.setStatus("Connecting\xe2\x80\xa6");
             },
             .uploading => |progress| {
-                overlay.setShowPassword(false);
+                resetOverlayDefaults(overlay);
                 overlay.setShowProgress(true);
-                overlay.setActionButton(null);
-                overlay.setReconnectButton(null);
-                overlay.setDisconnected(false);
                 if (progress.total_bytes > 0) {
                     const frac: f64 = @as(f64, @floatFromInt(progress.bytes_sent)) /
                         @as(f64, @floatFromInt(progress.total_bytes));
@@ -968,28 +964,18 @@ pub const Surface = extern struct {
                 overlay.setStatus("Uploading Ghostty\xe2\x80\xa6");
             },
             .setup => {
-                overlay.setShowPassword(false);
-                overlay.setShowProgress(false);
-                overlay.setActionButton(null);
-                overlay.setReconnectButton(null);
-                overlay.setDisconnected(false);
+                resetOverlayDefaults(overlay);
                 overlay.setStatus("Starting remote daemon\xe2\x80\xa6");
             },
             .connected => {
-                priv.pending_auth_state = null;
+                cancelPendingAuth(priv);
+                resetOverlayDefaults(overlay);
                 overlay.setStatus(null);
-                overlay.setShowProgress(false);
-                overlay.setShowPassword(false);
-                overlay.setActionButton(null);
-                overlay.setReconnectButton(null);
-                overlay.setDisconnected(false);
                 // Trigger subtitle re-evaluation now that remote info is available.
                 self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
             },
             .reconnecting => |info| {
-                overlay.setShowPassword(false);
-                overlay.setShowProgress(false);
-                overlay.setDisconnected(false);
+                resetOverlayDefaults(overlay);
                 var buf: [128:0]u8 = @splat(0);
 
                 if (info.next_retry_ns == 0) {
@@ -1012,18 +998,12 @@ pub const Surface = extern struct {
                 }
             },
             .stale => {
-                overlay.setShowPassword(false);
-                overlay.setShowProgress(false);
-                overlay.setActionButton(null);
-                overlay.setReconnectButton(null);
-                overlay.setDisconnected(false);
+                resetOverlayDefaults(overlay);
                 overlay.setStatus("Connection stale");
             },
             .failed => |reason| {
-                priv.pending_auth_state = null;
-                overlay.setShowPassword(false);
-                overlay.setShowProgress(false);
-                overlay.setDisconnected(false);
+                cancelPendingAuth(priv);
+                resetOverlayDefaults(overlay);
                 const msg: [:0]const u8 = switch (reason) {
                     .auth_failed => "Authentication failed",
                     .timeout => "Connection timed out",
@@ -1035,9 +1015,8 @@ pub const Surface = extern struct {
                 overlay.setActionButton("Close");
             },
             .disconnected => |info| {
-                priv.pending_auth_state = null;
-                overlay.setShowPassword(false);
-                overlay.setShowProgress(false);
+                cancelPendingAuth(priv);
+                resetOverlayDefaults(overlay);
                 overlay.setDisconnected(true);
                 var buf: [128:0]u8 = @splat(0);
                 const msg: [:0]const u8 = switch (info.reason) {
@@ -1054,10 +1033,7 @@ pub const Surface = extern struct {
             },
             .password_required => |prompt| {
                 priv.pending_auth_state = prompt.auth_state;
-                overlay.setShowProgress(false);
-                overlay.setActionButton(null);
-                overlay.setReconnectButton(null);
-                overlay.setDisconnected(false);
+                resetOverlayDefaults(overlay);
                 overlay.setShowPassword(true);
                 overlay.setStatus("Enter password:");
             },
@@ -1116,8 +1092,7 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        const auth_ptr = priv.pending_auth_state orelse return;
-        const auth_state: *SshConnectionManager.Entry.AuthState = @ptrCast(@alignCast(auth_ptr));
+        const auth_state = priv.pending_auth_state orelse return;
 
         const password = if (text) |t| std.mem.span(t) else "";
         const owned = std.heap.page_allocator.dupe(u8, password) catch return;
@@ -1136,15 +1111,18 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        const auth_ptr = priv.pending_auth_state orelse return;
-        const auth_state: *SshConnectionManager.Entry.AuthState = @ptrCast(@alignCast(auth_ptr));
+        cancelPendingAuth(priv);
+    }
 
-        auth_state.mutex.lock();
-        auth_state.cancelled = true;
-        auth_state.cond.signal();
-        auth_state.mutex.unlock();
-
-        priv.pending_auth_state = null;
+    /// Safely cancel any pending password authentication and clean up.
+    fn cancelPendingAuth(priv: *Private) void {
+        if (priv.pending_auth_state) |auth| {
+            auth.mutex.lock();
+            auth.cancelled = true;
+            auth.cond.signal();
+            auth.mutex.unlock();
+            priv.pending_auth_state = null;
+        }
     }
 
     /// Called when the user clicks the action button on the connection overlay.
@@ -2266,17 +2244,10 @@ pub const Surface = extern struct {
             alloc.free(wd);
             priv.overrides.working_directory = null;
         }
-        if (priv.overrides.ssh_surface_id) |sid| {
-            alloc.free(sid);
-            priv.overrides.ssh_surface_id = null;
-        }
-        if (priv.overrides.ssh_target) |t| {
-            alloc.free(t);
-            priv.overrides.ssh_target = null;
-        }
-        if (priv.overrides.ssh_session) |s| {
-            alloc.free(s);
-            priv.overrides.ssh_session = null;
+        if (priv.overrides.ssh_ctx) |*ctx| {
+            var ssh_ctx = ctx.*;
+            ssh_ctx.deinit(alloc);
+            priv.overrides.ssh_ctx = null;
         }
 
         // Clean up key sequence and key table state
@@ -3733,14 +3704,8 @@ pub const Surface = extern struct {
             try wd_val.finalize(config_alloc);
             config.@"working-directory" = wd_val;
         }
-        if (priv.overrides.ssh_surface_id) |sid| {
-            config.@"ssh-surface-id" = try config.arenaAlloc().dupe(u8, sid);
-        }
-        if (priv.overrides.ssh_target) |t| {
-            config.@"ssh-target" = try config.arenaAlloc().dupe(u8, t);
-        }
-        if (priv.overrides.ssh_session) |s| {
-            config.@"ssh-session" = try config.arenaAlloc().dupe(u8, s);
+        if (priv.overrides.ssh_ctx) |ctx| {
+            try ctx.applyToConfig(&config);
         }
 
         // Properties that can impact surface init
@@ -3871,12 +3836,15 @@ pub const Surface = extern struct {
         if (core_surface.io.backend != .remote) return;
         const remote = &core_surface.io.backend.remote;
         const entry = remote.conn_entry orelse return;
-        // Payload: [16 bytes surface_id][N bytes label]
-        var buf: [16 + 256]u8 = undefined;
-        @memcpy(buf[0..16], &remote.surface_id);
         const label_len = @min(title.len, 256);
-        @memcpy(buf[16..][0..label_len], title[0..label_len]);
-        SshConnectionManager.enqueueWrite(entry, .surface_rename, remote.target_id, buf[0 .. 16 + label_len]);
+        if ((session.protocol.Rename{
+            .scope = .surface,
+            .id = remote.ssh_ctx.surface_id,
+            .label = title[0..label_len],
+        }).encode(entry.alloc)) |rename_payload| {
+            defer entry.alloc.free(rename_payload);
+            SshConnectionManager.enqueueWrite(entry, .rename, remote.target_id, rename_payload);
+        } else |_| {}
     }
 
     fn searchStop(_: *SearchOverlay, self: *Self) callconv(.c) void {
