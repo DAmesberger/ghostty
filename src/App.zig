@@ -108,8 +108,22 @@ pub fn init(
 }
 
 pub fn deinit(self: *App) void {
-    // Clean up all our surfaces
-    for (self.surfaces.items) |surface| surface.deinit();
+    // Clean up all our surfaces.
+    // The apprt deinit is called first (may be a no-op for some runtimes),
+    // then we force-deinit any core surfaces whose apprt finalization
+    // hasn't completed yet. This ensures font grids are always deref'd
+    // before we check the count below.
+    for (self.surfaces.items) |surface| {
+        surface.deinit();
+        // If the apprt hasn't finalized the surface yet (e.g. GTK defers
+        // GObject finalization), force-deinit the core surface now so that
+        // font grids are properly deref'd before we check the count below.
+        if (surface.gobj().core()) |core| {
+            core.deinit();
+            self.alloc.destroy(core);
+            surface.gobj().clearCore();
+        }
+    }
     self.surfaces.deinit(self.alloc);
 
     // Clean up our font group cache

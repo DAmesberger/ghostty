@@ -801,6 +801,12 @@ typedef enum {
   GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT,
 } ghostty_action_close_tab_mode_e;
 
+// apprt.action.SshSessionMode
+typedef enum {
+  GHOSTTY_ACTION_SSH_SESSION_MODE_NEW_WINDOW,
+  GHOSTTY_ACTION_SSH_SESSION_MODE_NEW_TAB,
+} ghostty_action_ssh_session_mode_e;
+
 // apprt.surface.Message.ChildExited
 typedef struct {
   uint32_t exit_code;
@@ -923,7 +929,7 @@ typedef enum {
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_RESTORE_LAYOUT,
   GHOSTTY_ACTION_CONNECTION_STATE,
-  GHOSTTY_ACTION_OPEN_SSH_CONNECTION,
+  GHOSTTY_ACTION_SSH_CREATE_SESSION,
   GHOSTTY_ACTION_SSH_SESSION_ATTACH,
 } ghostty_action_tag_e;
 
@@ -966,6 +972,8 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_ssh_session_mode_e ssh_create_session;
+  ghostty_action_ssh_session_mode_e ssh_session_attach;
 } ghostty_action_u;
 
 typedef struct {

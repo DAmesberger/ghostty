@@ -773,22 +773,28 @@ pub const Action = union(enum) {
     /// window later, use `ghostty +session-attach`.
     ssh_session_reconnect,
 
-    /// Open the SSH connection picker to connect to a saved SSH host or
-    /// enter an ad-hoc SSH target (e.g. user@hostname).
+    /// Create a new SSH remote session.
     ///
     /// Shows a dialog listing hosts parsed from ~/.ssh/config. Selecting
-    /// a host opens a new Ghostty window with an SSH remote session to
-    /// that host. You can also type an arbitrary user@host target in the
-    /// search field and press Enter to connect directly. This requires
-    /// the ssh-session feature.
-    open_ssh_connection,
+    /// a host opens an SSH remote session to that host. You can also type
+    /// an arbitrary user@host target in the search field and press Enter
+    /// to connect directly. This requires the ssh-session feature.
+    ///
+    /// The mode controls where the session opens:
+    ///   - `new_window` (default): Opens in a new window.
+    ///   - `new_tab`: Opens in a new tab in the current window.
+    ssh_create_session: SshSessionMode,
 
     /// Attach to a detached Ghostty remote session.
     ///
     /// Opens the SSH connection picker, then shows a list of available
-    /// sessions on the selected host. Selecting a session opens a new
-    /// Ghostty window attached to that remote session.
-    ssh_session_attach,
+    /// sessions on the selected host. Selecting a session attaches to
+    /// that remote session.
+    ///
+    /// The mode controls where the session opens:
+    ///   - `new_window` (default): Opens in a new window.
+    ///   - `new_tab`: Opens in a new tab in the current window.
+    ssh_session_attach: SshSessionMode,
 
     /// Toggle the quick terminal.
     ///
@@ -1183,6 +1189,15 @@ pub const Action = union(enum) {
         pub const default: CloseTabMode = .this;
     };
 
+    pub const SshSessionMode = enum {
+        /// Open in a new window (current default behavior).
+        new_window,
+        /// Open in a new tab in the current window.
+        new_tab,
+
+        pub const default: SshSessionMode = .new_window;
+    };
+
     fn parseEnum(comptime T: type, value: []const u8) !T {
         return std.meta.stringToEnum(T, value) orelse return Error.InvalidFormat;
     }
@@ -1396,7 +1411,7 @@ pub const Action = union(enum) {
             .toggle_command_palette,
             .ssh_session_detach,
             .ssh_session_reconnect,
-            .open_ssh_connection,
+            .ssh_create_session,
             .ssh_session_attach,
             .toggle_background_opacity,
             .show_on_screen_keyboard,

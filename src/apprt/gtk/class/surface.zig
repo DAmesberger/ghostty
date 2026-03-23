@@ -764,6 +764,24 @@ pub const Surface = extern struct {
         return priv.core_surface;
     }
 
+    /// Clear the core surface pointer without deinitializing it.
+    /// Used by App.deinit to prevent double-deinit when GTK's
+    /// deferred finalize runs after the core surface was already cleaned up.
+    pub fn clearCore(self: *Self) void {
+        self.private().core_surface = null;
+    }
+
+    /// Release GPA-tracked GObject resources that would normally be freed
+    /// in dispose/finalize. Called from App.deinit when GObject finalization
+    /// is deferred during shutdown.
+    pub fn releaseGpaResources(self: *Self) void {
+        const priv = self.private();
+        if (priv.config) |v| {
+            v.unref();
+            priv.config = null;
+        }
+    }
+
     pub fn rt(self: *Self) *ApprtSurface {
         const priv = self.private();
         return &priv.rt_surface;
@@ -878,12 +896,20 @@ pub const Surface = extern struct {
         return self.as(gtk.Widget).activateAction("win.toggle-command-palette", null) != 0;
     }
 
-    pub fn openSshConnection(self: *Self) bool {
-        return self.as(gtk.Widget).activateAction("win.open-ssh-connection", null) != 0;
+    pub fn sshCreateSession(self: *Self, mode: apprt.action.SshSessionMode) bool {
+        return self.as(gtk.Widget).activateAction(
+            "win.ssh-create-session",
+            glib.ext.VariantType.stringFor([:0]const u8),
+            @as([*:0]const u8, @tagName(mode)),
+        ) != 0;
     }
 
-    pub fn sshSessionAttach(self: *Self) bool {
-        return self.as(gtk.Widget).activateAction("win.ssh-session-attach", null) != 0;
+    pub fn sshSessionAttach(self: *Self, mode: apprt.action.SshSessionMode) bool {
+        return self.as(gtk.Widget).activateAction(
+            "win.ssh-session-attach",
+            glib.ext.VariantType.stringFor([:0]const u8),
+            @as([*:0]const u8, @tagName(mode)),
+        ) != 0;
     }
 
     pub fn controlInspector(

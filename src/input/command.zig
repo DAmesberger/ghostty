@@ -567,11 +567,18 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Detach the current Ghostty remote session without killing it.",
         }},
 
-        .open_ssh_connection => comptime &.{.{
-            .action = .open_ssh_connection,
-            .title = "Open SSH Connection",
-            .description = "Open the SSH connection picker to connect to a saved host from ~/.ssh/config or enter an ad-hoc SSH target.",
-        }},
+        .ssh_create_session => comptime &.{
+            .{
+                .action = .{ .ssh_create_session = .new_window },
+                .title = "Connect SSH Session (New Window)",
+                .description = "Open the SSH connection picker to connect to a saved host from ~/.ssh/config or enter an ad-hoc SSH target. Opens in a new window.",
+            },
+            .{
+                .action = .{ .ssh_create_session = .new_tab },
+                .title = "Connect SSH Session (New Tab)",
+                .description = "Open the SSH connection picker to connect to a saved host from ~/.ssh/config or enter an ad-hoc SSH target. Opens in a new tab.",
+            },
+        },
 
         .ssh_session_reconnect => comptime &.{.{
             .action = .ssh_session_reconnect,
@@ -579,11 +586,18 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Reconnect the current Ghostty remote session after a disconnect.",
         }},
 
-        .ssh_session_attach => comptime &.{.{
-            .action = .ssh_session_attach,
-            .title = "Attach SSH Session",
-            .description = "Attach to a detached remote SSH session.",
-        }},
+        .ssh_session_attach => comptime &.{
+            .{
+                .action = .{ .ssh_session_attach = .new_window },
+                .title = "Attach SSH Session (New Window)",
+                .description = "Attach to a detached remote SSH session. Opens in a new window.",
+            },
+            .{
+                .action = .{ .ssh_session_attach = .new_tab },
+                .title = "Attach SSH Session (New Tab)",
+                .description = "Attach to a detached remote SSH session. Opens in a new tab.",
+            },
+        },
 
         .open_config => comptime &.{.{
             .action = .open_config,

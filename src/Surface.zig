@@ -5906,16 +5906,22 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .open_ssh_connection => return try self.rt_app.performAction(
+        .ssh_create_session => |mode| return try self.rt_app.performAction(
             .{ .surface = self },
-            .open_ssh_connection,
-            {},
+            .ssh_create_session,
+            switch (mode) {
+                .new_window => .new_window,
+                .new_tab => .new_tab,
+            },
         ),
 
-        .ssh_session_attach => return try self.rt_app.performAction(
+        .ssh_session_attach => |mode| return try self.rt_app.performAction(
             .{ .surface = self },
             .ssh_session_attach,
-            {},
+            switch (mode) {
+                .new_window => .new_window,
+                .new_tab => .new_tab,
+            },
         ),
 
         .ssh_session_detach => return sendDetach(self),

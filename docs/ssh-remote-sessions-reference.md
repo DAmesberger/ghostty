@@ -40,16 +40,18 @@ These actions can be bound in the Ghostty config via `keybind = <key>=<action>`.
 
 | Action | Description |
 |--------|-------------|
-| `open_ssh_connection` | Open the SSH connection picker dialog. Lists hosts parsed from `~/.ssh/config`. Selecting a host opens a new Ghostty window with an SSH remote session. You can also type an arbitrary `user@host` target in the search field and press Enter. |
-| `ssh_session_attach` | Open the SSH connection picker, then show a list of available sessions on the selected host. Selecting a session opens a new Ghostty window attached to that remote session. |
+| `ssh_create_session` | Open the SSH connection picker dialog. Lists hosts parsed from `~/.ssh/config`. Selecting a host opens an SSH remote session. You can also type an arbitrary `user@host` target in the search field and press Enter. Accepts an optional mode: `new_window` (default) or `new_tab`. |
+| `ssh_session_attach` | Open the SSH connection picker, then show a list of available sessions on the selected host. Selecting a session attaches to that remote session. Accepts an optional mode: `new_window` (default) or `new_tab`. |
 | `ssh_session_detach` | Detach the current remote session without killing it. The remote shells continue running; the session can be reattached later from the same or a different machine. Only effective when the surface is an SSH remote session. |
 | `ssh_session_reconnect` | Manually trigger reconnection of the current remote session after a transport loss. Use when the session is disconnected but the remote daemon is still alive. |
 
 ### Example
 
 ```
-keybind = ctrl+shift+o=open_ssh_connection
+keybind = ctrl+shift+o=ssh_create_session
 keybind = ctrl+shift+a=ssh_session_attach
+keybind = ctrl+shift+alt+o=ssh_create_session:new_tab
+keybind = ctrl+shift+alt+a=ssh_session_attach:new_tab
 keybind = ctrl+shift+d=ssh_session_detach
 keybind = ctrl+shift+r=ssh_session_reconnect
 ```

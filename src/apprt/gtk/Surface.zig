@@ -12,7 +12,10 @@ const Surface = @import("class/surface.zig").Surface;
 surface: *Surface,
 
 pub fn deinit(self: *Self) void {
-    _ = self;
+    // Release GPA-tracked GObject resources (e.g. Config arena) that would
+    // normally be freed by GObject dispose/finalize. During shutdown, GObject
+    // may defer finalization for orphaned widgets, leaking these resources.
+    self.surface.releaseGpaResources();
 }
 
 /// Returns the GObject surface for this apprt surface. This is a function

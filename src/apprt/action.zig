@@ -353,11 +353,11 @@ pub const Action = union(Key) {
     /// The GTK handler reads the actual state from renderer_state.
     connection_state: session.protocol.ConnectionState,
 
-    /// Open the SSH connection picker dialog.
-    open_ssh_connection,
+    /// Open the SSH connection picker to create a new session.
+    ssh_create_session: SshSessionMode,
 
     /// Attach to a detached SSH remote session.
-    ssh_session_attach,
+    ssh_session_attach: SshSessionMode,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -428,7 +428,7 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         restore_layout,
         connection_state,
-        open_ssh_connection,
+        ssh_create_session,
         ssh_session_attach,
 
         test "ghostty.h Action.Key" {
@@ -956,6 +956,17 @@ pub const CloseTabMode = enum(c_int) {
 
     test "ghostty.h CloseTabMode" {
         try lib.checkGhosttyHEnum(CloseTabMode, "GHOSTTY_ACTION_CLOSE_TAB_MODE_");
+    }
+};
+
+pub const SshSessionMode = enum(c_int) {
+    /// Open in a new window.
+    new_window,
+    /// Open in a new tab in the current window.
+    new_tab,
+
+    test "ghostty.h SshSessionMode" {
+        try lib.checkGhosttyHEnum(SshSessionMode, "GHOSTTY_ACTION_SSH_SESSION_MODE_");
     }
 };
 

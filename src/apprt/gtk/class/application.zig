@@ -787,9 +787,9 @@ pub const Application = extern struct {
 
             .connection_state => return Action.connectionState(target),
 
-            .open_ssh_connection => return Action.openSshConnection(target),
+            .ssh_create_session => return Action.sshCreateSession(target, value),
 
-            .ssh_session_attach => return Action.sshSessionAttach(target),
+            .ssh_session_attach => return Action.sshSessionAttach(target, value),
 
             // Unimplemented
             .secure_input,
@@ -2836,20 +2836,20 @@ const Action = struct {
         }
     }
 
-    pub fn openSshConnection(target: apprt.Target) bool {
+    pub fn sshCreateSession(target: apprt.Target, value: apprt.Action.Value(.ssh_create_session)) bool {
         switch (target) {
             .app => return false,
             .surface => |surface| {
-                return surface.rt_surface.gobj().openSshConnection();
+                return surface.rt_surface.gobj().sshCreateSession(value);
             },
         }
     }
 
-    pub fn sshSessionAttach(target: apprt.Target) bool {
+    pub fn sshSessionAttach(target: apprt.Target, value: apprt.Action.Value(.ssh_session_attach)) bool {
         switch (target) {
             .app => return false,
             .surface => |surface| {
-                return surface.rt_surface.gobj().sshSessionAttach();
+                return surface.rt_surface.gobj().sshSessionAttach(value);
             },
         }
     }

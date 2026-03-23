@@ -267,12 +267,18 @@ pub const Window = extern struct {
         /// A weak reference to the SSH session picker dialog.
         ssh_session_picker: WeakRef(SshSessionPicker) = .empty,
 
+        /// Mode for the current SSH create-session flow.
+        ssh_create_mode: apprt.action.SshSessionMode = .new_window,
+
+        /// Mode for the current SSH attach flow.
+        ssh_attach_mode: apprt.action.SshSessionMode = .new_window,
+
         /// Tab page that the context menu was opened for.
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
 
-        /// Debounced layout update: true if a GLib idle callback is pending.
-        layout_update_pending: bool = false,
+        /// GLib idle source ID for debounced layout updates, or null if none pending.
+        layout_update_source: ?c_uint = null,
 
         /// Hash of last-sent layout blob for dedup. Layout blobs are small
         /// (~128 bytes for complex layouts) so we just hash and compare.
@@ -395,8 +401,8 @@ pub const Window = extern struct {
             .init("clear", actionClear, null),
             // TODO: accept the surface that toggled the command palette
             .init("toggle-command-palette", actionToggleCommandPalette, null),
-            .init("open-ssh-connection", actionOpenSshConnection, null),
-            .init("ssh-session-attach", actionSshSessionAttach, null),
+            .init("ssh-create-session", actionSshCreateSession, s_variant_type),
+            .init("ssh-session-attach", actionSshSessionAttach, s_variant_type),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -1307,6 +1313,20 @@ pub const Window = extern struct {
         priv.ssh_attach_overlay.set(null);
         priv.ssh_session_picker.set(null);
 
+        if (priv.layout_update_source) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove layout update idle source", .{});
+            }
+            priv.layout_update_source = null;
+        }
+
+        if (priv.tab_overview_focus_timer) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove tab overview focus timer", .{});
+            }
+            priv.tab_overview_focus_timer = null;
+        }
+
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -1857,14 +1877,13 @@ pub const Window = extern struct {
     /// the layout is captured.
     pub fn scheduleLayoutUpdate(self: *Self) void {
         const priv = self.private();
-        if (priv.layout_update_pending) return;
-        priv.layout_update_pending = true;
-        _ = glib.idleAdd(layoutUpdateIdle, self);
+        if (priv.layout_update_source != null) return;
+        priv.layout_update_source = glib.idleAdd(layoutUpdateIdle, self);
     }
 
     fn layoutUpdateIdle(data: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(data orelse return 0));
-        self.private().layout_update_pending = false;
+        self.private().layout_update_source = null;
         self.sendRemoteLayoutUpdate();
         return 0; // remove source
     }
@@ -2424,8 +2443,9 @@ pub const Window = extern struct {
     }
 
     /// Open the SSH connection picker overlay.
-    fn openSshConnection(self: *Window) void {
+    fn sshCreateSession(self: *Window, mode: apprt.action.SshSessionMode) void {
         const priv = self.private();
+        priv.ssh_create_mode = mode;
 
         // Get a reference to the SSH connection overlay. First check the weak
         // reference to see if we already have one stored. If not, create one.
@@ -2449,28 +2469,34 @@ pub const Window = extern struct {
         ssh_overlay.toggle(self);
     }
 
-    /// React to the SSH connection overlay "connect" signal by opening a new
-    /// window with the selected SSH target.
-    fn signalSshConnect(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, _: *Self) callconv(.c) void {
-        if (target_str) |t| {
-            Application.default().newSshWindow(std.mem.span(t));
+    /// React to the SSH connection overlay "connect" signal.
+    /// Opens the SSH session in a new window or replaces the current window.
+    fn signalSshConnect(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, self: *Self) callconv(.c) void {
+        const target = std.mem.span(target_str orelse return);
+        if (target.len == 0) return;
+
+        const mode = self.private().ssh_create_mode;
+        switch (mode) {
+            .new_window => Application.default().newSshWindow(target),
+            .new_tab => self.newSshTab(target),
         }
     }
 
     /// React to a GTK action requesting the SSH connection picker.
-    fn actionOpenSshConnection(
+    fn actionSshCreateSession(
         _: *gio.SimpleAction,
-        _: ?*glib.Variant,
+        param_: ?*glib.Variant,
         self: *Window,
     ) callconv(.c) void {
-        self.openSshConnection();
+        self.sshCreateSession(parseSshSessionMode(param_));
     }
 
     /// Open the SSH connection picker for the attach flow.
     /// After the user selects a host, the session picker is shown
     /// to choose a detached session.
-    fn sshSessionAttach(self: *Window) void {
+    fn sshSessionAttach(self: *Window, mode: apprt.action.SshSessionMode) void {
         const priv = self.private();
+        priv.ssh_attach_mode = mode;
 
         // Get a reference to the attach-specific SSH connection overlay.
         const ssh_overlay = priv.ssh_attach_overlay.get() orelse ssh_overlay: {
@@ -2527,25 +2553,52 @@ pub const Window = extern struct {
         _: *SshSessionPicker,
         ssh_target: ?[*:0]const u8,
         session_id: ?[*:0]const u8,
-        _: *Self,
+        self: *Self,
     ) callconv(.c) void {
         const target = std.mem.span(ssh_target orelse return);
         const sid = std.mem.span(session_id orelse return);
         if (target.len == 0 or sid.len == 0) return;
 
-        // Create new window with ssh-target and ssh-session config set.
-        // The ssh-session config tells the Remote backend to attach to
-        // the specified session rather than creating a new one.
-        Application.default().newSshAttachWindow(target, sid);
+        const mode = self.private().ssh_attach_mode;
+        switch (mode) {
+            .new_window => Application.default().newSshAttachWindow(target, sid),
+            .new_tab => self.newSshAttachTab(target, sid),
+        }
     }
 
     /// React to a GTK action requesting the SSH session attach flow.
     fn actionSshSessionAttach(
         _: *gio.SimpleAction,
-        _: ?*glib.Variant,
+        param_: ?*glib.Variant,
         self: *Window,
     ) callconv(.c) void {
-        self.sshSessionAttach();
+        self.sshSessionAttach(parseSshSessionMode(param_));
+    }
+
+    /// Parse an SshSessionMode from a GTK action variant parameter.
+    /// Returns `.new_window` if the parameter is missing or invalid.
+    fn parseSshSessionMode(param_: ?*glib.Variant) apprt.action.SshSessionMode {
+        const param = param_ orelse return .new_window;
+        var str: ?[*:0]const u8 = null;
+        param.get("&s", &str);
+        return std.meta.stringToEnum(
+            apprt.action.SshSessionMode,
+            std.mem.span(str orelse return .new_window),
+        ) orelse .new_window;
+    }
+
+    /// Open a new SSH session tab in the current window.
+    fn newSshTab(self: *Self, ssh_target: []const u8) void {
+        self.newTabForWindow(null, .{
+            .ssh_ctx = .{ .target = ssh_target },
+        });
+    }
+
+    /// Open a new tab in this window attached to an existing SSH remote session.
+    fn newSshAttachTab(self: *Self, ssh_target: []const u8, ssh_session: []const u8) void {
+        self.newTabForWindow(null, .{
+            .ssh_ctx = .{ .target = ssh_target, .session_id = ssh_session },
+        });
     }
 
     /// Toggle the Ghostty inspector for the active surface.
