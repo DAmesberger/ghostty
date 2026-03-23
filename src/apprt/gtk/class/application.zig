@@ -660,20 +660,12 @@ pub const Application = extern struct {
     }
 
     /// Open a new window with an SSH remote session to the given target.
-    pub fn newSshWindow(self: *Self, ssh_target: []const u8) void {
+    /// If `session_id` is provided, attaches to an existing remote session.
+    pub fn newSshWindow(self: *Self, ssh_target: []const u8, session_id: ?[]const u8) void {
         Action.newWindow(self, null, .{
-            .ssh_ctx = .{ .target = ssh_target },
+            .ssh_ctx = .{ .target = ssh_target, .session_id = session_id },
         }) catch |err| {
             log.warn("failed to create SSH window: {}", .{err});
-        };
-    }
-
-    /// Open a new window that attaches to an existing SSH remote session.
-    pub fn newSshAttachWindow(self: *Self, ssh_target: []const u8, ssh_session: []const u8) void {
-        Action.newWindow(self, null, .{
-            .ssh_ctx = .{ .target = ssh_target, .session_id = ssh_session },
-        }) catch |err| {
-            log.warn("failed to create SSH attach window: {}", .{err});
         };
     }
 

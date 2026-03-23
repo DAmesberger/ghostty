@@ -153,6 +153,10 @@ pending_layout_restore: ?[]const u8 = null,
 pending_layout_group_id: session.shared.Uuid = session.shared.zero_uuid,
 pending_layout_surface_id: session.shared.Uuid = session.shared.zero_uuid,
 
+/// Scrollback restore progress for remote sessions (updated by SSH thread).
+scrollback_progress_received: u32 = 0,
+scrollback_progress_total: u32 = 0,
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -902,17 +906,27 @@ fn isRemoteSurface(self: *const Surface) bool {
 fn sendDetach(self: *Surface) bool {
     if (!isRemoteSurface(self)) return false;
 
-    // Detach the entire SSH connection — all tabs and splits on this
-    // host. Delegates to SshConnectionManager.detachAll which marks
-    // each surface as detaching, sends close(detach) frames, and
-    // closes all surface mailboxes.
     const remote = &self.io.backend.remote;
     const entry = remote.conn_entry orelse {
         self.close();
         return true;
     };
 
-    termio.SshConnectionManager.detachAll(entry);
+    const group_id = remote.ssh_ctx.group_id;
+    if (session.shared.isZeroUuid(group_id)) {
+        // No group — detach just this surface (standalone)
+        remote.detaching = true;
+        termio.SshConnectionManager.enqueueWrite(
+            entry,
+            .close,
+            remote.target_id,
+            &.{@intFromEnum(session.protocol.CloseMode.detach)},
+        );
+        self.close();
+    } else {
+        // Detach the entire session (all surfaces sharing this group_id).
+        termio.SshConnectionManager.detachSession(entry, group_id);
+    }
     return true;
 }
 
@@ -1276,6 +1290,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .restore_layout,
                 {},
             );
+        },
+
+        .scrollback_progress => |sp| {
+            self.scrollback_progress_received = sp.received;
+            self.scrollback_progress_total = sp.total;
         },
     }
 }
@@ -5909,19 +5928,13 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .ssh_create_session => |mode| return try self.rt_app.performAction(
             .{ .surface = self },
             .ssh_create_session,
-            switch (mode) {
-                .new_window => .new_window,
-                .new_tab => .new_tab,
-            },
+            mode,
         ),
 
         .ssh_session_attach => |mode| return try self.rt_app.performAction(
             .{ .surface = self },
             .ssh_session_attach,
-            switch (mode) {
-                .new_window => .new_window,
-                .new_tab => .new_tab,
-            },
+            mode,
         ),
 
         .ssh_session_detach => return sendDetach(self),

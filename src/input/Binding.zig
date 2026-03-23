@@ -1189,14 +1189,7 @@ pub const Action = union(enum) {
         pub const default: CloseTabMode = .this;
     };
 
-    pub const SshSessionMode = enum {
-        /// Open in a new window (current default behavior).
-        new_window,
-        /// Open in a new tab in the current window.
-        new_tab,
-
-        pub const default: SshSessionMode = .new_window;
-    };
+    pub const SshSessionMode = @import("../apprt/action.zig").SshSessionMode;
 
     fn parseEnum(comptime T: type, value: []const u8) !T {
         return std.meta.stringToEnum(T, value) orelse return Error.InvalidFormat;

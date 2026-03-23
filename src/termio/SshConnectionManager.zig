@@ -18,8 +18,6 @@ const config = @import("../config.zig").Config;
 
 const log = std.log.scoped(.ssh_connection_manager);
 
-pub const max_surfaces: usize = 64;
-
 mutex: std.Thread.Mutex = .{},
 /// Entries are heap-allocated so that pointers remain stable across
 /// hash map growth and ordered removal (which shifts internal arrays).
@@ -34,10 +32,43 @@ pub const SurfaceSlot = struct {
     surface_mailbox: *apprt.surface.Mailbox,
     /// Stable surface UUID for reconnect (survives target_id changes).
     surface_id: Uuid = session.shared.zero_uuid,
-    /// Group UUID this surface belongs to (for reconnect).
-    group_id: Uuid = session.shared.zero_uuid,
     /// Current tab/session label, synced from title changes. Used on reconnect.
     label: ?[]const u8 = null,
+};
+
+/// A group of surfaces sharing the same remote session (group_id).
+/// Layout sync and detach operate at the session level.
+pub const Session = struct {
+    group_id: Uuid,
+    surfaces: std.ArrayList(SurfaceSlot) = .empty,
+    layout_blob: ?[]const u8 = null,
+    layout_hash: u64 = 0,
+
+    pub fn deinit(self: *Session, alloc: Allocator) void {
+        for (self.surfaces.items) |s| {
+            if (s.label) |l| alloc.free(l);
+        }
+        self.surfaces.deinit(alloc);
+        if (self.layout_blob) |b| alloc.free(b);
+    }
+
+    pub fn findSurfaceByTargetId(self: *const Session, target_id: u16) ?SurfaceSlot {
+        for (self.surfaces.items) |s| {
+            if (s.target_id == target_id) return s;
+        }
+        return null;
+    }
+
+    fn removeSurface(self: *Session, target_id: u16, alloc: Allocator) bool {
+        for (self.surfaces.items, 0..) |s, i| {
+            if (s.target_id == target_id) {
+                if (s.label) |l| alloc.free(l);
+                _ = self.surfaces.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 pub const WriteRequest = struct {
@@ -67,8 +98,8 @@ pub const Entry = struct {
     quit_pipe: [2]posix.fd_t = .{ -1, -1 },
     write_pipe: [2]posix.fd_t = .{ -1, -1 },
 
-    // Registered surfaces for frame dispatch
-    surfaces: [max_surfaces]?SurfaceSlot = [_]?SurfaceSlot{null} ** max_surfaces,
+    // Registered sessions (keyed by group_id) for frame dispatch
+    sessions: std.AutoArrayHashMap(Uuid, *Session),
     surfaces_mutex: std.Thread.Mutex = .{},
 
     // Write queue (thread-safe)
@@ -135,10 +166,20 @@ pub fn deinit(self: *SshConnectionManager) void {
             entry.alloc.free(req.data);
         }
         entry.write_queue.deinit(entry.alloc);
+        deinitSessions(entry);
         entry.ctx.deinit();
         self.alloc.destroy(entry);
     }
     self.connections.deinit();
+}
+
+fn deinitSessions(entry: *Entry) void {
+    var sit = entry.sessions.iterator();
+    while (sit.next()) |skv| {
+        skv.value_ptr.*.deinit(entry.alloc);
+        entry.alloc.destroy(skv.value_ptr.*);
+    }
+    entry.sessions.deinit();
 }
 
 /// Build the lookup key from ssh_target + optional jump.
@@ -187,6 +228,7 @@ pub fn acquire(
         },
         .remote_bin_path = &.{},
         .ref_count = 1,
+        .sessions = std.AutoArrayHashMap(Uuid, *Session).init(self.alloc),
     };
     try self.connections.put(key, entry);
     return entry;
@@ -203,8 +245,9 @@ pub fn allocateTarget(self: *SshConnectionManager, entry: *Entry) u16 {
 }
 
 /// Register a surface for frame dispatch from the SSH thread.
-/// Returns true on success, false if the maximum number of surfaces
-/// has been reached (caller should report error to user).
+/// The surface is placed into the session matching `group_id`, creating
+/// one if it doesn't exist yet.
+/// Returns true on success, false on allocation failure.
 pub fn registerSurface(
     entry: *Entry,
     target_id: u16,
@@ -221,22 +264,22 @@ pub fn registerSurface(
 
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (&entry.surfaces) |*slot| {
-        if (slot.* == null) {
-            slot.* = .{
-                .target_id = target_id,
-                .io = io,
-                .surface_mailbox = mailbox,
-                .surface_id = surface_id,
-                .group_id = group_id,
-                .label = owned_label,
-            };
-            return true;
-        }
-    }
-    if (owned_label) |l| entry.alloc.free(l);
-    log.err("max surfaces ({d}) exceeded for SSH connection", .{max_surfaces});
-    return false;
+
+    const sess = findOrCreateSession(entry, group_id) orelse {
+        if (owned_label) |l| entry.alloc.free(l);
+        return false;
+    };
+    sess.surfaces.append(entry.alloc, .{
+        .target_id = target_id,
+        .io = io,
+        .surface_mailbox = mailbox,
+        .surface_id = surface_id,
+        .label = owned_label,
+    }) catch {
+        if (owned_label) |l| entry.alloc.free(l);
+        return false;
+    };
+    return true;
 }
 
 /// Update the label for a registered surface (e.g. after a title change).
@@ -245,8 +288,9 @@ pub fn updateSurfaceLabel(entry: *Entry, target_id: u16, new_label: []const u8) 
     const owned = entry.alloc.dupe(u8, new_label) catch return;
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (&entry.surfaces) |*slot| {
-        if (slot.*) |*s| {
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.*.surfaces.items) |*s| {
             if (s.target_id == target_id) {
                 if (s.label) |old| entry.alloc.free(old);
                 s.label = owned;
@@ -257,18 +301,12 @@ pub fn updateSurfaceLabel(entry: *Entry, target_id: u16, new_label: []const u8) 
     entry.alloc.free(owned);
 }
 
-/// Update the group_id for a registered surface (e.g. after group creation).
+/// Move a surface to the session matching `new_group_id`, creating it if needed.
+/// Removes the source session if it becomes empty.
 pub fn updateSurfaceGroupId(entry: *Entry, target_id: u16, new_group_id: Uuid) void {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (&entry.surfaces) |*slot| {
-        if (slot.*) |*s| {
-            if (s.target_id == target_id) {
-                s.group_id = new_group_id;
-                return;
-            }
-        }
-    }
+    moveSurfaceToSession(entry, target_id, new_group_id);
 }
 
 /// Unregister a surface. After this returns, the SSH thread will not
@@ -276,13 +314,14 @@ pub fn updateSurfaceGroupId(entry: *Entry, target_id: u16, new_group_id: Uuid) v
 pub fn unregisterSurface(entry: *Entry, target_id: u16) void {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (&entry.surfaces) |*slot| {
-        if (slot.*) |s| {
-            if (s.target_id == target_id) {
-                if (s.label) |l| entry.alloc.free(l);
-                slot.* = null;
-                return;
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        const sess = kv.value_ptr.*;
+        if (sess.removeSurface(target_id, entry.alloc)) {
+            if (sess.surfaces.items.len == 0) {
+                removeSession(entry, sess.group_id);
             }
+            return;
         }
     }
 }
@@ -319,17 +358,54 @@ pub fn enqueueWrite(entry: *Entry, kind: session.protocol.Kind, target_id: u16, 
     _ = posix.write(entry.write_pipe[1], "w") catch {};
 }
 
+/// Store and send a layout blob for a specific session, deduplicating by hash.
+/// Thread-safe: acquires surfaces_mutex internally.
+pub fn storeAndSendLayout(entry: *Entry, group_id: Uuid, target: u16, blob: []const u8) void {
+    const hash = std.hash.XxHash64.hash(0, blob);
+
+    entry.surfaces_mutex.lock();
+    const sess = entry.sessions.get(group_id);
+    if (sess) |s| {
+        if (hash == s.layout_hash) {
+            entry.surfaces_mutex.unlock();
+            return;
+        }
+        s.layout_hash = hash;
+        if (s.layout_blob) |old| entry.alloc.free(old);
+        s.layout_blob = entry.alloc.dupe(u8, blob) catch null;
+    }
+    entry.surfaces_mutex.unlock();
+
+    log.info("storeAndSendLayout: sending layout ({d} bytes) for session", .{blob.len});
+    enqueueWrite(entry, .layout, target, blob);
+}
+
 /// Detach all surfaces on this entry. Marks each as detaching, sends
 /// close(detach) frames, and closes all surface mailboxes.
 pub fn detachAll(entry: *Entry) void {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (&entry.surfaces) |*slot| {
-        if (slot.*) |s| {
-            s.io.backend.remote.detaching = true;
-            enqueueWrite(entry, .close, s.target_id, &.{@intFromEnum(session.protocol.CloseMode.detach)});
-            _ = s.surface_mailbox.push(.close, .{ .forever = {} });
-        }
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        detachSessionLocked(entry, kv.value_ptr.*);
+    }
+}
+
+/// Detach all surfaces in a single session. Caller must hold surfaces_mutex.
+fn detachSessionLocked(entry: *Entry, sess: *Session) void {
+    for (sess.surfaces.items) |s| {
+        s.io.backend.remote.detaching = true;
+        enqueueWrite(entry, .close, s.target_id, &.{@intFromEnum(session.protocol.CloseMode.detach)});
+        _ = s.surface_mailbox.push(.close, .{ .forever = {} });
+    }
+}
+
+/// Detach all surfaces belonging to a specific session (by group_id).
+pub fn detachSession(entry: *Entry, group_id: Uuid) void {
+    entry.surfaces_mutex.lock();
+    defer entry.surfaces_mutex.unlock();
+    if (entry.sessions.get(group_id)) |sess| {
+        detachSessionLocked(entry, sess);
     }
 }
 
@@ -428,6 +504,7 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
 
         if (entry.remote_bin_path.len > 0) self.alloc.free(entry.remote_bin_path);
         if (entry.channel) |*ch| ch.close();
+        deinitSessions(entry);
         entry.ctx.deinit();
         self.alloc.destroy(entry);
 
@@ -597,8 +674,9 @@ pub fn sshThreadMain(entry: *Entry) void {
 fn notifyAllSurfaces(entry: *Entry) void {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (entry.surfaces) |slot| {
-        if (slot) |s| {
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.*.surfaces.items) |s| {
             _ = s.surface_mailbox.push(.{
                 .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
             }, .{ .forever = {} });
@@ -609,8 +687,9 @@ fn notifyAllSurfaces(entry: *Entry) void {
 fn broadcastConnectionState(entry: *Entry, state: session.protocol.ConnectionState) void {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
-    for (entry.surfaces) |slot| {
-        if (slot) |s| {
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.*.surfaces.items) |s| {
             _ = s.surface_mailbox.push(.{ .connection_state = state }, .{ .forever = {} });
         }
     }
@@ -738,34 +817,35 @@ fn attemptReconnect(entry: *Entry) bool {
 }
 
 /// Re-open sessions for registered surfaces using their stable IDs after reconnect.
+/// Sends one open per session (group), using the first surface in each.
 fn reopenSurfaces(entry: *Entry) void {
     entry.surfaces_mutex.lock();
-    var group_sent = std.AutoArrayHashMap(session.shared.Uuid, void).init(entry.alloc);
-    defer group_sent.deinit();
-    for (entry.surfaces) |slot| {
-        if (slot) |s| {
-            if (!session.shared.isZeroUuid(s.group_id)) {
-                if (group_sent.contains(s.group_id)) continue;
-                group_sent.put(s.group_id, {}) catch continue;
-            }
+    defer entry.surfaces_mutex.unlock();
 
-            const open_payload = (session.protocol.Open{
-                .open_type = .session_attach,
-                .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
-                .surface_id = s.surface_id,
-                .group_id = s.group_id,
-                .label = s.label orelse "reconnected",
-            }).encode(entry.alloc) catch continue;
-            defer entry.alloc.free(open_payload);
-            sendFrame(&entry.channel.?, .open, s.target_id, open_payload) catch {
-                log.warn("reconnect: failed to re-open surface target={d}", .{s.target_id});
-                _ = s.surface_mailbox.push(.{
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        const sess = kv.value_ptr.*;
+        if (sess.surfaces.items.len == 0) continue;
+        const s = sess.surfaces.items[0];
+
+        const open_payload = (session.protocol.Open{
+            .open_type = .session_attach,
+            .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
+            .surface_id = s.surface_id,
+            .group_id = sess.group_id,
+            .label = s.label orelse "reconnected",
+        }).encode(entry.alloc) catch continue;
+        defer entry.alloc.free(open_payload);
+        sendFrame(&entry.channel.?, .open, s.target_id, open_payload) catch {
+            log.warn("reconnect: failed to re-open session target={d}", .{s.target_id});
+            // Notify all surfaces in this session
+            for (sess.surfaces.items) |surf| {
+                _ = surf.surface_mailbox.push(.{
                     .child_exited = .{ .exit_code = 1, .runtime_ms = 0 },
                 }, .{ .forever = {} });
-            };
-        }
+            }
+        };
     }
-    entry.surfaces_mutex.unlock();
 }
 
 /// Try to open a multiplexed channel, restarting the daemon if needed.
@@ -832,13 +912,16 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
         // on surface io pointers (unregisterSurface acquires the same lock).
         entry.surfaces_mutex.lock();
         if (frame_target == 0) {
-            // Broadcast to all surfaces
-            for (&entry.surfaces) |*slot| {
-                if (slot.*) |_| dispatchFrame(kind, slot, payload);
+            // Broadcast to all surfaces across all sessions
+            var sit = entry.sessions.iterator();
+            while (sit.next()) |kv| {
+                for (kv.value_ptr.*.surfaces.items) |s| {
+                    dispatchFrame(entry, kind, s, payload);
+                }
             }
         } else {
-            if (findSurfacePtr(entry, frame_target)) |slot| {
-                dispatchFrame(kind, slot, payload);
+            if (findSurfaceAcrossSessions(entry, frame_target)) |s| {
+                dispatchFrame(entry, kind, s, payload);
             }
         }
         entry.surfaces_mutex.unlock();
@@ -847,8 +930,7 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
     }
 }
 
-fn dispatchFrame(kind: session.protocol.Kind, slot: *?SurfaceSlot, payload: []const u8) void {
-    const s = slot.* orelse return;
+fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, payload: []const u8) void {
     switch (kind) {
         .data_out => {
             @call(.always_inline, termio.Termio.processOutput, .{ s.io, payload });
@@ -861,11 +943,10 @@ fn dispatchFrame(kind: session.protocol.Kind, slot: *?SurfaceSlot, payload: []co
             };
             log.info("remote session opened history_rows={d}", .{parsed.history_rows});
 
-            // Update IDs in the slot (surfaces_mutex is held by caller).
-            slot.*.?.group_id = parsed.group_id;
-            if (!session.shared.isZeroUuid(parsed.surface_id)) {
-                slot.*.?.surface_id = parsed.surface_id;
-            }
+            // Move surface to the correct session and update surface_id.
+            // surfaces_mutex is held by caller.
+            moveSurfaceToSession(entry, s.target_id, parsed.group_id);
+            updateSurfaceIdLocked(entry, s.target_id, parsed.surface_id);
 
             // Send IDs to GTK thread via mailbox so it can update ssh_ctx
             // without racing this (SSH) thread. All GTK-thread readers see
@@ -918,6 +999,12 @@ fn dispatchFrame(kind: session.protocol.Kind, slot: *?SurfaceSlot, payload: []co
             // row_count == 0 is the done marker
             if (resp.row_count == 0) {
                 log.info("scrollback restore complete ({d} history rows)", .{resp.total_history_rows});
+                _ = s.surface_mailbox.push(.{
+                    .scrollback_progress = .{
+                        .received = resp.total_history_rows,
+                        .total = resp.total_history_rows,
+                    },
+                }, .{ .forever = {} });
                 return;
             }
 
@@ -932,6 +1019,15 @@ fn dispatchFrame(kind: session.protocol.Kind, slot: *?SurfaceSlot, payload: []co
                 resp.row_count,
                 resp.chunk_data,
             );
+
+            // Notify surface of progress
+            const received = resp.chunk_start_row + resp.row_count;
+            _ = s.surface_mailbox.push(.{
+                .scrollback_progress = .{
+                    .received = received,
+                    .total = resp.total_history_rows,
+                },
+            }, .{ .forever = {} });
         },
         .layout => {
             log.info("received layout blob len={d}", .{payload.len});
@@ -961,22 +1057,84 @@ fn dispatchFrame(kind: session.protocol.Kind, slot: *?SurfaceSlot, payload: []co
     }
 }
 
-fn findSurface(entry: *const Entry, target_id: u16) ?SurfaceSlot {
-    for (entry.surfaces) |slot| {
-        if (slot) |s| {
-            if (s.target_id == target_id) return s;
-        }
+/// Find a surface by target_id across all sessions. Returns a copy.
+/// Caller must hold surfaces_mutex.
+fn findSurfaceAcrossSessions(entry: *const Entry, target_id: u16) ?SurfaceSlot {
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.*.findSurfaceByTargetId(target_id)) |s| return s;
     }
     return null;
 }
 
-fn findSurfacePtr(entry: *Entry, target_id: u16) ?*?SurfaceSlot {
-    for (&entry.surfaces) |*slot| {
-        if (slot.*) |s| {
-            if (s.target_id == target_id) return slot;
+/// Find or create a session for the given group_id. Caller must hold surfaces_mutex.
+fn findOrCreateSession(entry: *Entry, group_id: Uuid) ?*Session {
+    if (entry.sessions.get(group_id)) |s| return s;
+
+    const sess = entry.alloc.create(Session) catch return null;
+    sess.* = .{ .group_id = group_id };
+    entry.sessions.put(group_id, sess) catch {
+        entry.alloc.destroy(sess);
+        return null;
+    };
+    return sess;
+}
+
+/// Remove an empty session. Caller must hold surfaces_mutex.
+fn removeSession(entry: *Entry, group_id: Uuid) void {
+    if (entry.sessions.fetchSwapRemove(group_id)) |kv| {
+        kv.value.deinit(entry.alloc);
+        entry.alloc.destroy(kv.value);
+    }
+}
+
+/// Move a surface between sessions. Caller must hold surfaces_mutex.
+fn moveSurfaceToSession(entry: *Entry, target_id: u16, new_group_id: Uuid) void {
+    // Find and remove from current session
+    var old_session: ?*Session = null;
+    var surface_data: ?SurfaceSlot = null;
+
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        const sess = kv.value_ptr.*;
+        for (sess.surfaces.items, 0..) |s, i| {
+            if (s.target_id == target_id) {
+                // Check if already in correct session
+                if (std.mem.eql(u8, &sess.group_id, &new_group_id)) return;
+
+                surface_data = s;
+                old_session = sess;
+                _ = sess.surfaces.swapRemove(i);
+                break;
+            }
+        }
+        if (surface_data != null) break;
+    }
+
+    const surf = surface_data orelse return;
+    const target_sess = findOrCreateSession(entry, new_group_id) orelse return;
+    target_sess.surfaces.append(entry.alloc, surf) catch return;
+
+    // Remove empty source session
+    if (old_session) |old| {
+        if (old.surfaces.items.len == 0) {
+            removeSession(entry, old.group_id);
         }
     }
-    return null;
+}
+
+/// Update surface_id for a surface. Caller must hold surfaces_mutex.
+fn updateSurfaceIdLocked(entry: *Entry, target_id: u16, new_surface_id: Uuid) void {
+    if (session.shared.isZeroUuid(new_surface_id)) return;
+    var it = entry.sessions.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.*.surfaces.items) |*s| {
+            if (s.target_id == target_id) {
+                s.surface_id = new_surface_id;
+                return;
+            }
+        }
+    }
 }
 
 fn sendFrame(channel: *ssh.Channel, kind: session.protocol.Kind, target: u16, data: []const u8) !void {

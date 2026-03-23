@@ -116,6 +116,9 @@ pub const Message = union(enum) {
     /// page_allocator and must be freed by the receiver.
     layout_restore: LayoutRestore,
 
+    /// Scrollback restore progress update from the SSH thread.
+    scrollback_progress: ScrollbackProgress,
+
     /// Search progress update
     search_total: ?usize,
 
@@ -146,6 +149,11 @@ pub const Message = union(enum) {
         pub fn deinit(self: LayoutRestore) void {
             std.heap.page_allocator.free(self.blob[0..self.len]);
         }
+    };
+
+    pub const ScrollbackProgress = struct {
+        received: u32,
+        total: u32,
     };
 
     pub const ReportTitleStyle = enum {

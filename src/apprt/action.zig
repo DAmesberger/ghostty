@@ -965,6 +965,9 @@ pub const SshSessionMode = enum(c_int) {
     /// Open in a new tab in the current window.
     new_tab,
 
+    /// Default used by the keybinding parser when no explicit value is given.
+    pub const default: SshSessionMode = .new_window;
+
     test "ghostty.h SshSessionMode" {
         try lib.checkGhosttyHEnum(SshSessionMode, "GHOSTTY_ACTION_SSH_SESSION_MODE_");
     }

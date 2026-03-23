@@ -267,11 +267,9 @@ pub const Window = extern struct {
         /// A weak reference to the SSH session picker dialog.
         ssh_session_picker: WeakRef(SshSessionPicker) = .empty,
 
-        /// Mode for the current SSH create-session flow.
-        ssh_create_mode: apprt.action.SshSessionMode = .new_window,
-
-        /// Mode for the current SSH attach flow.
-        ssh_attach_mode: apprt.action.SshSessionMode = .new_window,
+        /// Mode for the current SSH session flow (create or attach).
+        /// Only one overlay is active at a time, so a single field suffices.
+        ssh_mode: apprt.action.SshSessionMode = .new_window,
 
         /// Tab page that the context menu was opened for.
         /// setup by `setup-menu`.
@@ -279,10 +277,6 @@ pub const Window = extern struct {
 
         /// GLib idle source ID for debounced layout updates, or null if none pending.
         layout_update_source: ?c_uint = null,
-
-        /// Hash of last-sent layout blob for dedup. Layout blobs are small
-        /// (~128 bytes for complex layouts) so we just hash and compare.
-        last_layout_hash: u64 = 0,
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -1889,8 +1883,8 @@ pub const Window = extern struct {
     }
 
     /// Serialize the layout of ALL tabs in this window and send it to
-    /// the remote daemon. Only acts if at least one tab contains remote
-    /// surfaces. Called from the idle callback.
+    /// the remote daemon, grouped by session (group_id). Each session
+    /// receives its own layout blob containing only its tabs.
     pub fn sendRemoteLayoutUpdate(self: *Self) void {
         const priv = self.private();
         const alloc = Application.default().allocator();
@@ -1901,61 +1895,65 @@ pub const Window = extern struct {
 
         log.debug("sendRemoteLayoutUpdate: {d} pages in tab_view", .{n});
 
-        // Determine which page is currently selected
         const selected_page = tab_view.getSelectedPage();
 
-        // Temporary per-tab info collected on the stack/heap
-        const tab_infos = alloc.alloc(session_layout.TabInfo, n) catch return;
-        var send_entry: ?*SshConnectionManager.Entry = null;
-        var send_target: u16 = 0;
-        var remote_tab_count: usize = 0;
-        var active_tab_idx: ?u16 = null;
+        // Per-tab metadata collected in first pass
+        const SessionKey = struct {
+            entry: *SshConnectionManager.Entry,
+            group_id: SshConnectionManager.Uuid,
+            target_id: u16,
+        };
+        const TabMeta = struct {
+            info: session_layout.TabInfo,
+            key: SessionKey,
+            is_selected: bool,
+        };
+
+        const tab_metas = alloc.alloc(TabMeta, n) catch return;
+        var tab_count: usize = 0;
         defer {
-            for (tab_infos[0..remote_tab_count]) |*ti| alloc.free(ti.nodes);
-            alloc.free(tab_infos);
+            for (tab_metas[0..tab_count]) |*tm| alloc.free(tm.info.nodes);
+            alloc.free(tab_metas);
         }
 
+        // First pass: collect tab info with session classification
         for (0..n) |i| {
             const page = tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
-            const tab = gobject.ext.cast(Tab, child) orelse {
-                log.debug("sendRemoteLayoutUpdate: tab {d} cast failed", .{i});
-                continue;
-            };
+            const tab = gobject.ext.cast(Tab, child) orelse continue;
             const split_tree = tab.getSplitTree();
-            const tree = split_tree.getTree() orelse {
-                log.debug("sendRemoteLayoutUpdate: tab {d} no tree", .{i});
-                continue;
-            };
-            if (tree.nodes.len == 0) {
-                log.debug("sendRemoteLayoutUpdate: tab {d} empty tree", .{i});
-                continue;
-            }
+            const tree = split_tree.getTree() orelse continue;
+            if (tree.nodes.len == 0) continue;
 
-            // Convert tree nodes to NodeInfo
             const nodes = alloc.alloc(session_layout.NodeInfo, tree.nodes.len) catch return;
             var tab_has_remote = false;
+            var tab_entry: ?*SshConnectionManager.Entry = null;
+            var tab_group_id: SshConnectionManager.Uuid = undefined;
+            var tab_target: u16 = 0;
 
             for (tree.nodes, 0..) |node, j| {
                 switch (node) {
                     .leaf => |surface| {
                         const core = surface.core() orelse {
-                            // Surface not yet initialized — skip this tab
-                            log.debug("sendRemoteLayoutUpdate: tab {d} leaf {d} no core", .{ i, j });
                             alloc.free(nodes);
                             break;
                         };
                         switch (core.io.backend) {
                             .remote => |remote| {
+                                const entry = remote.conn_entry orelse {
+                                    // Not yet connected — skip tab
+                                    alloc.free(nodes);
+                                    break;
+                                };
                                 nodes[j] = .{ .leaf = .{ .surface_id = remote.ssh_ctx.surface_id } };
-                                tab_has_remote = true;
-                                if (send_entry == null) {
-                                    send_entry = remote.conn_entry;
-                                    send_target = remote.target_id;
+                                if (!tab_has_remote) {
+                                    tab_has_remote = true;
+                                    tab_entry = entry;
+                                    tab_group_id = remote.ssh_ctx.group_id;
+                                    tab_target = remote.target_id;
                                 }
                             },
                             else => {
-                                // Non-remote tab — skip entirely
                                 alloc.free(nodes);
                                 break;
                             },
@@ -1974,7 +1972,6 @@ pub const Window = extern struct {
                     },
                 }
             } else {
-                // Loop completed without break — tab was fully processed
                 if (!tab_has_remote) {
                     alloc.free(nodes);
                     continue;
@@ -1983,8 +1980,6 @@ pub const Window = extern struct {
                 const zoomed: ?u16 = if (tree.zoomed) |h| @intFromEnum(h) else null;
                 const title: ?[]const u8 = if (tab.getTitleOverride()) |t| @as([]const u8, t) else null;
 
-                // Determine focused_node: find which leaf node index matches
-                // the split_tree's active surface.
                 const focused_node: ?u16 = blk: {
                     const active_surface = split_tree.getActiveSurface() orelse break :blk null;
                     for (tree.nodes, 0..) |node, j| {
@@ -1998,47 +1993,74 @@ pub const Window = extern struct {
                     break :blk null;
                 };
 
-                // Track active tab: if this page is the selected page,
-                // record the remote tab index.
-                if (selected_page) |sel| {
-                    if (sel == page) {
-                        active_tab_idx = @intCast(remote_tab_count);
-                    }
-                }
+                const is_sel = if (selected_page) |sel| (sel == page) else false;
 
-                tab_infos[remote_tab_count] = .{
-                    .nodes = nodes,
-                    .zoomed = zoomed,
-                    .title_override = title,
-                    .focused_node = focused_node,
+                tab_metas[tab_count] = .{
+                    .info = .{
+                        .nodes = nodes,
+                        .zoomed = zoomed,
+                        .title_override = title,
+                        .focused_node = focused_node,
+                    },
+                    .key = .{
+                        .entry = tab_entry orelse {
+                            alloc.free(nodes);
+                            continue;
+                        },
+                        .group_id = tab_group_id,
+                        .target_id = tab_target,
+                    },
+                    .is_selected = is_sel,
                 };
-                remote_tab_count += 1;
+                tab_count += 1;
                 continue;
             }
-            // If we got here via break (non-remote surface), skip this tab
         }
 
-        log.debug("sendRemoteLayoutUpdate: {d} remote tabs serialized", .{remote_tab_count});
-        if (remote_tab_count == 0) return;
-        const entry = send_entry orelse return;
+        log.debug("sendRemoteLayoutUpdate: {d} remote tabs collected", .{tab_count});
+        if (tab_count == 0) return;
 
-        const blob = session_layout.serialize(alloc, .{
-            .tabs = tab_infos[0..remote_tab_count],
-            .active_tab = active_tab_idx,
-        }) catch return;
-        defer alloc.free(blob);
+        // Second pass: group by session and send per-session layout blobs.
+        // Mark processed tabs to avoid duplicates.
+        var processed = alloc.alloc(bool, tab_count) catch return;
+        defer alloc.free(processed);
+        @memset(processed, false);
 
-        self.sendLayoutBlob(entry, send_target, blob);
-    }
+        var session_tab_buf = alloc.alloc(session_layout.TabInfo, tab_count) catch return;
+        defer alloc.free(session_tab_buf);
 
-    /// Send a layout blob to the remote daemon, deduplicating by hash.
-    fn sendLayoutBlob(self: *Self, entry: *SshConnectionManager.Entry, target: u16, blob: []const u8) void {
-        const priv = self.private();
-        const hash = std.hash.XxHash64.hash(0, blob);
-        if (hash == priv.last_layout_hash) return;
-        priv.last_layout_hash = hash;
-        log.info("sendLayoutBlob: sending layout ({d} bytes)", .{blob.len});
-        SshConnectionManager.enqueueWrite(entry, .layout, target, blob);
+        for (0..tab_count) |start| {
+            if (processed[start]) continue;
+            processed[start] = true;
+
+            const key = tab_metas[start].key;
+            var session_count: usize = 0;
+            var active_tab_idx: ?u16 = null;
+
+            // Collect all tabs for this session
+            if (tab_metas[start].is_selected) active_tab_idx = @intCast(session_count);
+            session_tab_buf[session_count] = tab_metas[start].info;
+            session_count += 1;
+
+            for (start + 1..tab_count) |k| {
+                if (processed[k]) continue;
+                if (tab_metas[k].key.entry != key.entry) continue;
+                if (!std.mem.eql(u8, &tab_metas[k].key.group_id, &key.group_id)) continue;
+
+                processed[k] = true;
+                if (tab_metas[k].is_selected) active_tab_idx = @intCast(session_count);
+                session_tab_buf[session_count] = tab_metas[k].info;
+                session_count += 1;
+            }
+
+            const blob = session_layout.serialize(alloc, .{
+                .tabs = session_tab_buf[0..session_count],
+                .active_tab = active_tab_idx,
+            }) catch continue;
+            defer alloc.free(blob);
+
+            SshConnectionManager.storeAndSendLayout(key.entry, key.group_id, key.target_id, blob);
+        }
     }
 
     /// Restore a multi-tab layout from a serialized blob received from
@@ -2442,43 +2464,44 @@ pub const Window = extern struct {
         self.toggleCommandPalette();
     }
 
-    /// Open the SSH connection picker overlay.
-    fn sshCreateSession(self: *Window, mode: apprt.action.SshSessionMode) void {
-        const priv = self.private();
-        priv.ssh_create_mode = mode;
-
-        // Get a reference to the SSH connection overlay. First check the weak
-        // reference to see if we already have one stored. If not, create one.
-        const ssh_overlay = priv.ssh_connection_overlay.get() orelse ssh_overlay: {
+    /// Get or create an SSH connection overlay, caching it in the given WeakRef.
+    fn getOrCreateSshOverlay(
+        self: *Window,
+        weak_ref: *WeakRef(SshConnectionOverlay),
+        comptime handler: *const fn (*SshConnectionOverlay, ?[*:0]const u8, *Self) callconv(.c) void,
+    ) *SshConnectionOverlay {
+        return weak_ref.get() orelse {
             const overlay = SshConnectionOverlay.new();
-
-            // Connect the "host-connect" signal to create a new window with SSH
             _ = SshConnectionOverlay.signals.@"host-connect".connect(
                 overlay,
                 *Window,
-                signalSshConnect,
+                handler,
                 self,
                 .{},
             );
-
-            priv.ssh_connection_overlay.set(overlay);
-            break :ssh_overlay overlay;
+            weak_ref.set(overlay);
+            return overlay;
         };
-        defer ssh_overlay.unref();
+    }
 
+    /// Open the SSH connection picker overlay.
+    fn sshCreateSession(self: *Window, mode: apprt.action.SshSessionMode) void {
+        const priv = self.private();
+        priv.ssh_mode = mode;
+        const ssh_overlay = self.getOrCreateSshOverlay(&priv.ssh_connection_overlay, signalSshConnect);
+        defer ssh_overlay.unref();
         ssh_overlay.toggle(self);
     }
 
     /// React to the SSH connection overlay "connect" signal.
-    /// Opens the SSH session in a new window or replaces the current window.
     fn signalSshConnect(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, self: *Self) callconv(.c) void {
         const target = std.mem.span(target_str orelse return);
         if (target.len == 0) return;
 
-        const mode = self.private().ssh_create_mode;
+        const mode = self.private().ssh_mode;
         switch (mode) {
-            .new_window => Application.default().newSshWindow(target),
-            .new_tab => self.newSshTab(target),
+            .new_window => Application.default().newSshWindow(target, null),
+            .new_tab => self.newSshTab(target, null),
         }
     }
 
@@ -2492,30 +2515,11 @@ pub const Window = extern struct {
     }
 
     /// Open the SSH connection picker for the attach flow.
-    /// After the user selects a host, the session picker is shown
-    /// to choose a detached session.
     fn sshSessionAttach(self: *Window, mode: apprt.action.SshSessionMode) void {
         const priv = self.private();
-        priv.ssh_attach_mode = mode;
-
-        // Get a reference to the attach-specific SSH connection overlay.
-        const ssh_overlay = priv.ssh_attach_overlay.get() orelse ssh_overlay: {
-            const overlay = SshConnectionOverlay.new();
-
-            // Connect with attach-specific handler
-            _ = SshConnectionOverlay.signals.@"host-connect".connect(
-                overlay,
-                *Window,
-                signalSshAttach,
-                self,
-                .{},
-            );
-
-            priv.ssh_attach_overlay.set(overlay);
-            break :ssh_overlay overlay;
-        };
+        priv.ssh_mode = mode;
+        const ssh_overlay = self.getOrCreateSshOverlay(&priv.ssh_attach_overlay, signalSshAttach);
         defer ssh_overlay.unref();
-
         ssh_overlay.toggle(self);
     }
 
@@ -2559,10 +2563,10 @@ pub const Window = extern struct {
         const sid = std.mem.span(session_id orelse return);
         if (target.len == 0 or sid.len == 0) return;
 
-        const mode = self.private().ssh_attach_mode;
+        const mode = self.private().ssh_mode;
         switch (mode) {
-            .new_window => Application.default().newSshAttachWindow(target, sid),
-            .new_tab => self.newSshAttachTab(target, sid),
+            .new_window => Application.default().newSshWindow(target, sid),
+            .new_tab => self.newSshTab(target, sid),
         }
     }
 
@@ -2588,16 +2592,10 @@ pub const Window = extern struct {
     }
 
     /// Open a new SSH session tab in the current window.
-    fn newSshTab(self: *Self, ssh_target: []const u8) void {
+    /// If `session_id` is provided, attaches to an existing remote session.
+    fn newSshTab(self: *Self, ssh_target: []const u8, session_id: ?[]const u8) void {
         self.newTabForWindow(null, .{
-            .ssh_ctx = .{ .target = ssh_target },
-        });
-    }
-
-    /// Open a new tab in this window attached to an existing SSH remote session.
-    fn newSshAttachTab(self: *Self, ssh_target: []const u8, ssh_session: []const u8) void {
-        self.newTabForWindow(null, .{
-            .ssh_ctx = .{ .target = ssh_target, .session_id = ssh_session },
+            .ssh_ctx = .{ .target = ssh_target, .session_id = session_id },
         });
     }
 
