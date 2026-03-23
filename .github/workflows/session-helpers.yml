@@ -51,6 +51,8 @@ jobs:
           zig build \
             -Dapp-runtime=none \
             -Demit-headless=true \
+            -Demit-xcframework=false \
+            -Demit-docs=false \
             -Dtarget=${{ matrix.target }} \
             -Doptimize=ReleaseSafe
 
