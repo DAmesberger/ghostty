@@ -1,4 +1,4 @@
-name: Build Session Helpers
+name: Build Ghostty Headless
 
 on:
   push:
@@ -106,13 +106,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="session-v${{ steps.proto.outputs.version }}"
+          tag="ghostty-headless-v${{ steps.proto.outputs.version }}"
 
           # Delete existing release if it exists (to update assets)
           gh release delete "$tag" --yes 2>/dev/null || true
 
           gh release create "$tag" \
-            --title "Session Helpers v${{ steps.proto.outputs.version }}" \
+            --title "Ghostty Headless v${{ steps.proto.outputs.version }}" \
             --notes "Pre-built headless binaries for SSH remote sessions.
 
           Protocol version: ${{ steps.proto.outputs.version }}

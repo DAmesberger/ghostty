@@ -88,7 +88,7 @@ pub fn headlessDownloadUrl(
 ) ![]const u8 {
     return try std.fmt.allocPrint(
         alloc,
-        "{s}/session-v{d}/ghostty-headless-{s}-{s}",
+        "{s}/ghostty-headless-v{d}/ghostty-headless-{s}-{s}",
         .{ release_base_url, proto_version, os, arch },
     );
 }
@@ -394,7 +394,7 @@ test "headlessDownloadUrl" {
     const url = try headlessDownloadUrl(testing.allocator, 1, "linux", "x86_64");
     defer testing.allocator.free(url);
     try testing.expectEqualStrings(
-        "https://github.com/DAmesberger/ghostty/releases/download/session-v1/ghostty-headless-linux-x86_64",
+        "https://github.com/DAmesberger/ghostty/releases/download/ghostty-headless-v1/ghostty-headless-linux-x86_64",
         url,
     );
 }
