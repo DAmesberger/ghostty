@@ -1,0 +1,120 @@
+name: Build Session Helpers
+
+on:
+  push:
+    branches:
+      - feature/ssh-remote-sessions
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: ghostty-headless-linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-linux-gnu
+          - artifact: ghostty-headless-linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-linux-gnu
+          - artifact: ghostty-headless-macos-x86_64
+            runner: macos-latest
+            target: x86_64-macos
+          - artifact: ghostty-headless-macos-aarch64
+            runner: macos-latest
+            target: aarch64-macos
+
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.artifact }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine Zig version
+        id: zig-version
+        run: |
+          version=$(grep -oP '\.minimum_zig_version\s*=\s*"\K[^"]+' build.zig.zon)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - name: Build headless binary
+        run: |
+          zig build \
+            -Dapp-runtime=none \
+            -Demit-headless=true \
+            -Dtarget=${{ matrix.target }} \
+            -Doptimize=ReleaseSafe
+
+      - name: Rename artifact
+        run: mv zig-out/bin/ghostty-headless ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read protocol version
+        id: proto
+        run: |
+          version=$(grep -oP 'protocol_version:\s*u16\s*=\s*\K[0-9]+' src/session/protocol.zig)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/ghostty-headless-*; do
+            name=$(basename "$dir")
+            cp "$dir/$name" "release/$name"
+            chmod +x "release/$name"
+          done
+
+          cat > release/metadata.json <<EOF
+          {
+            "protocol_version": ${{ steps.proto.outputs.version }},
+            "commit": "${{ github.sha }}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="session-v${{ steps.proto.outputs.version }}"
+
+          # Delete existing release if it exists (to update assets)
+          gh release delete "$tag" --yes 2>/dev/null || true
+
+          gh release create "$tag" \
+            --title "Session Helpers v${{ steps.proto.outputs.version }}" \
+            --notes "Pre-built headless binaries for SSH remote sessions.
+
+          Protocol version: ${{ steps.proto.outputs.version }}
+          Commit: ${{ github.sha }}
+          Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --prerelease \
+            release/*

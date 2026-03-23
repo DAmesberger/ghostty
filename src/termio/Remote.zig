@@ -118,9 +118,10 @@ pub fn threadEnter(
     // Show overlay
     _ = td.surface_mailbox.push(.{ .connection_state = .connecting }, .{ .forever = {} });
 
-    // Acquire a connection from the pool
+    // Acquire a connection from the pool. Don't set conn_entry yet —
+    // other threads (resize, write) use it to enqueue data, and the
+    // entry isn't safe to use until the connection is fully established.
     const entry = try self.connection_manager.acquire(self.ssh_ctx.target, self.ssh_ctx.jump);
-    self.conn_entry = entry;
     errdefer {
         self.connection_manager.release(self.ssh_ctx.target, self.ssh_ctx.jump);
         self.conn_entry = null;
@@ -152,6 +153,10 @@ pub fn threadEnter(
         self.connection_manager.mutex.unlock();
         if (!has_channel) return error.SshConnectionFailed;
     }
+
+    // Connection is fully established — now safe to expose the entry
+    // to other threads via conn_entry.
+    self.conn_entry = entry;
 
     // Allocate a target ID for this surface
     self.target_id = self.connection_manager.allocateTarget(entry);
@@ -240,7 +245,7 @@ pub fn threadEnter(
     } };
 }
 
-/// Performs SSH connection setup: connect, upload helper, start daemon,
+/// Performs SSH connection setup: connect, provision ghostty, start daemon,
 /// open channel, switch to non-blocking, and spawn the SSH thread.
 fn setupConnection(
     self: *Remote,
@@ -295,35 +300,35 @@ fn setupConnection(
         }
     }
 
-    const helper_result = session.client.ensureRemoteHelper(alloc, &entry.ctx, stderr, mailbox) catch |err| {
+    const provision = session.client.ensureRemoteGhostty(alloc, &entry.ctx, stderr, mailbox) catch |err| {
         _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;
     };
-    const helper_path = helper_result.path;
+    const remote_bin_path = provision.path;
 
-    // Only force-restart the daemon if the helper binary was re-uploaded
+    // Only force-restart the daemon if the binary was re-provisioned
     // (version mismatch). Otherwise reuse the running daemon to preserve
     // existing sessions.
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path, helper_result.uploaded) catch |err| {
-        alloc.free(helper_path);
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, provision.provisioned) catch |err| {
+        alloc.free(remote_bin_path);
         _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
         return err;
     };
 
     entry.surfaces_mutex.lock();
-    if (entry.helper_path.len > 0) self.connection_manager.alloc.free(entry.helper_path);
-    entry.helper_path = helper_path;
+    if (entry.remote_bin_path.len > 0) self.connection_manager.alloc.free(entry.remote_bin_path);
+    entry.remote_bin_path = remote_bin_path;
     entry.surfaces_mutex.unlock();
 
-    // Copy helper_path for use below so we don't read the field after
+    // Copy remote_bin_path for use below so we don't read the field after
     // releasing the lock (another thread could modify it).
-    const helper_path_local = self.alloc.dupe(u8, helper_path) catch return error.OutOfMemory;
-    defer self.alloc.free(helper_path_local);
+    const remote_bin_path_local = self.alloc.dupe(u8, remote_bin_path) catch return error.OutOfMemory;
+    defer self.alloc.free(remote_bin_path_local);
 
     const channel = session.client.openMultiplexChannel(
         alloc,
         &entry.ctx,
-        helper_path_local,
+        remote_bin_path_local,
     ) catch |err| {
         _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
         return err;

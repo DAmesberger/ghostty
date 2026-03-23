@@ -128,6 +128,13 @@ pub fn build(b: *std.Build) !void {
             resources.install();
             if (i18n) |v| v.install();
         }
+    } else if (config.emit_headless) {
+        // Headless build: install the exe as "ghostty-headless" (no resources/i18n/libs).
+        // Used to produce cross-platform binaries for SSH remote sessions.
+        const headless_install = b.addInstallArtifact(exe.exe, .{
+            .dest_sub_path = "ghostty-headless",
+        });
+        b.getInstallStep().dependOn(&headless_install.step);
     } else {
         // Libghostty
         //

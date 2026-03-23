@@ -1,6 +1,6 @@
 //! Shared SSH connection pool keyed by (ssh_target, jump).
 //! Multiple surfaces (tabs/splits) to the same host share one SSH connection,
-//! one SSH channel to the helper process, and multiplexed sessions via target IDs.
+//! one SSH channel to the remote ghostty process, and multiplexed sessions via target IDs.
 //! A dedicated SSH thread per connection exclusively owns all libssh2 calls,
 //! since libssh2 is NOT thread-safe. Surfaces communicate via a thread-safe
 //! write queue and receive frames via direct processOutput calls.
@@ -21,7 +21,9 @@ const log = std.log.scoped(.ssh_connection_manager);
 pub const max_surfaces: usize = 64;
 
 mutex: std.Thread.Mutex = .{},
-connections: std.StringArrayHashMap(Entry),
+/// Entries are heap-allocated so that pointers remain stable across
+/// hash map growth and ordered removal (which shifts internal arrays).
+connections: std.StringArrayHashMap(*Entry),
 alloc: Allocator,
 
 pub const Uuid = session.shared.Uuid;
@@ -54,9 +56,9 @@ pub const EntryState = enum(u8) {
 pub const Entry = struct {
     alloc: Allocator,
     ctx: session.client.SshContext,
-    helper_path: []const u8,
+    remote_bin_path: []const u8,
     ref_count: u32,
-    /// Shared SSH channel to the multiplexed helper process (one per host).
+    /// Shared SSH channel to the multiplexed ghostty process (one per host).
     channel: ?ssh.Channel = null,
     /// Next target ID to assign for multiplexing.
     next_target: u16 = 1,
@@ -80,7 +82,7 @@ pub const Entry = struct {
     last_keepalive_received: i128 = 0,
     /// Set to true after receiving the first pong from the remote.
     /// Stale detection is only active when this is true, ensuring backward
-    /// compatibility with old helpers that don't support keepalive.
+    /// compatibility with older remote ghostty versions that don't support keepalive.
     keepalive_active: bool = false,
 
     // Reconnect configuration (set from config during setupConnection)
@@ -117,22 +119,24 @@ pub const Entry = struct {
 
 pub fn init(alloc: Allocator) SshConnectionManager {
     return .{
-        .connections = std.StringArrayHashMap(Entry).init(alloc),
+        .connections = std.StringArrayHashMap(*Entry).init(alloc),
         .alloc = alloc,
     };
 }
 
 pub fn deinit(self: *SshConnectionManager) void {
     var it = self.connections.iterator();
-    while (it.next()) |entry| {
-        self.alloc.free(entry.key_ptr.*);
-        if (entry.value_ptr.helper_path.len > 0) self.alloc.free(entry.value_ptr.helper_path);
-        if (entry.value_ptr.channel) |*ch| ch.close();
-        for (entry.value_ptr.write_queue.items) |req| {
-            entry.value_ptr.alloc.free(req.data);
+    while (it.next()) |kv| {
+        self.alloc.free(kv.key_ptr.*);
+        const entry = kv.value_ptr.*;
+        if (entry.remote_bin_path.len > 0) self.alloc.free(entry.remote_bin_path);
+        if (entry.channel) |*ch| ch.close();
+        for (entry.write_queue.items) |req| {
+            entry.alloc.free(req.data);
         }
-        entry.value_ptr.write_queue.deinit(entry.value_ptr.alloc);
-        entry.value_ptr.ctx.deinit();
+        entry.write_queue.deinit(entry.alloc);
+        entry.ctx.deinit();
+        self.alloc.destroy(entry);
     }
     self.connections.deinit();
 }
@@ -152,7 +156,7 @@ pub fn findEntry(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]c
     defer self.mutex.unlock();
     const key = makeKey(self.alloc, ssh_target, jump) catch return null;
     defer self.alloc.free(key);
-    return self.connections.getPtr(key);
+    return if (self.connections.get(key)) |entry| entry else null;
 }
 
 /// Acquire a connection entry. If the entry already exists its ref_count
@@ -167,24 +171,25 @@ pub fn acquire(
 
     const key = try makeKey(self.alloc, ssh_target, jump);
 
-    if (self.connections.getPtr(key)) |entry| {
+    if (self.connections.get(key)) |entry| {
         self.alloc.free(key);
         entry.ref_count += 1;
         return entry;
     }
 
-    const entry: Entry = .{
+    const entry = try self.alloc.create(Entry);
+    entry.* = .{
         .alloc = self.alloc,
         .ctx = .{
             .alloc = self.alloc,
             .ssh_target = ssh_target,
             .jump = jump,
         },
-        .helper_path = &.{},
+        .remote_bin_path = &.{},
         .ref_count = 1,
     };
     try self.connections.put(key, entry);
-    return self.connections.getPtr(key).?;
+    return entry;
 }
 
 /// Allocate the next target ID for a session on this entry.
@@ -392,7 +397,7 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
     const key = makeKey(self.alloc, ssh_target, jump) catch return;
     defer self.alloc.free(key);
 
-    if (self.connections.getPtr(key)) |entry| {
+    if (self.connections.get(key)) |entry| {
         if (entry.ref_count > 1) {
             entry.ref_count -= 1;
             return;
@@ -421,9 +426,10 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
             entry.auth_state.password = null;
         }
 
-        if (entry.helper_path.len > 0) self.alloc.free(entry.helper_path);
+        if (entry.remote_bin_path.len > 0) self.alloc.free(entry.remote_bin_path);
         if (entry.channel) |*ch| ch.close();
         entry.ctx.deinit();
+        self.alloc.destroy(entry);
 
         const removed = self.connections.fetchOrderedRemove(key);
         if (removed) |r| self.alloc.free(r.key);
@@ -461,7 +467,7 @@ pub fn sshThreadMain(entry: *Entry) void {
     // Keepalive state.
     // Stale detection only activates after receiving the first pong
     // from the remote (entry.keepalive_active). This ensures backward
-    // compatibility with old helpers that don't support keepalive.
+    // compatibility with older remote ghostty versions that don't support keepalive.
     const now_init = std.time.nanoTimestamp();
     var last_keepalive_sent: i128 = now_init;
     entry.last_keepalive_received = now_init;
@@ -482,7 +488,7 @@ pub fn sshThreadMain(entry: *Entry) void {
             } else break;
         }
 
-        // Check channel EOF (helper process exited — all sessions dead)
+        // Check channel EOF (remote ghostty exited — all sessions dead)
         if (channel.eof()) {
             log.info("ssh channel EOF", .{});
             notifyAllSurfaces(entry);
@@ -763,28 +769,28 @@ fn reopenSurfaces(entry: *Entry) void {
 }
 
 /// Try to open a multiplexed channel, restarting the daemon if needed.
-/// Copies helper_path under surfaces_mutex to avoid racing with setupConnection.
+/// Copies remote_bin_path under surfaces_mutex to avoid racing with setupConnection.
 fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     const alloc = entry.alloc;
 
-    // Copy helper_path under mutex — setupConnection writes it from another thread.
+    // Copy remote_bin_path under mutex — setupConnection writes it from another thread.
     entry.surfaces_mutex.lock();
-    const helper_path = alloc.dupe(u8, entry.helper_path) catch {
+    const remote_bin_path = alloc.dupe(u8, entry.remote_bin_path) catch {
         entry.surfaces_mutex.unlock();
         return null;
     };
     entry.surfaces_mutex.unlock();
-    defer alloc.free(helper_path);
+    defer alloc.free(remote_bin_path);
 
     // First attempt
-    if (session.client.openMultiplexChannel(alloc, &entry.ctx, helper_path)) |ch| {
+    if (session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path)) |ch| {
         return ch;
     } else |_| {}
 
-    // Helper might be dead — try starting daemon without killing existing one first
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, helper_path, false) catch return null;
+    // Daemon might be dead — try starting without killing existing one first
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false) catch return null;
 
-    return session.client.openMultiplexChannel(alloc, &entry.ctx, helper_path) catch null;
+    return session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path) catch null;
 }
 
 fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {

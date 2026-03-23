@@ -3,10 +3,14 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const internal_os = @import("../os/main.zig");
 
-pub const helper_subdir = "ghostty/remote-session";
+pub const state_subdir = "ghostty/remote-session";
 pub const remote_binary_name = "ghostty";
-/// The CLI subcommand used to invoke the remote helper modes.
+pub const remote_headless_binary_name = "ghostty-headless";
+/// The CLI subcommand used to invoke the remote session modes.
 pub const remote_subcommand = "+ssh-session";
+
+/// Base URL for downloading pre-built headless binaries from CI releases.
+pub const release_base_url = "https://github.com/DAmesberger/ghostty/releases/download";
 
 pub const ControlCommand = enum {
     detach,
@@ -14,7 +18,7 @@ pub const ControlCommand = enum {
 };
 
 pub fn stateDir(alloc: Allocator) ![]const u8 {
-    return try internal_os.xdg.state(alloc, .{ .subdir = helper_subdir });
+    return try internal_os.xdg.state(alloc, .{ .subdir = state_subdir });
 }
 
 pub fn registryPath(alloc: Allocator) ![]const u8 {
@@ -50,6 +54,43 @@ pub fn remoteInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: [
     const dir = try remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(dir);
     return try std.fs.path.join(alloc, &.{ dir, remote_binary_name });
+}
+
+pub fn remoteHeadlessInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
+    const dir = try remoteInstallDir(alloc, remote_home, remote_os);
+    defer alloc.free(dir);
+    return try std.fs.path.join(alloc, &.{ dir, remote_headless_binary_name });
+}
+
+/// Normalize raw `uname -s` output to the OS name used in release artifacts.
+pub fn normalizeOs(uname_s: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(uname_s, "Darwin")) return "macos";
+    if (std.ascii.eqlIgnoreCase(uname_s, "Linux")) return "linux";
+    // Pass through as-is for unrecognized values (e.g. FreeBSD).
+    return uname_s;
+}
+
+/// Normalize raw `uname -m` output to the arch name used in release artifacts.
+pub fn normalizeArch(uname_m: []const u8) []const u8 {
+    if (std.mem.eql(u8, uname_m, "arm64")) return "aarch64";
+    if (std.mem.eql(u8, uname_m, "x86_64")) return "x86_64";
+    if (std.mem.eql(u8, uname_m, "aarch64")) return "aarch64";
+    return uname_m;
+}
+
+/// Construct the full download URL for a headless binary release asset.
+/// Caller owns the returned string.
+pub fn headlessDownloadUrl(
+    alloc: Allocator,
+    proto_version: u16,
+    os: []const u8,
+    arch: []const u8,
+) ![]const u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s}/session-v{d}/ghostty-headless-{s}-{s}",
+        .{ release_base_url, proto_version, os, arch },
+    );
 }
 
 pub fn sanitizeLabelAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
@@ -330,4 +371,37 @@ test "sanitize label" {
     defer testing.allocator.free(value);
 
     try testing.expectEqualStrings("hello-world", value);
+}
+
+test "normalizeOs" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("macos", normalizeOs("Darwin"));
+    try testing.expectEqualStrings("macos", normalizeOs("darwin"));
+    try testing.expectEqualStrings("linux", normalizeOs("Linux"));
+    try testing.expectEqualStrings("linux", normalizeOs("linux"));
+    try testing.expectEqualStrings("FreeBSD", normalizeOs("FreeBSD"));
+}
+
+test "normalizeArch" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("aarch64", normalizeArch("arm64"));
+    try testing.expectEqualStrings("aarch64", normalizeArch("aarch64"));
+    try testing.expectEqualStrings("x86_64", normalizeArch("x86_64"));
+}
+
+test "headlessDownloadUrl" {
+    const testing = std.testing;
+    const url = try headlessDownloadUrl(testing.allocator, 1, "linux", "x86_64");
+    defer testing.allocator.free(url);
+    try testing.expectEqualStrings(
+        "https://github.com/DAmesberger/ghostty/releases/download/session-v1/ghostty-headless-linux-x86_64",
+        url,
+    );
+}
+
+test "remoteHeadlessInstallPath" {
+    const testing = std.testing;
+    const path = try remoteHeadlessInstallPath(testing.allocator, "/home/user", "Linux");
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings("/home/user/.local/state/ghostty/bin/ghostty-headless", path);
 }

@@ -23,7 +23,8 @@ fn secureZeroAndFree(alloc: Allocator, buf: []u8) void {
 pub const Error = error{
     RemoteCommandFailed,
     RemotePlatformUnsupported,
-    RemoteHelperUploadFailed,
+    RemoteUploadFailed,
+    RemoteDownloadFailed,
     RemoteAuthRequired,
     RemoteCheckFailed,
 };
@@ -274,19 +275,29 @@ pub const SshContext = struct {
 
 pub const Mailbox = @import("../apprt.zig").surface.Mailbox;
 
-/// Ensure the remote helper binary exists on the target host with a
-/// compatible protocol version.
-pub const HelperResult = struct {
+/// Result of provisioning a ghostty binary on the remote host.
+pub const ProvisionResult = struct {
     path: []const u8,
-    uploaded: bool,
+    provisioned: bool,
 };
 
-pub fn ensureRemoteHelper(
+/// Ensure a compatible ghostty binary exists on the remote host.
+///
+/// Resolution order (check existing):
+///   1. `ghostty` in PATH with matching protocol version → use it
+///   2. Deployed `ghostty-headless` at install path → protocol version match → use it
+///   3. Deployed `ghostty` (full) at install path → protocol version match → use it
+///
+/// Provisioning (always installs as `ghostty-headless`):
+///   4a. Local headless binary exists → upload it
+///   4b. Same platform, no local headless → upload full local ghostty as ghostty-headless
+///   4c. Different platform → download headless from CI
+pub fn ensureRemoteGhostty(
     alloc: Allocator,
     ctx: *SshContext,
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
-) !HelperResult {
+) !ProvisionResult {
     // Establish SSH connection
     try ctx.connect(stderr);
     var sess = &ctx.session.?;
@@ -298,10 +309,7 @@ pub fn ensureRemoteHelper(
     const remote_os = try resolveRemoteOs(alloc, sess);
     defer alloc.free(remote_os);
 
-    const helper_path = try shared.remoteInstallPath(alloc, remote_home, remote_os);
-    errdefer alloc.free(helper_path);
-
-    // First, check if ghostty is in PATH on the remote and has the right version.
+    // 1. Check if ghostty is in PATH on the remote and has the right version.
     const path_check = sess.exec("ghostty " ++ shared.remote_subcommand ++ " --protocol-version") catch null;
     if (path_check) |pc| {
         defer alloc.free(pc.stdout);
@@ -309,48 +317,312 @@ pub fn ensureRemoteHelper(
         if (pc.exit_code == 0) {
             if (parseProtocolVersion(pc.stdout)) |ver| {
                 if (ver == protocol.protocol_version) {
-                    // ghostty in PATH has the right version — use it directly.
-                    const system_path = try alloc.dupe(u8, "ghostty");
-                    alloc.free(helper_path);
-                    return .{ .path = system_path, .uploaded = false };
+                    return .{ .path = try alloc.dupe(u8, "ghostty"), .provisioned = false };
                 }
             }
         }
     }
 
-    // Probe the deployed binary at the install path.
+    // 2. Probe deployed ghostty-headless (works regardless of platform).
+    const headless_path = try shared.remoteHeadlessInstallPath(alloc, remote_home, remote_os);
+    defer alloc.free(headless_path);
+
+    if (try probeDeployedBinary(alloc, sess, headless_path)) {
+        return .{ .path = try alloc.dupe(u8, headless_path), .provisioned = false };
+    }
+
+    // 3. Probe deployed full ghostty (legacy/manual install).
+    const full_path = try shared.remoteInstallPath(alloc, remote_home, remote_os);
+    defer alloc.free(full_path);
+
+    if (try probeDeployedBinary(alloc, sess, full_path)) {
+        return .{ .path = try alloc.dupe(u8, full_path), .provisioned = false };
+    }
+
+    // 4. Need to provision — always installs as ghostty-headless.
+    const dest = try alloc.dupe(u8, headless_path);
+    errdefer alloc.free(dest);
+
+    // 4a. Prefer uploading a local headless binary if available.
+    if (try findLocalHeadless(alloc)) |local_headless| {
+        defer alloc.free(local_headless);
+
+        try stderr.writeAll("Uploading ghostty-headless to remote...\n");
+        try stderr.flush();
+
+        try uploadGhostty(alloc, sess, dest, local_headless, remote_home, remote_os, stderr, mailbox);
+        return .{ .path = dest, .provisioned = true };
+    }
+
+    // 4b/c. No local headless — check platform compatibility.
+    const remote_arch = try resolveRemoteArch(alloc, sess);
+    defer alloc.free(remote_arch);
+
+    const local = shared.localPlatform();
+    const platforms_match = platformMatches(local.os, remote_os) and
+        std.ascii.eqlIgnoreCase(local.arch, remote_arch);
+
+    if (platforms_match) {
+        // 4b. Same platform — upload full local ghostty, installed as ghostty-headless.
+        const exe_path = try std.fs.selfExePathAlloc(alloc);
+        defer alloc.free(exe_path);
+
+        try stderr.writeAll("Uploading ghostty to remote (as ghostty-headless)...\n");
+        try stderr.flush();
+
+        try uploadGhostty(alloc, sess, dest, exe_path, remote_home, remote_os, stderr, mailbox);
+        return .{ .path = dest, .provisioned = true };
+    }
+
+    // 4c. Cross-platform — download headless from CI.
+    const norm_os = shared.normalizeOs(remote_os);
+    const norm_arch = shared.normalizeArch(remote_arch);
+
+    try stderr.print(
+        "Cross-platform detected (local={s}/{s}, remote={s}/{s}). Downloading headless binary...\n",
+        .{ local.os, local.arch, norm_os, norm_arch },
+    );
+    try stderr.flush();
+
+    try downloadAndInstallHeadless(alloc, sess, dest, remote_home, remote_os, norm_os, norm_arch, stderr, mailbox);
+    return .{ .path = dest, .provisioned = true };
+}
+
+/// Find a locally-built headless binary adjacent to the current exe.
+/// Returns the path if found, null otherwise. Caller owns returned memory.
+fn findLocalHeadless(alloc: Allocator) !?[]const u8 {
+    const exe_path = std.fs.selfExePathAlloc(alloc) catch return null;
+    defer alloc.free(exe_path);
+
+    const dir = std.fs.path.dirname(exe_path) orelse return null;
+    const headless_path = try std.fs.path.join(alloc, &.{ dir, "ghostty-headless" });
+
+    // Verify it exists by opening it
+    const f = std.fs.openFileAbsolute(headless_path, .{}) catch {
+        alloc.free(headless_path);
+        return null;
+    };
+    f.close();
+
+    return headless_path;
+}
+
+/// Check if a deployed binary at the given path has a compatible protocol version.
+/// Returns true if the binary exists and its protocol version matches the local one.
+fn probeDeployedBinary(
+    alloc: Allocator,
+    sess: *ssh.SshSession,
+    binary_path: []const u8,
+) !bool {
     const version_cmd = try std.fmt.allocPrint(
         alloc,
         "{s} " ++ shared.remote_subcommand ++ " --protocol-version",
-        .{helper_path},
+        .{binary_path},
     );
     defer alloc.free(version_cmd);
 
-    const result = sess.exec(version_cmd) catch {
-        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
-        return .{ .path = helper_path, .uploaded = true };
-    };
+    const result = sess.exec(version_cmd) catch return false;
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
-    if (result.exit_code != 0) {
-        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
-        return .{ .path = helper_path, .uploaded = true };
+    if (result.exit_code != 0) return false;
+
+    const remote_version = parseProtocolVersion(result.stdout) orelse return false;
+    if (remote_version != protocol.protocol_version) {
+        log.info("remote binary at {s} has protocol v{d}, need v{d}", .{
+            binary_path, remote_version, protocol.protocol_version,
+        });
+        return false;
     }
 
-    const remote_version = parseProtocolVersion(result.stdout) orelse {
-        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
-        return .{ .path = helper_path, .uploaded = true };
+    return true;
+}
+
+/// Download a pre-built headless binary from GitHub releases and install
+/// it on the remote host. Tries downloading directly on the remote first
+/// (most efficient), then falls back to local download + SCP upload.
+fn downloadAndInstallHeadless(
+    alloc: Allocator,
+    sess: *ssh.SshSession,
+    remote_dest_path: []const u8,
+    remote_home: []const u8,
+    remote_os: []const u8,
+    norm_os: []const u8,
+    norm_arch: []const u8,
+    stderr: *std.Io.Writer,
+    mailbox: ?*Mailbox,
+) !void {
+    const url = try shared.headlessDownloadUrl(alloc, protocol.protocol_version, norm_os, norm_arch);
+    defer alloc.free(url);
+
+    const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
+    defer alloc.free(install_dir);
+
+    // Ensure install directory exists
+    const mkdir_cmd = try std.fmt.allocPrint(alloc, "mkdir -p '{s}' && chmod 700 '{s}'", .{ install_dir, install_dir });
+    defer alloc.free(mkdir_cmd);
+    const mkdir_result = try sess.exec(mkdir_cmd);
+    alloc.free(mkdir_result.stdout);
+    alloc.free(mkdir_result.stderr);
+
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{remote_dest_path});
+    defer alloc.free(tmp_path);
+
+    // Strategy 1: Download directly on remote (avoids double transfer)
+    const remote_dl_cmd = try std.fmt.allocPrint(
+        alloc,
+        "curl -fsSL -o '{s}' '{s}' && chmod 700 '{s}' && mv -f '{s}' '{s}'",
+        .{ tmp_path, url, tmp_path, tmp_path, remote_dest_path },
+    );
+    defer alloc.free(remote_dl_cmd);
+
+    pushConnectionState(mailbox, .downloading);
+
+    const dl_result = sess.exec(remote_dl_cmd) catch null;
+    const remote_dl_ok = if (dl_result) |r| blk: {
+        defer alloc.free(r.stdout);
+        defer alloc.free(r.stderr);
+        break :blk r.exit_code == 0;
+    } else false;
+
+    if (!remote_dl_ok) {
+        // Strategy 2: Download locally then upload via SCP
+        try stderr.writeAll("Remote download failed, downloading locally and uploading via SCP...\n");
+        try stderr.flush();
+
+        try downloadAndUploadLocal(alloc, sess, remote_dest_path, tmp_path, url, stderr, mailbox);
+    }
+
+    // Verify the installed binary works
+    const verify_cmd = try std.fmt.allocPrint(
+        alloc,
+        "{s} " ++ shared.remote_subcommand ++ " --protocol-version",
+        .{remote_dest_path},
+    );
+    defer alloc.free(verify_cmd);
+
+    const verify = sess.exec(verify_cmd) catch {
+        try stderr.writeAll("Failed to verify downloaded headless binary.\n");
+        try stderr.flush();
+        return error.RemoteDownloadFailed;
+    };
+    defer alloc.free(verify.stdout);
+    defer alloc.free(verify.stderr);
+
+    if (verify.exit_code != 0) {
+        try stderr.print("Headless binary failed to execute (exit={d}).\n", .{verify.exit_code});
+        try stderr.flush();
+        return error.RemoteDownloadFailed;
+    }
+
+    const ver = parseProtocolVersion(verify.stdout) orelse {
+        try stderr.writeAll("Headless binary did not report protocol version.\n");
+        try stderr.flush();
+        return error.RemoteDownloadFailed;
     };
 
-    if (remote_version != protocol.protocol_version) {
-        try stderr.writeAll("Ghostty version mismatch on remote, re-uploading...\n");
+    if (ver != protocol.protocol_version) {
+        try stderr.print(
+            "Downloaded binary has protocol version {d}, expected {d}. " ++
+                "Please ensure the CI release matches your local build.\n",
+            .{ ver, protocol.protocol_version },
+        );
         try stderr.flush();
-        try uploadHelper(alloc, sess, helper_path, remote_home, remote_os, stderr, mailbox);
-        return .{ .path = helper_path, .uploaded = true };
+        return error.RemoteDownloadFailed;
     }
 
-    return .{ .path = helper_path, .uploaded = false };
+    try stderr.writeAll("Headless binary installed successfully.\n");
+    try stderr.flush();
+}
+
+/// Download a file locally using curl/wget, then upload via SCP.
+fn downloadAndUploadLocal(
+    alloc: Allocator,
+    sess: *ssh.SshSession,
+    remote_dest_path: []const u8,
+    remote_tmp_path: []const u8,
+    url: []const u8,
+    stderr: *std.Io.Writer,
+    mailbox: ?*Mailbox,
+) !void {
+    // Create a temporary local file
+    const local_tmp = "/tmp/ghostty-headless-download";
+
+    // Try curl first, then wget
+    const curl_argv = [_][]const u8{ "curl", "-fsSL", "-o", local_tmp, url };
+    const wget_argv = [_][]const u8{ "wget", "-q", "-O", local_tmp, url };
+
+    var local_dl_ok = false;
+    for ([_][]const []const u8{ &curl_argv, &wget_argv }) |argv| {
+        var child = std.process.Child.init(argv, alloc);
+        child.stderr_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        _ = child.spawnAndWait() catch continue;
+        local_dl_ok = true;
+        break;
+    }
+
+    if (!local_dl_ok) {
+        try stderr.writeAll("Failed to download headless binary: neither curl nor wget available locally.\n");
+        try stderr.flush();
+        return error.RemoteDownloadFailed;
+    }
+
+    defer std.fs.deleteFileAbsolute(local_tmp) catch {};
+
+    // Upload via SCP
+    const stat = blk: {
+        const f = std.fs.openFileAbsolute(local_tmp, .{}) catch {
+            try stderr.writeAll("Failed to open locally downloaded binary.\n");
+            try stderr.flush();
+            return error.RemoteDownloadFailed;
+        };
+        defer f.close();
+        break :blk f.stat() catch {
+            try stderr.writeAll("Failed to stat locally downloaded binary.\n");
+            try stderr.flush();
+            return error.RemoteDownloadFailed;
+        };
+    };
+
+    const total_bytes: u64 = stat.size;
+    try stderr.print("Uploading headless binary ({d} KB)... ", .{total_bytes / 1024});
+    try stderr.flush();
+
+    pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes } });
+
+    const ProgressCtx = struct {
+        mbox: ?*Mailbox,
+        total: u64,
+
+        pub fn onProgress(ctx: @This(), bytes_sent: u64) void {
+            pushConnectionState(ctx.mbox, .{ .uploading = .{
+                .bytes_sent = bytes_sent,
+                .total_bytes = ctx.total,
+            } });
+        }
+    };
+    try sess.upload(local_tmp, remote_tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes });
+
+    try stderr.writeAll("Done.\n");
+    try stderr.flush();
+
+    // Move into final location
+    const mv_cmd = try std.fmt.allocPrint(
+        alloc,
+        "mv -f '{s}' '{s}' && test -x '{s}' && echo GHOSTTY_SETUP_SUCCESS",
+        .{ remote_tmp_path, remote_dest_path, remote_dest_path },
+    );
+    defer alloc.free(mv_cmd);
+    const mv_result = try sess.exec(mv_cmd);
+    defer alloc.free(mv_result.stdout);
+    defer alloc.free(mv_result.stderr);
+
+    if (std.mem.indexOf(u8, mv_result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
+        try stderr.writeAll("Failed to install headless binary on remote host.\n");
+        try stderr.flush();
+        return error.RemoteUploadFailed;
+    }
 }
 
 fn parseProtocolVersion(stdout: []const u8) ?u16 {
@@ -374,13 +646,26 @@ fn resolveRemoteOs(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
     return os;
 }
 
-/// Launch the remote session daemon via the helper's --daemonize flag.
+fn resolveRemoteArch(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
+    const result = try sess.exec("uname -m");
+    defer alloc.free(result.stderr);
+    if (result.exit_code != 0) {
+        alloc.free(result.stdout);
+        return try alloc.dupe(u8, "x86_64");
+    }
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const arch = try alloc.dupe(u8, trimmed);
+    alloc.free(result.stdout);
+    return arch;
+}
+
+/// Launch the remote session daemon via ghostty's --daemonize flag.
 /// If `force_restart` is true, kills any existing daemon first (used
-/// when the helper binary was re-uploaded with a new protocol version).
+/// when the binary was re-provisioned with a new protocol version).
 pub fn ensureRemoteDaemon(
     alloc: Allocator,
     ctx: *const SshContext,
-    helper_path: []const u8,
+    remote_bin_path: []const u8,
     force_restart: bool,
 ) !void {
     var sess = ctx.session orelse return error.RemoteCommandFailed;
@@ -391,7 +676,7 @@ pub fn ensureRemoteDaemon(
         const kill_cmd = try std.fmt.allocPrint(
             alloc,
             "{s} " ++ shared.remote_subcommand ++ " --kill-daemon",
-            .{helper_path},
+            .{remote_bin_path},
         );
         defer alloc.free(kill_cmd);
         const kill_result = sess.exec(kill_cmd) catch null;
@@ -404,7 +689,7 @@ pub fn ensureRemoteDaemon(
     const cmd = try std.fmt.allocPrint(
         alloc,
         "{s} " ++ shared.remote_subcommand ++ " --daemonize",
-        .{helper_path},
+        .{remote_bin_path},
     );
     defer alloc.free(cmd);
 
@@ -491,42 +776,40 @@ fn shellEscape(alloc: Allocator, s: []const u8) ![]u8 {
     return out[0 .. i + 1];
 }
 
-/// Open a multiplexed channel to the remote helper's stdio-attach mode.
+/// Open a multiplexed channel to the remote ghostty's stdio-attach mode.
 /// Returns a Channel shared by all sessions to this host. Session creation
 /// happens via open frames, not CLI args.
 pub fn openMultiplexChannel(
     alloc: Allocator,
     ctx: *const SshContext,
-    helper_path: []const u8,
+    remote_bin_path: []const u8,
 ) !ssh.Channel {
     var sess = ctx.session orelse return error.RemoteCommandFailed;
     var channel = try sess.openChannel();
     errdefer channel.close();
 
-    const cmd = try std.fmt.allocPrint(alloc, "{s} " ++ shared.remote_subcommand ++ " --stdio-attach", .{helper_path});
+    const cmd = try std.fmt.allocPrint(alloc, "{s} " ++ shared.remote_subcommand ++ " --stdio-attach", .{remote_bin_path});
     defer alloc.free(cmd);
 
     try channel.exec(cmd);
     return channel;
 }
 
-// -- Internal helpers --
+// -- Internal --
 
-fn uploadHelper(
+/// Upload a local binary to the remote host via SCP.
+/// `local_binary_path` is the path to the binary on the local machine.
+/// `remote_dest_path` is the full path on the remote where it will be installed.
+fn uploadGhostty(
     alloc: Allocator,
     sess: *ssh.SshSession,
-    helper_path: []const u8,
+    remote_dest_path: []const u8,
+    local_binary_path: []const u8,
     remote_home: []const u8,
     remote_os: []const u8,
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
 ) !void {
-    try stderr.writeAll("\nCopying Ghostty to remote host...\n");
-    try stderr.flush();
-
-    const exe_path = try std.fs.selfExePathAlloc(alloc);
-    defer alloc.free(exe_path);
-
     const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(install_dir);
 
@@ -537,29 +820,12 @@ fn uploadHelper(
     defer alloc.free(mkdir_result.stdout);
     defer alloc.free(mkdir_result.stderr);
 
-    // Check platform compatibility
-    {
-        const arch_result = sess.exec("uname -m") catch null;
-        if (arch_result) |ar| {
-            defer alloc.free(ar.stdout);
-            defer alloc.free(ar.stderr);
-            const remote_arch = std.mem.trim(u8, ar.stdout, " \t\r\n");
-            const local = shared.localPlatform();
-            if (!platformMatches(local.os, remote_os) or
-                !std.ascii.eqlIgnoreCase(local.arch, remote_arch))
-            {
-                try stderr.writeAll("Warning: remote platform may not match local binary.\n");
-                try stderr.flush();
-            }
-        }
-    }
-
     // Upload via SCP to a temp file, then move into place to avoid
     // "Text file busy" when replacing a running binary.
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{helper_path});
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{remote_dest_path});
     defer alloc.free(tmp_path);
 
-    const file = try std.fs.openFileAbsolute(exe_path, .{});
+    const file = try std.fs.openFileAbsolute(local_binary_path, .{});
     defer file.close();
     const stat = try file.stat();
     const total_bytes: u64 = stat.size;
@@ -581,7 +847,7 @@ fn uploadHelper(
             } });
         }
     };
-    try sess.upload(exe_path, tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes });
+    try sess.upload(local_binary_path, tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes });
 
     try stderr.writeAll("Done.\n");
     try stderr.flush();
@@ -590,7 +856,7 @@ fn uploadHelper(
     const mv_cmd = try std.fmt.allocPrint(
         alloc,
         "mv -f '{s}' '{s}' && test -x '{s}' && echo GHOSTTY_SETUP_SUCCESS",
-        .{ tmp_path, helper_path, helper_path },
+        .{ tmp_path, remote_dest_path, remote_dest_path },
     );
     defer alloc.free(mv_cmd);
     const mv_result = try sess.exec(mv_cmd);
@@ -600,7 +866,7 @@ fn uploadHelper(
     if (std.mem.indexOf(u8, mv_result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
         try stderr.writeAll("Setup failed: could not install Ghostty on remote host.\n");
         try stderr.flush();
-        return error.RemoteHelperUploadFailed;
+        return error.RemoteUploadFailed;
     }
 
     try stderr.writeAll("Ghostty installed successfully.\n");
@@ -691,7 +957,7 @@ test "platform matches case insensitive" {
 }
 
 test "version output format matches parser expectation" {
-    // The helper outputs "GHOSTTY_SESSION_PROTOCOL <version>\n"
+    // Remote ghostty outputs "GHOSTTY_SESSION_PROTOCOL <version>\n"
     // and the client parses it with this prefix. Verify they agree.
     const version_output = std.fmt.comptimePrint(
         "GHOSTTY_SESSION_PROTOCOL {d}\n",

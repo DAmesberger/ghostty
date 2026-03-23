@@ -15,5 +15,8 @@ pub const App = struct {
     ) !bool {
         return false;
     }
+
+    /// No-op for headless builds — nothing to wake up.
+    pub fn wakeup(_: *App) void {}
 };
 pub const Surface = struct {};

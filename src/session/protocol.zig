@@ -21,6 +21,7 @@ pub const keepalive_server_timeout_ns: i128 = 60 * std.time.ns_per_s;
 pub const ConnectionState = union(enum) {
     connecting,
     uploading: UploadProgress,
+    downloading,
     setup,
     connected,
     reconnecting: ReconnectInfo,

@@ -963,6 +963,10 @@ pub const Surface = extern struct {
                 }
                 overlay.setStatus("Uploading Ghostty\xe2\x80\xa6");
             },
+            .downloading => {
+                resetOverlayDefaults(overlay);
+                overlay.setStatus("Downloading headless binary\xe2\x80\xa6");
+            },
             .setup => {
                 resetOverlayDefaults(overlay);
                 overlay.setStatus("Starting remote daemon\xe2\x80\xa6");

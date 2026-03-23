@@ -644,16 +644,16 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
 
         log.info("session query: SSH connected, checking remote Ghostty...", .{});
 
-        const helper_result = session.client.ensureRemoteHelper(alloc, &ctx, stderr, null) catch |err| {
-            log.warn("session query: ensureRemoteHelper failed: {}", .{err});
+        const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch |err| {
+            log.warn("session query: ensureRemoteGhostty failed: {}", .{err});
             return error.NoActiveConnection;
         };
-        const helper_path = helper_result.path;
-        defer alloc.free(helper_path);
+        const remote_bin_path = provision.path;
+        defer alloc.free(remote_bin_path);
 
-        log.info("session query: remote Ghostty at {s}, starting daemon...", .{helper_path});
+        log.info("session query: remote Ghostty at {s}, starting daemon...", .{remote_bin_path});
 
-        session.client.ensureRemoteDaemon(alloc, &ctx, helper_path, helper_result.uploaded) catch |err| {
+        session.client.ensureRemoteDaemon(alloc, &ctx, remote_bin_path, provision.provisioned) catch |err| {
             log.warn("session query: ensureRemoteDaemon failed: {}", .{err});
             return error.NoActiveConnection;
         };
@@ -663,7 +663,7 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
         const cmd = std.fmt.allocPrint(
             alloc,
             "{s} " ++ session.shared.remote_subcommand ++ " --list",
-            .{helper_path},
+            .{remote_bin_path},
         ) catch return error.SessionQueryFailed;
         defer alloc.free(cmd);
 
