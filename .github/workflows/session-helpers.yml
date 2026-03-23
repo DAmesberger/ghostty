@@ -38,7 +38,7 @@ jobs:
       - name: Determine Zig version
         id: zig-version
         run: |
-          version=$(grep -oP '\.minimum_zig_version\s*=\s*"\K[^"]+' build.zig.zon)
+          version=$(sed -n 's/.*\.minimum_zig_version\s*=\s*"\([^"]*\)".*/\1/p' build.zig.zon)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig
@@ -75,7 +75,7 @@ jobs:
       - name: Read protocol version
         id: proto
         run: |
-          version=$(grep -oP 'protocol_version:\s*u16\s*=\s*\K[0-9]+' src/session/protocol.zig)
+          version=$(sed -n 's/.*protocol_version.*=\s*\([0-9]*\);/\1/p' src/session/protocol.zig)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
