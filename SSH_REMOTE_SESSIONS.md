@@ -7,7 +7,7 @@ Native SSH remote session support for Ghostty. Connect to remote hosts with full
 
 ## What it does
 
-When you SSH into a host, Ghostty provisions a headless daemon on the remote side. Your local Ghostty talks to it over a binary protocol, giving you:
+Ghostty connects to remote hosts natively via SSH (using `--ssh-target` or keybindings), provisions a headless daemon on the remote side, and communicates over a binary protocol. This gives you:
 
 - **Persistent sessions** — detach and reattach without losing state
 - **Scrollback sync** — full history is preserved across reconnects
@@ -21,39 +21,47 @@ When you SSH into a host, Ghostty provisions a headless daemon on the remote sid
 
 ## Quick start
 
+### Recommended keybindings
+
+Add these to your Ghostty config to enable SSH session management:
+
+```
+keybind = ctrl+shift+s=ssh_create_session:new_tab
+keybind = ctrl+shift+a=ssh_session_attach:new_tab
+keybind = ctrl+shift+d=ssh_session_detach
+keybind = ctrl+shift+r=ssh_session_reconnect
+```
+
 ### Connect to a remote host
 
-```
-ghostty -e ssh user@host
+Use the `ssh_create_session` keybinding (above) or launch from the CLI with `--ssh-target`:
+
+```bash
+# New session via CLI
+ghostty --ssh-target=user@host
+
+# With a jump/bastion host
+ghostty --ssh-target=user@host --ssh-jump=bastion@proxy
 ```
 
-Ghostty detects the SSH command, provisions the headless daemon on the remote host (first time only), and establishes a multiplexed binary session.
+Ghostty connects via SSH, provisions a headless daemon on the remote host (first time only), and establishes a multiplexed binary session. This is **not** a regular `ssh` command — Ghostty manages the connection natively.
 
 ### Detach a session
 
-Use the keybinding for `ssh_session_detach` (bind it in your config):
-
-```
-keybind = ctrl+shift+d=ssh_session_detach
-```
-
-The session keeps running on the remote host. Your local tab closes cleanly.
+Press your `ssh_session_detach` keybinding (e.g. `Ctrl+Shift+D`). The session keeps running on the remote host. Your local tab closes cleanly.
 
 ### Reattach to a session
 
-**GUI picker** — bind `ssh_session_attach`:
+Press your `ssh_session_attach` keybinding (e.g. `Ctrl+Shift+A`). This opens a session picker dialog showing all detached sessions on the host. Select one to reattach.
 
-```
-keybind = ctrl+shift+a=ssh_session_attach:new_tab
-```
-
-This opens a session picker dialog showing all detached sessions on the host.
-
-**CLI** — list and attach directly:
+You can also attach from the CLI:
 
 ```bash
+# List sessions on a remote host
 ghostty +session-list --ssh user@host
-ghostty -e ssh user@host --ssh-session=SESSION_ID
+
+# Attach to a specific session by ID
+ghostty --ssh-target=user@host --ssh-session=SESSION_ID
 ```
 
 ### Manage sessions
