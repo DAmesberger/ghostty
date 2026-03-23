@@ -1,3 +1,7 @@
+> **Fork notice**: This branch adds experimental **SSH remote session support** — persistent sessions,
+> automatic reconnection, scrollback sync, and per-session colored tabs. See
+> [SSH_REMOTE_SESSIONS.md](SSH_REMOTE_SESSIONS.md) for details.
+
 <!-- LOGO -->
 <h1>
 <p align="center">
