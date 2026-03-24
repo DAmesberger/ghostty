@@ -18,14 +18,22 @@ const protocol = @import("../session.zig").protocol;
 /// Write a single protocol frame to a file descriptor.
 /// This is the canonical frame-send function — use this everywhere
 /// instead of duplicating frame write logic.
+///
+/// Writes header + payload as two sequential writeAll calls (the OS
+/// will coalesce into one TCP segment for small frames via Nagle or
+/// cork). For the common case this is 2 syscalls total, which is
+/// better than the previous streaming approach that split large
+/// payloads into many 1KB writes.
 pub fn sendFrameFd(fd: posix.fd_t, kind: protocol.Kind, target: u16, payload: []const u8) !void {
     if (payload.len > protocol.max_payload) return error.PayloadTooLarge;
+    const header = (protocol.Header{
+        .kind = kind,
+        .target = target,
+        .len = @intCast(payload.len),
+    }).encodeToBuf();
     var file: std.fs.File = .{ .handle = fd };
-    var buf: [1024]u8 = undefined;
-    var writer_ = file.writerStreaming(&buf);
-    const writer = &writer_.interface;
-    try protocol.writeFrame(writer, kind, target, payload);
-    try writer.flush();
+    try file.writeAll(&header);
+    if (payload.len > 0) try file.writeAll(payload);
 }
 
 pub const ControlCommand = enum {

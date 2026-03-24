@@ -209,28 +209,77 @@ pub const RemoteSession = struct {
         if (self.command.pid) |pid| _ = posix.kill(pid, posix.SIG.TERM) catch {};
     }
 
+    /// Frame interval for output batching (nanoseconds). Accumulate PTY
+    /// output and flush at this rate. 16ms ≈ 60fps — good balance between
+    /// latency and throughput. Interactive keystrokes flush immediately
+    /// (when poll shows no more data ready).
+    const frame_interval_ns: u64 = 16 * std.time.ns_per_ms;
+    /// Soft threshold for flushing early (avoid unbounded accumulation).
+    const flush_threshold: usize = 128 * 1024;
+
     /// Reader thread: reads PTY output, feeds the headless Terminal,
-    /// and forwards raw bytes to the attached client as .data_out frames.
+    /// and forwards accumulated bytes to viewers at the frame rate.
     pub fn readerMain(self: *RemoteSession) void {
-        var buf: [4096]u8 = undefined;
+        var read_buf: [65536]u8 = undefined;
+        var accum = std.ArrayList(u8).empty;
+        defer accum.deinit(self.alloc);
+        var last_flush = std.time.nanoTimestamp();
+
         while (true) {
-            const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => break,
+            // Poll PTY for available data with frame-interval timeout.
+            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - last_flush));
+            const remaining_ms: i32 = if (elapsed >= frame_interval_ns)
+                0
+            else
+                @intCast((frame_interval_ns - elapsed) / std.time.ns_per_ms);
+
+            var pollfds = [1]posix.pollfd{
+                .{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = undefined },
             };
-            if (n == 0) break;
+            const poll_result = posix.poll(&pollfds, remaining_ms) catch break;
 
-            self.mutex.lock();
+            if (poll_result > 0 and (pollfds[0].revents & posix.POLL.IN != 0)) {
+                // Data available — read into accumulation buffer.
+                const n = posix.read(self.pty.master, &read_buf) catch |err| switch (err) {
+                    error.WouldBlock => continue,
+                    else => break,
+                };
+                if (n == 0) break;
 
-            // Feed headless terminal (the source of truth for this session)
-            self.stream.nextSlice(buf[0..n]);
+                self.mutex.lock();
+                self.stream.nextSlice(read_buf[0..n]);
+                self.mutex.unlock();
 
-            // Forward raw bytes to all attached viewers
-            // TODO: Replace with structured page diffs (Phase 4)
-            for (self.viewers.items) |viewer| {
-                sendFrameFd(viewer.fd, .data_out, viewer.target, buf[0..n]) catch {};
+                accum.appendSlice(self.alloc, read_buf[0..n]) catch break;
+
+                // Check if we should flush (threshold exceeded or interval elapsed).
+                const now = std.time.nanoTimestamp();
+                const since_flush: u64 = @intCast(@max(0, now - last_flush));
+                if (accum.items.len < flush_threshold and since_flush < frame_interval_ns) {
+                    continue; // Keep accumulating
+                }
+            } else if (pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
+                break; // PTY closed
             }
 
+            // Flush accumulated data to all viewers as one frame.
+            if (accum.items.len > 0) {
+                self.mutex.lock();
+                for (self.viewers.items) |viewer| {
+                    sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                }
+                self.mutex.unlock();
+                accum.clearRetainingCapacity();
+                last_flush = std.time.nanoTimestamp();
+            }
+        }
+
+        // Flush any remaining data.
+        if (accum.items.len > 0) {
+            self.mutex.lock();
+            for (self.viewers.items) |viewer| {
+                sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+            }
             self.mutex.unlock();
         }
 
