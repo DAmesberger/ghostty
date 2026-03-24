@@ -543,12 +543,8 @@ const Daemon = struct {
                 }
 
                 if (sess) |s| {
-                    s.attachAndServe(fd, target, open_data.resize) catch |err| {
-                        const msg = switch (err) {
-                            error.SessionAlreadyAttached => "session is already attached by another client",
-                            else => "failed to attach to session",
-                        };
-                        sendFrameFd(fd, .err, target, msg) catch {};
+                    s.attachAndServe(fd, target, open_data.resize) catch {
+                        sendFrameFd(fd, .err, target, "failed to attach to session") catch {};
                         sendFrameFd(fd, .eof, target, "") catch {};
                     };
 
@@ -743,7 +739,7 @@ const Daemon = struct {
             for (group.surfaces.values()) |sess| {
                 sess.mutex.lock();
                 if (sess.alive) alive_count += 1;
-                if (sess.attached_fd != null) attached_count += 1;
+                if (sess.viewers.items.len > 0) attached_count += 1;
                 sess.mutex.unlock();
             }
             group.mutex.unlock();
@@ -908,6 +904,7 @@ const Daemon = struct {
             .terminal_instance = t,
             .stream = undefined,
             .group = group,
+            .viewers = .empty,
             .created_at = std.time.timestamp(),
         };
 

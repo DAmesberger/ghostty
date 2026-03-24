@@ -1238,6 +1238,21 @@ command: ?Command = null,
 /// Available since 1.3.0.
 @"ssh-reconnect-interval": u32 = 1000,
 
+/// zstd compression level for SSH remote session data (0-15).
+/// 0 disables compression. Levels 1-3 are fast (suitable for
+/// real-time), 4-9 are balanced, 10-15 are high compression.
+/// Higher levels reduce bandwidth but increase CPU usage.
+@"ssh-compression": u8 = 3,
+
+/// Default size negotiation mode when multiple viewers are attached
+/// to the same remote session.
+///
+/// * `smallest` — PTY is sized to the minimum rows/cols across all
+///   viewers (the default). All viewers see the full content.
+/// * `leader` — PTY is sized to the active controller's terminal.
+///   Other viewers may see a cropped view.
+@"ssh-size-mode": SshSizeMode = .smallest,
+
 /// Controls when command finished notifications are sent. There are
 /// three options:
 ///
@@ -10204,6 +10219,11 @@ pub const SshReconnectBackoff = enum {
     exponential,
     linear,
     constant,
+};
+
+pub const SshSizeMode = enum {
+    smallest,
+    leader,
 };
 
 /// See notify-on-command-finish

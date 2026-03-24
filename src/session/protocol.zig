@@ -87,9 +87,14 @@ pub const header_size: usize = 8;
 
 /// Frame flags (byte 1 of header).
 pub const Flags = packed struct(u8) {
-    /// Payload is zstd compressed.
-    compressed: bool = false,
-    _reserved: u7 = 0,
+    /// zstd compression level (0 = none, 1-15 = zstd level 1-15).
+    compression_level: u4 = 0,
+    _reserved: u4 = 0,
+
+    /// Convenience: true if any compression is applied.
+    pub fn isCompressed(self: Flags) bool {
+        return self.compression_level > 0;
+    }
 };
 
 /// Frame types. Every kind is a first-class enum variant — no sub-typing.
@@ -120,6 +125,10 @@ pub const Kind = enum(u8) {
 
     // Scrollback
     scrollback_response = 17, // Daemon → client: scrollback history chunk (proactive streaming)
+
+    // Multi-viewer
+    viewer_state = 20, // Daemon → viewer(s): roster + session state
+    size_mode_change = 21, // Client → daemon: change size negotiation mode
 };
 
 pub const Header = struct {
@@ -295,6 +304,117 @@ pub const Rename = struct {
             .scope = std.meta.intToEnum(RenameScope, payload[0]) catch return error.InvalidRenamePayload,
             .id = payload[1..][0..uuid_size].*,
             .label = payload[min_payload_size..],
+        };
+    }
+};
+
+// =========================================================================
+// Multi-viewer: size mode and viewer state
+// =========================================================================
+
+pub const SizeMode = enum(u8) {
+    smallest_wins = 0,
+    leader_wins = 1,
+};
+
+pub const ViewerStateReason = enum(u8) {
+    welcome = 0, // Sent to a joining viewer with full roster
+    join = 1, // A new viewer joined
+    leave = 2, // A viewer left
+    control_change = 3, // Active controller changed (someone typed)
+    size_change = 4, // Effective PTY size changed
+    mode_change = 5, // Size mode changed
+};
+
+/// Single viewer entry within a ViewerState payload.
+pub const ViewerEntry = struct {
+    id: Uuid,
+    label: []const u8,
+    is_controller: bool,
+    rows: u16,
+    cols: u16,
+};
+
+/// Payload for `viewer_state` (kind 20).
+/// Sent to viewers on roster changes.
+pub const ViewerState = struct {
+    reason: ViewerStateReason,
+    size_mode: SizeMode,
+    controller_id: Uuid,
+    effective_rows: u16,
+    effective_cols: u16,
+    viewers: []const ViewerEntry,
+
+    /// Fixed header: reason(1) + size_mode(1) + controller_id(16) + rows(2) + cols(2) + count(2) = 24
+    pub const fixed_size = 24;
+    /// Per viewer: id(16) + label_len(2) + is_controller(1) + rows(2) + cols(2) = 23 + label
+    pub const viewer_fixed_size = 23;
+
+    pub fn encode(self: ViewerState, alloc: Allocator) ![]u8 {
+        var total: usize = fixed_size;
+        for (self.viewers) |v| {
+            total += viewer_fixed_size + v.label.len;
+        }
+        const buf = try alloc.alloc(u8, total);
+        buf[0] = @intFromEnum(self.reason);
+        buf[1] = @intFromEnum(self.size_mode);
+        @memcpy(buf[2..18], &self.controller_id);
+        std.mem.writeInt(u16, buf[18..20], self.effective_rows, .little);
+        std.mem.writeInt(u16, buf[20..22], self.effective_cols, .little);
+        std.mem.writeInt(u16, buf[22..24], @intCast(self.viewers.len), .little);
+
+        var off: usize = fixed_size;
+        for (self.viewers) |v| {
+            @memcpy(buf[off..][0..uuid_size], &v.id);
+            off += uuid_size;
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(v.label.len), .little);
+            off += 2;
+            buf[off] = if (v.is_controller) 1 else 0;
+            off += 1;
+            std.mem.writeInt(u16, buf[off..][0..2], v.rows, .little);
+            off += 2;
+            std.mem.writeInt(u16, buf[off..][0..2], v.cols, .little);
+            off += 2;
+            @memcpy(buf[off..][0..v.label.len], v.label);
+            off += v.label.len;
+        }
+        return buf;
+    }
+
+    pub fn parseHeader(payload: []const u8) !struct {
+        reason: ViewerStateReason,
+        size_mode: SizeMode,
+        controller_id: Uuid,
+        effective_rows: u16,
+        effective_cols: u16,
+        viewer_count: u16,
+        remaining: []const u8,
+    } {
+        if (payload.len < fixed_size) return error.InvalidViewerStatePayload;
+        return .{
+            .reason = std.meta.intToEnum(ViewerStateReason, payload[0]) catch return error.InvalidViewerStatePayload,
+            .size_mode = std.meta.intToEnum(SizeMode, payload[1]) catch return error.InvalidViewerStatePayload,
+            .controller_id = payload[2..18].*,
+            .effective_rows = std.mem.readInt(u16, payload[18..20], .little),
+            .effective_cols = std.mem.readInt(u16, payload[20..22], .little),
+            .viewer_count = std.mem.readInt(u16, payload[22..24], .little),
+            .remaining = payload[fixed_size..],
+        };
+    }
+};
+
+/// Payload for `size_mode_change` (kind 21): single byte.
+pub const SizeModeChange = struct {
+    mode: SizeMode,
+
+    pub fn encode(self: SizeModeChange) [1]u8 {
+        return .{@intFromEnum(self.mode)};
+    }
+
+    pub fn parse(payload: []const u8) !SizeModeChange {
+        if (payload.len < 1) return error.InvalidSizeModePayload;
+        return .{
+            .mode = std.meta.intToEnum(SizeMode, payload[0]) catch return error.InvalidSizeModePayload,
         };
     }
 };
@@ -699,14 +819,14 @@ test "header parseFromBuf/encodeToBuf roundtrip" {
     const testing = std.testing;
     const h = Header{
         .kind = .data_out,
-        .flags = .{ .compressed = true },
+        .flags = .{ .compression_level = 3 },
         .target = 42,
         .len = 12345,
     };
     const buf = h.encodeToBuf();
     const parsed = try Header.parseFromBuf(&buf);
     try testing.expectEqual(h.kind, parsed.kind);
-    try testing.expect(parsed.flags.compressed);
+    try testing.expect(parsed.flags.isCompressed());
     try testing.expectEqual(@as(u16, 42), parsed.target);
     try testing.expectEqual(@as(u32, 12345), parsed.len);
 }
@@ -717,11 +837,11 @@ test "flags roundtrip" {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
 
-    try writeFrameFlags(buf.writer(testing.allocator), .data_out, .{ .compressed = true }, 1, "test");
+    try writeFrameFlags(buf.writer(testing.allocator), .data_out, .{ .compression_level = 3 }, 1, "test");
 
     var stream = std.io.fixedBufferStream(buf.items);
     const header = try readHeader(stream.reader());
-    try testing.expect(header.flags.compressed);
+    try testing.expect(header.flags.isCompressed());
     try testing.expectEqual(.data_out, header.kind);
 }
 
@@ -915,4 +1035,58 @@ test "scrollback_response rejects short payload" {
     const testing = std.testing;
     const short: [4]u8 = .{ 0, 0, 0, 0 };
     try testing.expectError(error.InvalidScrollbackResponse, ScrollbackResponse.parse(&short));
+}
+
+test "viewer_state encode/parse" {
+    const testing = std.testing;
+    const shared = @import("shared.zig");
+    const v1_id = shared.generateUuid();
+    const v2_id = shared.generateUuid();
+
+    const state = ViewerState{
+        .reason = .join,
+        .size_mode = .smallest_wins,
+        .controller_id = v1_id,
+        .effective_rows = 24,
+        .effective_cols = 80,
+        .viewers = &.{
+            .{ .id = v1_id, .label = "user@laptop", .is_controller = true, .rows = 24, .cols = 80 },
+            .{ .id = v2_id, .label = "user@desktop", .is_controller = false, .rows = 40, .cols = 120 },
+        },
+    };
+    const encoded = try state.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+
+    const hdr = try ViewerState.parseHeader(encoded);
+    try testing.expectEqual(ViewerStateReason.join, hdr.reason);
+    try testing.expectEqual(SizeMode.smallest_wins, hdr.size_mode);
+    try testing.expectEqualSlices(u8, &v1_id, &hdr.controller_id);
+    try testing.expectEqual(@as(u16, 24), hdr.effective_rows);
+    try testing.expectEqual(@as(u16, 80), hdr.effective_cols);
+    try testing.expectEqual(@as(u16, 2), hdr.viewer_count);
+}
+
+test "size_mode_change encode/parse" {
+    const testing = std.testing;
+    const change = SizeModeChange{ .mode = .leader_wins };
+    const encoded = change.encode();
+    const parsed = try SizeModeChange.parse(&encoded);
+    try testing.expectEqual(SizeMode.leader_wins, parsed.mode);
+}
+
+test "compression level in flags" {
+    const testing = std.testing;
+    const flags = Flags{ .compression_level = 9 };
+    try testing.expect(flags.isCompressed());
+    try testing.expectEqual(@as(u4, 9), flags.compression_level);
+
+    const no_comp = Flags{};
+    try testing.expect(!no_comp.isCompressed());
+    try testing.expectEqual(@as(u4, 0), no_comp.compression_level);
+
+    // Roundtrip through header
+    const h = Header{ .kind = .data_out, .flags = flags, .target = 1, .len = 100 };
+    const buf = h.encodeToBuf();
+    const parsed = try Header.parseFromBuf(&buf);
+    try testing.expectEqual(@as(u4, 9), parsed.flags.compression_level);
 }

@@ -13,7 +13,7 @@
 //! Threading model:
 //!   - readerMain thread: reads PTY → feeds Terminal → forwards raw bytes
 //!   - ClientThread (from daemon): calls attachAndServe which reads client frames
-//!   - The `mutex` protects: terminal_instance, attached_fd, attached_target, alive.
+//!   - The `mutex` protects: terminal_instance, viewers, controller_id, alive.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -48,12 +48,18 @@ pub const RemoteSession = struct {
     /// Used by attachAndServe to store layout blobs.
     group: ?*SessionGroup = null,
 
-    /// Protects: terminal_instance, attached_fd, attached_target, alive.
+    /// Protects: terminal_instance, viewers, controller_id, alive.
     /// Both readerMain and attachAndServe must hold this when accessing
     /// any of these fields.
     mutex: std.Thread.Mutex = .{},
-    attached_fd: ?posix.fd_t = null,
-    attached_target: u16 = 0,
+
+    /// Connected viewers. Multiple clients can view the same surface.
+    viewers: std.ArrayList(ViewerSlot),
+    /// UUID of the viewer who last sent input (active controller).
+    /// Used for UI display and leader-wins size mode.
+    controller_id: Uuid = session.shared.zero_uuid,
+    /// Size negotiation mode for this surface.
+    size_mode: session.protocol.SizeMode = .smallest_wins,
 
     created_at: i64,
     alive: bool = true,
@@ -62,6 +68,15 @@ pub const RemoteSession = struct {
     reader_thread: std.Thread = undefined,
 
     pub const SessionGroup = @import("helper.zig").SessionGroup;
+
+    pub const ViewerSlot = struct {
+        fd: posix.fd_t,
+        target: u16,
+        viewer_id: Uuid,
+        label: []const u8,
+        rows: u16,
+        cols: u16,
+    };
 
     /// Number of rows to serialize per scrollback chunk. Targets ~64KB.
     const scrollback_chunk_rows: u16 = 90;
@@ -78,7 +93,71 @@ pub const RemoteSession = struct {
         return total;
     }
 
+    /// Find a viewer by fd. Must be called with mutex held.
+    pub fn findViewer(self: *RemoteSession, fd: posix.fd_t) ?*ViewerSlot {
+        for (self.viewers.items) |*v| {
+            if (v.fd == fd) return v;
+        }
+        return null;
+    }
+
+    /// Remove a viewer by fd. Must be called with mutex held.
+    fn removeViewer(self: *RemoteSession, fd: posix.fd_t) void {
+        var i: usize = 0;
+        while (i < self.viewers.items.len) {
+            if (self.viewers.items[i].fd == fd) {
+                _ = self.viewers.swapRemove(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Recalculate and apply PTY size based on all viewers and current mode.
+    /// Must be called with mutex held.
+    fn recalculateSize(self: *RemoteSession) void {
+        if (self.viewers.items.len == 0) return;
+        switch (self.size_mode) {
+            .smallest_wins => {
+                var rows: u16 = std.math.maxInt(u16);
+                var cols: u16 = std.math.maxInt(u16);
+                for (self.viewers.items) |v| {
+                    rows = @min(rows, v.rows);
+                    cols = @min(cols, v.cols);
+                }
+                self.pty.setSize(.{
+                    .ws_row = rows,
+                    .ws_col = cols,
+                    .ws_xpixel = 0,
+                    .ws_ypixel = 0,
+                }) catch {};
+            },
+            .leader_wins => {
+                // Leader is whoever has control (controller_id).
+                for (self.viewers.items) |v| {
+                    if (std.mem.eql(u8, &v.viewer_id, &self.controller_id)) {
+                        self.pty.setSize(.{
+                            .ws_row = v.rows,
+                            .ws_col = v.cols,
+                            .ws_xpixel = 0,
+                            .ws_ypixel = 0,
+                        }) catch {};
+                        return;
+                    }
+                }
+                // No controller found — use first viewer's size.
+                self.pty.setSize(.{
+                    .ws_row = self.viewers.items[0].rows,
+                    .ws_col = self.viewers.items[0].cols,
+                    .ws_xpixel = 0,
+                    .ws_ypixel = 0,
+                }) catch {};
+            },
+        }
+    }
+
     pub fn deinit(self: *RemoteSession) void {
+        self.viewers.deinit(self.alloc);
         self.stream.handler.deinit();
         self.terminal_instance.deinit(self.alloc);
         closeFd(self.pty.master);
@@ -109,12 +188,10 @@ pub const RemoteSession = struct {
             // Feed headless terminal (the source of truth for this session)
             self.stream.nextSlice(buf[0..n]);
 
-            // Forward raw bytes to attached client
+            // Forward raw bytes to all attached viewers
             // TODO: Replace with structured page diffs (Phase 4)
-            if (self.attached_fd) |fd| {
-                sendFrameFd(fd, .data_out, self.attached_target, buf[0..n]) catch {
-                    self.attached_fd = null;
-                };
+            for (self.viewers.items) |viewer| {
+                sendFrameFd(viewer.fd, .data_out, viewer.target, buf[0..n]) catch {};
             }
 
             self.mutex.unlock();
@@ -122,8 +199,8 @@ pub const RemoteSession = struct {
 
         self.mutex.lock();
         self.alive = false;
-        if (self.attached_fd) |fd| {
-            sendFrameFd(fd, .eof, self.attached_target, "") catch {};
+        for (self.viewers.items) |viewer| {
+            sendFrameFd(viewer.fd, .eof, viewer.target, "") catch {};
         }
         self.mutex.unlock();
         _ = self.command.wait(false) catch {};
@@ -136,25 +213,35 @@ pub const RemoteSession = struct {
         target: u16,
         resize: session.protocol.Resize,
     ) !void {
+        // Generate a viewer ID for this connection.
+        const viewer_id = session.shared.generateUuid();
+
         self.mutex.lock();
 
-        if (self.attached_fd != null) {
+        // Add viewer to list — multi-viewer: no rejection.
+        self.viewers.append(self.alloc, .{
+            .fd = fd,
+            .target = target,
+            .viewer_id = viewer_id,
+            .label = "", // TODO: pass from Open frame
+            .rows = resize.rows,
+            .cols = resize.cols,
+        }) catch {
             self.mutex.unlock();
-            return error.SessionAlreadyAttached;
+            return error.OutOfMemory;
+        };
+
+        // First viewer gets implicit control.
+        if (self.viewers.items.len == 1) {
+            self.controller_id = viewer_id;
         }
 
-        // Resize PTY so the shell adjusts its output
-        self.pty.setSize(.{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = resize.width_px,
-            .ws_ypixel = resize.height_px,
-        }) catch |err| {
-            log.warn("pty resize failed: {}", .{err});
-        };
+        // Recalculate PTY size based on all viewers.
+        self.recalculateSize();
 
         // Generate and send VT snapshot BEFORE enabling live forwarding
         const vt_snapshot = serializeViewportAsVT(self.alloc, &self.terminal_instance) catch |err| {
+            self.removeViewer(fd);
             self.mutex.unlock();
             return err;
         };
@@ -166,14 +253,12 @@ pub const RemoteSession = struct {
 
         if (vt_snapshot.len > 0) {
             sendFrameFd(fd, .data_out, target, vt_snapshot) catch |err| {
+                self.removeViewer(fd);
                 self.mutex.unlock();
                 return err;
             };
         }
 
-        // NOW enable live forwarding — readerMain will start sending .data_out
-        self.attached_fd = fd;
-        self.attached_target = target;
         self.mutex.unlock();
 
         var history_sent: u32 = 0;
@@ -211,7 +296,12 @@ pub const RemoteSession = struct {
         }
 
         self.mutex.lock();
-        if (self.attached_fd == fd) self.attached_fd = null;
+        self.removeViewer(fd);
+        // If the disconnected viewer was the controller, clear it.
+        if (std.mem.eql(u8, &self.controller_id, &viewer_id)) {
+            self.controller_id = session.shared.zero_uuid;
+        }
+        self.recalculateSize();
         self.mutex.unlock();
     }
 
