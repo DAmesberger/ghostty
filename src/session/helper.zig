@@ -421,7 +421,7 @@ const Daemon = struct {
                     sendFrameFd(fd, .opened, target, p) catch {};
                 }
 
-                sess.attachAndServe(fd, target, open_data.resize) catch {};
+                sess.attachAndServe(fd, target, open_data) catch {};
 
                 if (sess.closed) {
                     sess.kill();
@@ -543,7 +543,7 @@ const Daemon = struct {
                 }
 
                 if (sess) |s| {
-                    s.attachAndServe(fd, target, open_data.resize) catch {
+                    s.attachAndServe(fd, target, open_data) catch {
                         sendFrameFd(fd, .err, target, "failed to attach to session") catch {};
                         sendFrameFd(fd, .eof, target, "") catch {};
                     };
@@ -568,7 +568,7 @@ const Daemon = struct {
                         sendFrameFd(fd, .eof, target, "") catch {};
                         return;
                     };
-                    new_sess.attachAndServe(fd, target, open_data.resize) catch |err| {
+                    new_sess.attachAndServe(fd, target, open_data) catch |err| {
                         log.warn("attach to new session failed: {}", .{err});
                         sendFrameFd(fd, .eof, target, "") catch {};
                     };
@@ -630,7 +630,7 @@ const Daemon = struct {
                 if (opened_payload) |p| {
                     sendFrameFd(fd, .opened, target, p) catch {};
                 }
-                sess.attachAndServe(fd, target, open_data.resize) catch {};
+                sess.attachAndServe(fd, target, open_data) catch {};
 
                 if (sess.closed) {
                     sess.kill();
@@ -663,7 +663,7 @@ const Daemon = struct {
                     if (opened_payload) |p| {
                         sendFrameFd(fd, .opened, target, p) catch {};
                     }
-                    s.attachAndServe(fd, target, open_data.resize) catch {};
+                    s.attachAndServe(fd, target, open_data) catch {};
 
                     // Clean up surface if client sent close.
                     if (s.closed) {

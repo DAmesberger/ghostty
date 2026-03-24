@@ -179,6 +179,8 @@ pub const uuid_size = 16;
 ///   [16] surface_id (zero = auto-generate or first-alive)
 ///   [8]  resize
 ///   [4]  max_scrollback (u32 LE, 0 = use daemon default)
+///   [1]  max_compression_level (0=none, 1-15=zstd, client's preferred max)
+///   [2]  frame_interval_ms (0=no debounce, default 16; client's preferred rate)
 ///   [N]  label (remaining bytes, UTF-8, may be empty)
 pub const Open = struct {
     open_type: OpenType,
@@ -186,11 +188,16 @@ pub const Open = struct {
     surface_id: Uuid = zero_uuid,
     resize: Resize,
     max_scrollback: u32 = 0,
+    max_compression_level: u8 = 3,
+    frame_interval_ms: u16 = 16,
     label: []const u8 = "",
 
     /// Old min size (without max_scrollback) for backward compat parsing.
     const legacy_min_payload_size = 1 + uuid_size * 2 + 8;
-    pub const min_payload_size = legacy_min_payload_size + 4;
+    /// Size with max_scrollback but without capabilities.
+    const v1_min_payload_size = legacy_min_payload_size + 4;
+    /// Current min size: v1 + compression(1) + frame_interval(2) = v1 + 3.
+    pub const min_payload_size = v1_min_payload_size + 3;
 
     pub fn encode(self: Open, alloc: Allocator) ![]u8 {
         const total = min_payload_size + self.label.len;
@@ -201,6 +208,8 @@ pub const Open = struct {
         const resize_bytes = self.resize.bytes();
         @memcpy(buf[1 + uuid_size * 2 .. 1 + uuid_size * 2 + 8], &resize_bytes);
         std.mem.writeInt(u32, buf[legacy_min_payload_size..][0..4], self.max_scrollback, .little);
+        buf[v1_min_payload_size] = self.max_compression_level;
+        std.mem.writeInt(u16, buf[v1_min_payload_size + 1 ..][0..2], self.frame_interval_ms, .little);
         @memcpy(buf[min_payload_size..], self.label);
         return buf;
     }
@@ -212,12 +221,22 @@ pub const Open = struct {
             .group_id = payload[1..][0..uuid_size].*,
             .surface_id = payload[1 + uuid_size ..][0..uuid_size].*,
             .resize = try Resize.parse(payload[1 + uuid_size * 2 ..][0..8]),
-            .max_scrollback = if (payload.len >= min_payload_size)
+            .max_scrollback = if (payload.len >= v1_min_payload_size)
                 std.mem.readInt(u32, payload[legacy_min_payload_size..][0..4], .little)
             else
                 0,
+            .max_compression_level = if (payload.len >= min_payload_size)
+                payload[v1_min_payload_size]
+            else
+                0,
+            .frame_interval_ms = if (payload.len >= min_payload_size)
+                std.mem.readInt(u16, payload[v1_min_payload_size + 1 ..][0..2], .little)
+            else
+                16,
             .label = if (payload.len >= min_payload_size)
                 payload[min_payload_size..]
+            else if (payload.len >= v1_min_payload_size)
+                payload[v1_min_payload_size..]
             else
                 payload[legacy_min_payload_size..],
         };

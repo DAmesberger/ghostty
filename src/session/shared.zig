@@ -36,6 +36,19 @@ pub fn sendFrameFd(fd: posix.fd_t, kind: protocol.Kind, target: u16, payload: []
     if (payload.len > 0) try file.writeAll(payload);
 }
 
+/// Compute the effective compression level for a set of viewers.
+/// Returns the minimum of all viewers' max_compression_level values,
+/// or 0 if any viewer doesn't support compression.
+pub fn negotiateCompressionLevel(viewers: []const @import("remote_session.zig").RemoteSession.ViewerSlot) u8 {
+    if (viewers.len == 0) return 0;
+    var min_level: u8 = 15;
+    for (viewers) |v| {
+        if (v.max_compression_level == 0) return 0; // Any viewer without compression → disable
+        min_level = @min(min_level, v.max_compression_level);
+    }
+    return min_level;
+}
+
 pub const ControlCommand = enum {
     detach,
     reconnect,

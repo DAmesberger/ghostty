@@ -76,6 +76,7 @@ pub const RemoteSession = struct {
         label: []const u8,
         rows: u16,
         cols: u16,
+        max_compression_level: u8 = 0,
     };
 
     /// Number of rows to serialize per scrollback chunk. Targets ~64KB.
@@ -297,7 +298,7 @@ pub const RemoteSession = struct {
         self: *RemoteSession,
         fd: posix.fd_t,
         target: u16,
-        resize: session.protocol.Resize,
+        open_data: session.protocol.Open,
     ) !void {
         // Generate a viewer ID for this connection.
         const viewer_id = session.shared.generateUuid();
@@ -309,9 +310,10 @@ pub const RemoteSession = struct {
             .fd = fd,
             .target = target,
             .viewer_id = viewer_id,
-            .label = "", // TODO: pass from Open frame
-            .rows = resize.rows,
-            .cols = resize.cols,
+            .label = open_data.label,
+            .rows = open_data.resize.rows,
+            .cols = open_data.resize.cols,
+            .max_compression_level = open_data.max_compression_level,
         }) catch {
             self.mutex.unlock();
             return error.OutOfMemory;

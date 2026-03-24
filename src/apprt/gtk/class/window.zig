@@ -33,6 +33,7 @@ const session_layout = session.layout;
 const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
 const SshConnectionOverlay = @import("ssh_connection_overlay.zig").SshConnectionOverlay;
 const SshSessionPicker = @import("ssh_session_picker.zig").SshSessionPicker;
+const SshViewerPanel = @import("ssh_viewer_panel.zig").SshViewerPanel;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -2664,11 +2665,13 @@ pub const Window = extern struct {
     fn actionSshToggleViewerPanel(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
-        self: *Window,
+        _: *Window,
     ) callconv(.c) void {
-        // TODO: Toggle viewer panel overlay widget
-        _ = self;
-        log.info("ssh_toggle_viewer_panel action triggered (not yet implemented)", .{});
+        // The viewer panel is a per-surface overlay. Toggle is handled
+        // at the surface level via the apprt action dispatch.
+        // This window-level handler is a fallback — the real work
+        // happens in the surface's viewer_state mailbox handler.
+        log.info("ssh_toggle_viewer_panel: use keybinding on an SSH surface", .{});
     }
 
     /// React to a GTK action requesting SSH session deletion.
