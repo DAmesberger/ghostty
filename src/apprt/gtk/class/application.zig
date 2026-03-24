@@ -783,6 +783,10 @@ pub const Application = extern struct {
 
             .ssh_session_attach => return Action.sshSessionAttach(target, value),
 
+            .ssh_rename_session => return Action.sshRenameSession(target, value),
+
+            .ssh_delete_session => return Action.sshDeleteSession(target, value),
+
             // Unimplemented
             .secure_input,
             .close_all_windows,
@@ -2842,6 +2846,24 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().sshSessionAttach(value);
+            },
+        }
+    }
+
+    pub fn sshRenameSession(target: apprt.Target, _: apprt.Action.Value(.ssh_rename_session)) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().sshRenameSession();
+            },
+        }
+    }
+
+    pub fn sshDeleteSession(target: apprt.Target, _: apprt.Action.Value(.ssh_delete_session)) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().sshDeleteSession();
             },
         }
     }

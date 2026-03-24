@@ -5954,6 +5954,18 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             return false;
         },
 
+        .ssh_rename_session => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .ssh_rename_session,
+            {},
+        ),
+
+        .ssh_delete_session => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .ssh_delete_session,
+            {},
+        ),
+
         .toggle_background_opacity => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_background_opacity,

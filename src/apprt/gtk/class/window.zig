@@ -397,6 +397,8 @@ pub const Window = extern struct {
             .init("toggle-command-palette", actionToggleCommandPalette, null),
             .init("ssh-create-session", actionSshCreateSession, s_variant_type),
             .init("ssh-session-attach", actionSshSessionAttach, s_variant_type),
+            .init("ssh-rename-session", actionSshRenameSession, null),
+            .init("ssh-delete-session", actionSshDeleteSession, null),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -2589,6 +2591,30 @@ pub const Window = extern struct {
             apprt.action.SshSessionMode,
             std.mem.span(str orelse return .new_window),
         ) orelse .new_window;
+    }
+
+    /// React to a GTK action requesting SSH session rename.
+    fn actionSshRenameSession(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        // TODO: Show Adw.MessageDialog with text entry for new name,
+        // then send rename frame through SshConnectionManager.
+        _ = self;
+        log.info("ssh_rename_session action triggered (not yet implemented)", .{});
+    }
+
+    /// React to a GTK action requesting SSH session deletion.
+    fn actionSshDeleteSession(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        // TODO: Show Adw.AlertDialog confirmation, then send close
+        // frame with CloseMode.session through SshConnectionManager.
+        _ = self;
+        log.info("ssh_delete_session action triggered (not yet implemented)", .{});
     }
 
     /// Open a new SSH session tab in the current window.

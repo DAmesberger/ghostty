@@ -761,8 +761,8 @@ pub const Action = union(enum) {
     ///
     /// This only has an effect when the surface command is `+session-proxy`.
     /// The remote session continues running on the SSH target and can later
-    /// be rediscovered with `ghostty +session-list` and reattached with
-    /// `ghostty +session-attach`.
+    /// be rediscovered with `ghostty +ssh-session --list` and reattached with
+    /// `ghostty +ssh-session --attach`.
     ssh_session_detach,
 
     /// Reconnect the current Ghostty remote session after a transport loss.
@@ -795,6 +795,20 @@ pub const Action = union(enum) {
     ///   - `new_window` (default): Opens in a new window.
     ///   - `new_tab`: Opens in a new tab in the current window.
     ssh_session_attach: SshSessionMode,
+
+    /// Rename the current SSH remote session.
+    ///
+    /// Opens a dialog prompting for a new session name, then sends a
+    /// rename command to the remote daemon. Only effective when the
+    /// surface is an SSH remote session.
+    ssh_rename_session,
+
+    /// Delete (kill) the current SSH remote session.
+    ///
+    /// Shows a confirmation dialog, then terminates all surfaces in the
+    /// session group on the remote host. Only effective when the surface
+    /// is an SSH remote session.
+    ssh_delete_session,
 
     /// Toggle the quick terminal.
     ///
@@ -1406,6 +1420,8 @@ pub const Action = union(enum) {
             .ssh_session_reconnect,
             .ssh_create_session,
             .ssh_session_attach,
+            .ssh_rename_session,
+            .ssh_delete_session,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

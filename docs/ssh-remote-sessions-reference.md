@@ -12,9 +12,8 @@ flags.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `ssh-target` | `?string` | `null` | SSH destination. Format: `user@host` or `user@host:port`. When set, the surface connects to the remote host via SSH instead of running a local command. Multiple tabs/splits to the same target share one underlying SSH connection. |
-| `ssh-jump` | `?string` | `null` | SSH jump host (ProxyJump). Format: `user@host` or `user@host:port`. Used to tunnel through an intermediate host to reach the target. |
-| `ssh-session` | `?string` | `null` | Session name or UUID to attach to. If a session with this name/UUID exists, Ghostty reattaches; otherwise a new named session is created (create-or-attach semantics). Session IDs are shown by `ghostty +session-list`. |
+| `ssh-target` | `?string` | `null` | SSH destination. Format: `user@host` or `user@host:port`. Supports `via` syntax for jump hosts: `user@host via bastion@gateway`. Multiple jump hosts can be chained with commas: `user@host via hop1,hop2`. When set, the surface connects to the remote host via SSH instead of running a local command. Multiple tabs/splits to the same target share one underlying SSH connection. |
+| `ssh-session` | `?string` | `null` | Session name or UUID to attach to. If a session with this name/UUID exists, Ghostty reattaches; otherwise a new named session is created (create-or-attach semantics). Session IDs are shown by `ghostty +ssh-session --list`. |
 | `ssh-reconnect-attempts` | `u32` | `5` | Maximum automatic reconnect attempts after an SSH disconnect. Once exhausted, the overlay shows Reconnect/Exit buttons for manual retry. Set to `0` to disable auto-reconnect entirely. Available since 1.3.0. |
 | `ssh-reconnect-backoff` | `enum` | `exponential` | Backoff strategy for automatic reconnection. Values: `exponential` (`min(interval * 2^attempt, 30000)`), `linear` (`min(interval * attempt, 30000)`), `constant` (fixed interval). Available since 1.3.0. |
 | `ssh-reconnect-interval` | `u32` | `1000` | Base interval in milliseconds between reconnect attempts. Interpretation depends on `ssh-reconnect-backoff`. Available since 1.3.0. |
@@ -24,8 +23,7 @@ flags.
 ### Example
 
 ```
-ssh-target = user@dev-server:22
-ssh-jump = user@bastion
+ssh-target = user@dev-server:22 via user@bastion
 ssh-session = my-project
 ssh-reconnect-attempts = 10
 ssh-reconnect-backoff = exponential
@@ -60,42 +58,46 @@ keybind = ctrl+shift+r=ssh_session_reconnect
 
 ## CLI Commands
 
-### `+session-list`
+### `+ssh-session`
 
-List Ghostty-managed remote sessions on an SSH target.
+Unified command for managing remote sessions. When `--ssh` is provided, the
+command connects to the remote host first and executes there. Without `--ssh`,
+it runs locally (used by the remote helper).
+
+**List sessions:**
 
 ```
-ghostty +session-list --ssh=user@host [--jump=user@bastion]
+ghostty +ssh-session --list --ssh user@host
+ghostty +ssh-session --list --ssh "user@host via bastion"
+```
+
+**Kill a session:**
+
+```
+ghostty +ssh-session --kill=<id> --ssh user@host
+```
+
+**Rename a session:**
+
+```
+ghostty +ssh-session --rename=<id> --label=new-name --ssh user@host
 ```
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--ssh` | Yes | SSH destination whose sessions to list. |
-| `--jump` | No | SSH jump host (ProxyJump). |
+| `--ssh` | Yes (for remote) | SSH destination. Supports `via` syntax for jump hosts. |
+| `--list` | — | List all sessions on the target. |
+| `--kill=<id>` | — | Kill the session with the given UUID. |
+| `--rename=<id>` | — | Rename the session with the given UUID. Requires `--label`. |
+| `--label=<name>` | With `--rename` | New label for the session. |
 
-Output shows session groups with their surfaces:
+Output for `--list` shows session groups:
 
 ```
 a1b2c3d4e5f6...  my-project  2 surfaces  attached
-  11223344...    my-project   alive  attached
-  55667788...    my-project   alive  attached
 ```
 
-### `+session-kill`
-
-Terminate a Ghostty-managed remote session.
-
-```
-ghostty +session-kill --ssh=user@host --session=<id> [--jump=user@bastion]
-```
-
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--ssh` | Yes | SSH destination that owns the session. |
-| `--session` | Yes | Session identifier to terminate (from `+session-list`). |
-| `--jump` | No | SSH jump host (ProxyJump). |
-
-### `+ssh-session` (remote helper)
+### `+ssh-session` remote helper modes
 
 The `+ssh-session` subcommand is the remote helper binary invoked on the SSH
 target. It is not typically run by the user directly. The client uploads a

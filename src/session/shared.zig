@@ -78,6 +78,40 @@ pub fn normalizeArch(uname_m: []const u8) []const u8 {
     return uname_m;
 }
 
+/// Parsed SSH target with optional jump host chain.
+/// Returned slices point into the original input string.
+pub const ParsedSshTarget = struct {
+    target: []const u8,
+    jump: ?[]const u8,
+};
+
+/// Parse an SSH target string that optionally contains a " via " jump host
+/// specifier.  Examples:
+///   "user@host"                → .{ .target = "user@host", .jump = null }
+///   "user@host via bastion"    → .{ .target = "user@host", .jump = "bastion" }
+///   "user@host via h1,h2"     → .{ .target = "user@host", .jump = "h1,h2" }
+pub fn parseSshTarget(raw: []const u8) ParsedSshTarget {
+    // Search before trimming so trailing " via " edge cases work.
+    if (std.mem.indexOf(u8, raw, " via ")) |idx| {
+        const target = std.mem.trim(u8, raw[0..idx], " \t\r\n");
+        const jump = std.mem.trim(u8, raw[idx + 5 ..], " \t\r\n");
+        return .{
+            .target = target,
+            .jump = if (jump.len > 0) jump else null,
+        };
+    }
+    return .{ .target = std.mem.trim(u8, raw, " \t\r\n"), .jump = null };
+}
+
+/// Format a target + optional jump back into the canonical "via" string.
+/// Caller owns the returned memory.
+pub fn formatSshTarget(alloc: Allocator, target: []const u8, jump: ?[]const u8) ![]const u8 {
+    if (jump) |j| {
+        return try std.fmt.allocPrint(alloc, "{s} via {s}", .{ target, j });
+    }
+    return try alloc.dupe(u8, target);
+}
+
 /// Construct the full download URL for a headless binary release asset.
 /// Caller owns the returned string.
 pub fn headlessDownloadUrl(
@@ -228,7 +262,7 @@ pub fn generateReadableName(alloc: Allocator, uuid: Uuid) ![]u8 {
 /// Unified SSH connection context that bundles all SSH properties into a
 /// single value type. Replaces threading individual optional fields through
 /// multiple layers (ssh_target, ssh-session, _ssh-group-id, _ssh-surface-id,
-/// ssh-jump, reconnect config).
+/// reconnect config).
 pub const SshConnectionContext = struct {
     target: []const u8,
     jump: ?[]const u8 = null,
@@ -243,8 +277,10 @@ pub const SshConnectionContext = struct {
     pub const SshReconnectBackoff = @import("../config.zig").Config.SshReconnectBackoff;
 
     /// Construct from config fields. Returns null if ssh-target is not set.
+    /// The ssh-target field supports "via" syntax: "user@host via jump".
     pub fn fromConfig(config: anytype) ?SshConnectionContext {
-        const ssh_target = config.@"ssh-target" orelse return null;
+        const raw_target = config.@"ssh-target" orelse return null;
+        const parsed = parseSshTarget(raw_target);
 
         const group_id = if (config.@"_ssh-group-id") |gid_hex|
             parseUuid(gid_hex) catch zero_uuid
@@ -257,8 +293,8 @@ pub const SshConnectionContext = struct {
             zero_uuid;
 
         return .{
-            .target = ssh_target,
-            .jump = config.@"ssh-jump",
+            .target = parsed.target,
+            .jump = parsed.jump,
             .session_id = config.@"ssh-session",
             .group_id = group_id,
             .surface_id = surface_id,
@@ -269,13 +305,10 @@ pub const SshConnectionContext = struct {
     }
 
     /// Apply this context's properties to a config, allocating strings
-    /// in the config's arena.
+    /// in the config's arena. Encodes jump host into "via" syntax.
     pub fn applyToConfig(self: SshConnectionContext, config: anytype) !void {
         const alloc = config.arenaAlloc();
-        config.@"ssh-target" = try alloc.dupe(u8, self.target);
-        if (self.jump) |j| {
-            config.@"ssh-jump" = try alloc.dupe(u8, j);
-        }
+        config.@"ssh-target" = try formatSshTarget(alloc, self.target, self.jump);
         if (self.session_id) |s| {
             config.@"ssh-session" = try alloc.dupe(u8, s);
         }
@@ -404,4 +437,46 @@ test "remoteHeadlessInstallPath" {
     const path = try remoteHeadlessInstallPath(testing.allocator, "/home/user", "Linux");
     defer testing.allocator.free(path);
     try testing.expectEqualStrings("/home/user/.local/state/ghostty/bin/ghostty-headless", path);
+}
+
+test "parseSshTarget simple" {
+    const result = parseSshTarget("user@host");
+    try std.testing.expectEqualStrings("user@host", result.target);
+    try std.testing.expect(result.jump == null);
+}
+
+test "parseSshTarget with via" {
+    const result = parseSshTarget("user@host via bastion@gw");
+    try std.testing.expectEqualStrings("user@host", result.target);
+    try std.testing.expectEqualStrings("bastion@gw", result.jump.?);
+}
+
+test "parseSshTarget with multi-hop via" {
+    const result = parseSshTarget("user@host via hop1,hop2");
+    try std.testing.expectEqualStrings("user@host", result.target);
+    try std.testing.expectEqualStrings("hop1,hop2", result.jump.?);
+}
+
+test "parseSshTarget with extra whitespace" {
+    const result = parseSshTarget("  user@host  via  bastion  ");
+    try std.testing.expectEqualStrings("user@host", result.target);
+    try std.testing.expectEqualStrings("bastion", result.jump.?);
+}
+
+test "parseSshTarget empty via" {
+    const result = parseSshTarget("user@host via ");
+    try std.testing.expectEqualStrings("user@host", result.target);
+    try std.testing.expect(result.jump == null);
+}
+
+test "formatSshTarget without jump" {
+    const s = try formatSshTarget(std.testing.allocator, "user@host", null);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("user@host", s);
+}
+
+test "formatSshTarget with jump" {
+    const s = try formatSshTarget(std.testing.allocator, "user@host", "bastion");
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("user@host via bastion", s);
 }

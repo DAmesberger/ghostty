@@ -359,6 +359,12 @@ pub const Action = union(Key) {
     /// Attach to a detached SSH remote session.
     ssh_session_attach: SshSessionMode,
 
+    /// Rename the current SSH remote session.
+    ssh_rename_session: void,
+
+    /// Delete the current SSH remote session.
+    ssh_delete_session: void,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -430,6 +436,8 @@ pub const Action = union(Key) {
         connection_state,
         ssh_create_session,
         ssh_session_attach,
+        ssh_rename_session,
+        ssh_delete_session,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

@@ -17,7 +17,7 @@ Ghostty connects to remote hosts natively via SSH (using `--ssh-target` or keybi
 - **Connection overlays** — real-time status (connecting, reconnecting, stale)
 - **Password authentication** — GUI overlay prompts, no stdin hijacking
 - **Splits and layouts** — preserved across detach/reattach cycles
-- **Jump host support** — `ssh-jump` config for bastion/proxy setups
+- **Jump host support** — `via` syntax in `ssh-target` for bastion/proxy setups
 
 ## Quick start
 
@@ -41,7 +41,7 @@ Use the `ssh_create_session` keybinding (above) or launch from the CLI with `--s
 ghostty --ssh-target=user@host
 
 # With a jump/bastion host
-ghostty --ssh-target=user@host --ssh-jump=bastion@proxy
+ghostty --ssh-target="user@host via bastion@proxy"
 ```
 
 Ghostty connects via SSH, provisions a headless daemon on the remote host (first time only), and establishes a multiplexed binary session. This is **not** a regular `ssh` command — Ghostty manages the connection natively.
@@ -58,7 +58,7 @@ You can also attach from the CLI:
 
 ```bash
 # List sessions on a remote host
-ghostty +session-list --ssh user@host
+ghostty +ssh-session --list --ssh user@host
 
 # Attach to a specific session by ID
 ghostty --ssh-target=user@host --ssh-session=SESSION_ID
@@ -68,18 +68,20 @@ ghostty --ssh-target=user@host --ssh-session=SESSION_ID
 
 ```bash
 # List all sessions on a remote host
-ghostty +session-list --ssh user@host
+ghostty +ssh-session --list --ssh user@host
 
 # Kill a specific session
-ghostty +session-kill --ssh user@host --session SESSION_ID
+ghostty +ssh-session --kill=SESSION_ID --ssh user@host
+
+# Rename a session
+ghostty +ssh-session --rename=SESSION_ID --label=new-name --ssh user@host
 ```
 
 ## Configuration
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `ssh-target` | — | SSH target (set automatically from `ssh` command) |
-| `ssh-jump` | — | Jump/bastion host for proxied connections |
+| `ssh-target` | — | SSH target. Supports `via` for jump hosts: `user@host via bastion` |
 | `ssh-session` | — | Attach to existing session by ID or label |
 | `ssh-reconnect-attempts` | `5` | Max automatic reconnect attempts (0 = disabled) |
 | `ssh-reconnect-backoff` | `exponential` | Backoff strategy (`exponential` or `linear`) |

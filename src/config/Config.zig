@@ -1199,17 +1199,18 @@ command: ?Command = null,
 /// the remote host via SSH instead of running a local command. The
 /// format is `user@host` or `user@host:port`.
 ///
+/// To route through a jump host, append ` via <jump>`:
+///   `user@host via bastion@gateway`
+///
+/// Multiple jump hosts can be chained with commas:
+///   `user@host via hop1@gw1,hop2@gw2`
+///
 /// Multiple tabs and splits connecting to the same target share
 /// one underlying SSH connection.
 @"ssh-target": ?[]const u8 = null,
 
-/// Optional SSH jump host for remote sessions. Used to tunnel through
-/// an intermediate host to reach the target. Format is `user@host`
-/// or `user@host:port`.
-@"ssh-jump": ?[]const u8 = null,
-
 /// Attach to an existing remote session instead of creating a new one.
-/// The value is a session ID as shown by `ghostty +session-list`.
+/// The value is a session ID as shown by `ghostty +ssh-session --list`.
 /// When set, the remote daemon reattaches to the existing session and
 /// sends a snapshot of the current terminal state.
 @"ssh-session": ?[]const u8 = null,

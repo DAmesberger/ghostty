@@ -599,6 +599,18 @@ fn actionCommands(action: Action.Key) []const Command {
             },
         },
 
+        .ssh_rename_session => comptime &.{.{
+            .action = .ssh_rename_session,
+            .title = "Rename SSH Session",
+            .description = "Prompt to rename the current SSH remote session.",
+        }},
+
+        .ssh_delete_session => comptime &.{.{
+            .action = .ssh_delete_session,
+            .title = "Delete SSH Session",
+            .description = "Delete the current SSH remote session and all its surfaces.",
+        }},
+
         .open_config => comptime &.{.{
             .action = .open_config,
             .title = "Open Config",

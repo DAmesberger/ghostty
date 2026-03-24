@@ -34,6 +34,7 @@ pub const Options = struct {
     @"protocol-version": bool = false,
     @"stdio-attach": bool = false,
     kill: ?[]const u8 = null,
+    rename: ?[]const u8 = null,
     session: ?[]const u8 = null,
     new: bool = false,
     label: ?[]const u8 = null,
@@ -78,6 +79,16 @@ pub fn run(
 
     if (opts.kill) |id| {
         try killSession(alloc, id, stdout);
+        return 0;
+    }
+
+    if (opts.rename) |id| {
+        const new_label = opts.label orelse {
+            try stderr.writeAll("Error: --label is required for rename\n");
+            try stderr.flush();
+            return 1;
+        };
+        try renameSession(alloc, id, new_label, stdout);
         return 0;
     }
 
@@ -1350,6 +1361,36 @@ fn killSession(
     const close_payload = close_data.encode(alloc) catch return;
     defer alloc.free(close_payload);
     sendFrameFd(fd, .close, 0, close_payload) catch return;
+    try writer.writeAll("OK\n");
+    try writer.flush();
+}
+
+/// Rename a session via the daemon's binary frame protocol.
+fn renameSession(
+    alloc: Allocator,
+    id: []const u8,
+    new_label: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    const socket_path = try session.shared.socketPath(alloc);
+    defer alloc.free(socket_path);
+    const fd = try connectUnixSocket(socket_path);
+    defer closeFd(fd);
+
+    const uuid = session.shared.parseUuid(id) catch
+        session.shared.parseUuidDashed(id) catch {
+        log.warn("invalid session id for rename: {s}", .{id});
+        return;
+    };
+
+    const rename_data = session.protocol.Rename{
+        .scope = .group,
+        .id = uuid,
+        .label = new_label,
+    };
+    const rename_payload = try rename_data.encode(alloc);
+    defer alloc.free(rename_payload);
+    try sendFrameFd(fd, .rename, 0, rename_payload);
     try writer.writeAll("OK\n");
     try writer.flush();
 }

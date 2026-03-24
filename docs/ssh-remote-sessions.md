@@ -56,7 +56,7 @@ hosts without needing to look up session UUIDs.
 ### Listing sessions
 
 ```bash
-ghostty +session-list --ssh=user@host
+ghostty +ssh-session --list --ssh user@host
 ```
 
 Output shows session groups with their surfaces:
@@ -96,7 +96,7 @@ split layout is restored.
 ### Killing a session
 
 ```bash
-ghostty +session-kill --ssh=user@host --session=a1b2c3d4e5f6...
+ghostty +ssh-session --kill=a1b2c3d4e5f6... --ssh user@host
 ```
 
 This kills all surfaces in the group.
@@ -244,7 +244,7 @@ Client sends session_open(mode=attach, group_id)
 ```
 Client sends session_rename(group_id, new_label)
   → Daemon updates SessionGroup.label
-  → +session-list shows the new name
+  → +ssh-session --list shows the new name
 ```
 
 ### Protocol

@@ -928,6 +928,14 @@ pub const Surface = extern struct {
         ) != 0;
     }
 
+    pub fn sshRenameSession(self: *Self) bool {
+        return self.as(gtk.Widget).activateAction("win.ssh-rename-session", null) != 0;
+    }
+
+    pub fn sshDeleteSession(self: *Self) bool {
+        return self.as(gtk.Widget).activateAction("win.ssh-delete-session", null) != 0;
+    }
+
     pub fn controlInspector(
         self: *Self,
         value: apprt.Action.Value(.inspector),

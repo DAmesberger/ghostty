@@ -624,10 +624,11 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
         }
 
         // Slow path: establish a temporary SSH connection for the query
+        const parsed = session.shared.parseSshTarget(ssh_target);
         var ctx: session.client.SshContext = .{
             .alloc = alloc,
-            .ssh_target = ssh_target,
-            .jump = null,
+            .ssh_target = parsed.target,
+            .jump = parsed.jump,
         };
         defer ctx.deinit();
 
