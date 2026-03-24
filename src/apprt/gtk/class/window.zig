@@ -2595,15 +2595,69 @@ pub const Window = extern struct {
     }
 
     /// React to a GTK action requesting SSH session rename.
+    /// Shows an AlertDialog with a text entry for the new name.
     fn actionSshRenameSession(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
         self: *Window,
     ) callconv(.c) void {
-        // TODO: Show Adw.MessageDialog with text entry for new name,
-        // then send rename frame through SshConnectionManager.
-        _ = self;
-        log.info("ssh_rename_session action triggered (not yet implemented)", .{});
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+
+        const dialog = adw.AlertDialog.new("Rename Session", "Enter a new name for this session:");
+        dialog.addResponse("cancel", "Cancel");
+        dialog.addResponse("ok", "Rename");
+        dialog.setDefaultResponse("ok");
+        dialog.setCloseResponse("cancel");
+
+        // Add a text entry as the extra child.
+        const entry = gtk.Entry.new();
+        entry.as(gtk.Widget).setMarginStart(24);
+        entry.as(gtk.Widget).setMarginEnd(24);
+        dialog.setExtraChild(entry.as(gtk.Widget));
+
+        dialog.choose(
+            surface.as(gtk.Widget),
+            null,
+            renameDialogReady,
+            self,
+        );
+    }
+
+    fn renameDialogReady(
+        source: ?*gobject.Object,
+        result: *gio.AsyncResult,
+        ud: ?*anyopaque,
+    ) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(ud));
+        const dialog: *adw.AlertDialog = @ptrCast(source orelse return);
+        const response = dialog.chooseFinish(result);
+
+        if (std.mem.orderZ(u8, "ok", response) != .eq) return;
+
+        // Get the text from the entry widget.
+        const extra = dialog.getExtraChild() orelse return;
+        const entry = gobject.ext.cast(gtk.Entry, extra) orelse return;
+        const name = std.mem.span(entry.getBuffer().getText());
+        if (name.len == 0) return;
+
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+
+        const remote = &core.io.backend.remote;
+        const conn_entry = remote.conn_entry orelse return;
+
+        const alloc = Application.default().allocator();
+        const rename_data = session.protocol.Rename{
+            .scope = .group,
+            .id = remote.ssh_ctx.group_id,
+            .label = name,
+        };
+        const payload = rename_data.encode(alloc) catch return;
+        defer alloc.free(payload);
+        SshConnectionManager.enqueueWrite(conn_entry, .rename, remote.target_id, payload);
     }
 
     /// React to a GTK action toggling the viewer panel.
@@ -2618,15 +2672,61 @@ pub const Window = extern struct {
     }
 
     /// React to a GTK action requesting SSH session deletion.
+    /// Shows a confirmation dialog, then sends close(session) frame.
     fn actionSshDeleteSession(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
         self: *Window,
     ) callconv(.c) void {
-        // TODO: Show Adw.AlertDialog confirmation, then send close
-        // frame with CloseMode.session through SshConnectionManager.
-        _ = self;
-        log.info("ssh_delete_session action triggered (not yet implemented)", .{});
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+
+        const dialog = adw.AlertDialog.new(
+            "Delete Remote Session?",
+            "This will terminate all surfaces in the session group. This cannot be undone.",
+        );
+        dialog.addResponse("cancel", "Cancel");
+        dialog.addResponse("delete", "Delete");
+        dialog.setResponseAppearance("delete", .destructive);
+        dialog.setDefaultResponse("cancel");
+        dialog.setCloseResponse("cancel");
+
+        dialog.choose(
+            surface.as(gtk.Widget),
+            null,
+            deleteDialogReady,
+            self,
+        );
+    }
+
+    fn deleteDialogReady(
+        source: ?*gobject.Object,
+        result: *gio.AsyncResult,
+        ud: ?*anyopaque,
+    ) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(ud));
+        const dialog: *adw.AlertDialog = @ptrCast(source orelse return);
+        const response = dialog.chooseFinish(result);
+
+        if (std.mem.orderZ(u8, "delete", response) != .eq) return;
+
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+
+        const remote = &core.io.backend.remote;
+        const entry = remote.conn_entry orelse return;
+
+        // Send close(session) to kill the entire session group.
+        const alloc = Application.default().allocator();
+        const close_data = session.protocol.Close{
+            .mode = .session,
+            .id = remote.ssh_ctx.group_id,
+        };
+        const payload = close_data.encode(alloc) catch return;
+        defer alloc.free(payload);
+        SshConnectionManager.enqueueWrite(entry, .close, remote.target_id, payload);
     }
 
     /// Open a new SSH session tab in the current window.
