@@ -399,6 +399,7 @@ pub const Window = extern struct {
             .init("ssh-session-attach", actionSshSessionAttach, s_variant_type),
             .init("ssh-rename-session", actionSshRenameSession, null),
             .init("ssh-delete-session", actionSshDeleteSession, null),
+            .init("ssh-toggle-viewer-panel", actionSshToggleViewerPanel, null),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -2603,6 +2604,17 @@ pub const Window = extern struct {
         // then send rename frame through SshConnectionManager.
         _ = self;
         log.info("ssh_rename_session action triggered (not yet implemented)", .{});
+    }
+
+    /// React to a GTK action toggling the viewer panel.
+    fn actionSshToggleViewerPanel(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        // TODO: Toggle viewer panel overlay widget
+        _ = self;
+        log.info("ssh_toggle_viewer_panel action triggered (not yet implemented)", .{});
     }
 
     /// React to a GTK action requesting SSH session deletion.

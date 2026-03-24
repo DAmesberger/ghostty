@@ -810,6 +810,20 @@ pub const Action = union(enum) {
     /// is an SSH remote session.
     ssh_delete_session,
 
+    /// Toggle the size negotiation mode for the current SSH remote session.
+    ///
+    /// Cycles between "smallest wins" (PTY sized to smallest viewer) and
+    /// "leader wins" (PTY sized to the active controller). Only effective
+    /// when the surface is an SSH remote session.
+    ssh_toggle_size_mode,
+
+    /// Toggle the viewer panel overlay for the current SSH remote session.
+    ///
+    /// Shows or hides a floating panel listing connected viewers, who has
+    /// control, and the current size mode. Only effective when the surface
+    /// is an SSH remote session.
+    ssh_toggle_viewer_panel,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1422,6 +1436,8 @@ pub const Action = union(enum) {
             .ssh_session_attach,
             .ssh_rename_session,
             .ssh_delete_session,
+            .ssh_toggle_size_mode,
+            .ssh_toggle_viewer_panel,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

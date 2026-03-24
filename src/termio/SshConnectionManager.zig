@@ -1063,6 +1063,27 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                 },
             }, .{ .forever = {} });
         },
+        .viewer_state => {
+            const hdr = session.protocol.ViewerState.parseHeader(payload) catch {
+                log.warn("viewer_state: invalid payload", .{});
+                return;
+            };
+            log.info("viewer_state: reason={s} viewers={d} controller={any}", .{
+                @tagName(hdr.reason),
+                hdr.viewer_count,
+                hdr.controller_id,
+            });
+            _ = s.surface_mailbox.push(.{
+                .viewer_state = .{
+                    .reason = hdr.reason,
+                    .size_mode = hdr.size_mode,
+                    .controller_id = hdr.controller_id,
+                    .effective_rows = hdr.effective_rows,
+                    .effective_cols = hdr.effective_cols,
+                    .viewer_count = hdr.viewer_count,
+                },
+            }, .{ .forever = {} });
+        },
         .info => log.info("remote info: {s}", .{payload}),
         .err => log.err("remote error: {s}", .{payload}),
         .eof => {

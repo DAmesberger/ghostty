@@ -365,6 +365,12 @@ pub const Action = union(Key) {
     /// Delete the current SSH remote session.
     ssh_delete_session: void,
 
+    /// Toggle size negotiation mode for multi-viewer.
+    ssh_toggle_size_mode: void,
+
+    /// Toggle the viewer panel overlay.
+    ssh_toggle_viewer_panel: void,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -438,6 +444,8 @@ pub const Action = union(Key) {
         ssh_session_attach,
         ssh_rename_session,
         ssh_delete_session,
+        ssh_toggle_size_mode,
+        ssh_toggle_viewer_panel,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

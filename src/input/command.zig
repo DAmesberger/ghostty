@@ -611,6 +611,18 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Delete the current SSH remote session and all its surfaces.",
         }},
 
+        .ssh_toggle_size_mode => comptime &.{.{
+            .action = .ssh_toggle_size_mode,
+            .title = "Toggle Size Mode",
+            .description = "Toggle between smallest-wins and leader-wins size negotiation.",
+        }},
+
+        .ssh_toggle_viewer_panel => comptime &.{.{
+            .action = .ssh_toggle_viewer_panel,
+            .title = "Toggle Viewer Panel",
+            .description = "Show or hide the multi-viewer presence panel.",
+        }},
+
         .open_config => comptime &.{.{
             .action = .open_config,
             .title = "Open Config",

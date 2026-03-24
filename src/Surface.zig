@@ -157,6 +157,12 @@ pending_layout_surface_id: session.shared.Uuid = session.shared.zero_uuid,
 scrollback_progress_received: u32 = 0,
 scrollback_progress_total: u32 = 0,
 
+/// Multi-viewer state (updated from viewer_state frames).
+viewer_id: session.shared.Uuid = session.shared.zero_uuid,
+viewer_count: u16 = 0,
+is_controller: bool = false,
+size_mode_current: session.protocol.SizeMode = .smallest_wins,
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -1291,6 +1297,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .restore_layout,
                 {},
             );
+        },
+
+        .viewer_state => |vs| {
+            // Store viewer state for UI access (viewer panel, etc.)
+            self.viewer_count = vs.viewer_count;
+            self.is_controller = std.mem.eql(u8, &vs.controller_id, &self.viewer_id);
+            self.size_mode_current = vs.size_mode;
         },
 
         .scrollback_progress => |sp| {
@@ -5963,6 +5976,33 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .ssh_delete_session => return try self.rt_app.performAction(
             .{ .surface = self },
             .ssh_delete_session,
+            {},
+        ),
+
+        .ssh_toggle_size_mode => {
+            if (!isRemoteSurface(self)) return false;
+            // Send size_mode_change frame via the SSH connection.
+            const remote = &self.io.backend.remote;
+            if (remote.conn_entry) |entry| {
+                const new_mode: session.protocol.SizeMode = if (self.size_mode_current == .smallest_wins)
+                    .leader_wins
+                else
+                    .smallest_wins;
+                const payload = (session.protocol.SizeModeChange{ .mode = new_mode }).encode();
+                termio.SshConnectionManager.enqueueWrite(
+                    entry,
+                    .size_mode_change,
+                    remote.target_id,
+                    &payload,
+                );
+                return true;
+            }
+            return false;
+        },
+
+        .ssh_toggle_viewer_panel => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .ssh_toggle_viewer_panel,
             {},
         ),
 

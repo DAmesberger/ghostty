@@ -1017,16 +1017,16 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
         // Process complete frames from stdin buffer
         while (stdin_buf.items.len >= session.protocol.header_size) {
-            const kind_byte = stdin_buf.items[0];
-            const target = std.mem.readInt(u16, stdin_buf.items[2..4], .little);
-            const payload_len = std.mem.readInt(u32, stdin_buf.items[4..8], .little);
-            const total = session.protocol.header_size + payload_len;
-            if (stdin_buf.items.len < total) break;
-
-            const kind = std.meta.intToEnum(session.protocol.Kind, kind_byte) catch {
-                shiftBuffer(&stdin_buf, total);
+            const header = session.protocol.Header.parseFromBuf(
+                stdin_buf.items[0..session.protocol.header_size],
+            ) catch {
+                shiftBuffer(&stdin_buf, session.protocol.header_size);
                 continue;
             };
+            const kind = header.kind;
+            const target = header.target;
+            const total = session.protocol.header_size + header.len;
+            if (stdin_buf.items.len < total) break;
 
             const payload = stdin_buf.items[session.protocol.header_size..total];
 
@@ -1085,6 +1085,7 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                 .resize,
                 .layout,
                 .rename,
+                .size_mode_change,
                 => {
                     if (findMuxSession(&sessions, target)) |s| {
                         sendFrameFd(s.daemon_fd, kind, target, payload) catch {
@@ -1138,19 +1139,19 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
                 // Forward complete frames from daemon to stdout (rewrite target)
                 while (s.read_buf.items.len >= session.protocol.header_size) {
-                    const dk = s.read_buf.items[0];
-                    const dplen = std.mem.readInt(u32, s.read_buf.items[4..8], .little);
-                    const dtotal = session.protocol.header_size + dplen;
-                    if (s.read_buf.items.len < dtotal) break;
-
-                    const dkind = std.meta.intToEnum(session.protocol.Kind, dk) catch {
-                        shiftBuffer(&s.read_buf, dtotal);
+                    const dheader = session.protocol.Header.parseFromBuf(
+                        s.read_buf.items[0..session.protocol.header_size],
+                    ) catch {
+                        shiftBuffer(&s.read_buf, session.protocol.header_size);
                         continue;
                     };
+                    const dtotal = session.protocol.header_size + dheader.len;
+                    if (s.read_buf.items.len < dtotal) break;
+
                     const dpayload = s.read_buf.items[session.protocol.header_size..dtotal];
 
                     // Rewrite target ID and forward to client
-                    sendFrameFile(stdout_file, dkind, s.target, dpayload) catch {};
+                    sendFrameFile(stdout_file, dheader.kind, s.target, dpayload) catch {};
                     shiftBuffer(&s.read_buf, dtotal);
                 }
             }
@@ -1489,15 +1490,7 @@ fn connectUnixSocket(path: []const u8) !posix.fd_t {
     return fd;
 }
 
-fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
-    if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;
-    var file: std.fs.File = .{ .handle = fd };
-    var buf: [1024]u8 = undefined;
-    var writer_ = file.writerStreaming(&buf);
-    const writer = &writer_.interface;
-    try session.protocol.writeFrame(writer, kind, target, payload);
-    try writer.flush();
-}
+const sendFrameFd = session.shared.sendFrameFd;
 
 fn sendFrameFile(file: std.fs.File, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
     if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;

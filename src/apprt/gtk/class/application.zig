@@ -787,6 +787,10 @@ pub const Application = extern struct {
 
             .ssh_delete_session => return Action.sshDeleteSession(target, value),
 
+            .ssh_toggle_size_mode => return false, // Handled in Surface.zig directly (sends frame)
+
+            .ssh_toggle_viewer_panel => return Action.sshToggleViewerPanel(target, value),
+
             // Unimplemented
             .secure_input,
             .close_all_windows,
@@ -2864,6 +2868,15 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().sshDeleteSession();
+            },
+        }
+    }
+
+    pub fn sshToggleViewerPanel(target: apprt.Target, _: apprt.Action.Value(.ssh_toggle_viewer_panel)) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().sshToggleViewerPanel();
             },
         }
     }

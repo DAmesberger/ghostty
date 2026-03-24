@@ -156,6 +156,43 @@ pub const RemoteSession = struct {
         }
     }
 
+    /// Broadcast a viewer_state frame to all connected viewers.
+    /// Must be called with mutex held.
+    fn broadcastViewerState(self: *RemoteSession, reason: session.protocol.ViewerStateReason) void {
+        // Build viewer entries from current state.
+        var entries_buf: [64]session.protocol.ViewerEntry = undefined;
+        const count = @min(self.viewers.items.len, entries_buf.len);
+        for (self.viewers.items[0..count], 0..) |v, i| {
+            entries_buf[i] = .{
+                .id = v.viewer_id,
+                .label = v.label,
+                .is_controller = std.mem.eql(u8, &v.viewer_id, &self.controller_id),
+                .rows = v.rows,
+                .cols = v.cols,
+            };
+        }
+
+        // Get effective PTY size from terminal instance (always up to date).
+        const eff_rows = self.terminal_instance.rows;
+        const eff_cols = self.terminal_instance.cols;
+
+        const state = session.protocol.ViewerState{
+            .reason = reason,
+            .size_mode = self.size_mode,
+            .controller_id = self.controller_id,
+            .effective_rows = eff_rows,
+            .effective_cols = eff_cols,
+            .viewers = entries_buf[0..count],
+        };
+
+        const payload = state.encode(self.alloc) catch return;
+        defer self.alloc.free(payload);
+
+        for (self.viewers.items) |viewer| {
+            sendFrameFd(viewer.fd, .viewer_state, viewer.target, payload) catch {};
+        }
+    }
+
     pub fn deinit(self: *RemoteSession) void {
         self.viewers.deinit(self.alloc);
         self.stream.handler.deinit();
@@ -239,6 +276,9 @@ pub const RemoteSession = struct {
         // Recalculate PTY size based on all viewers.
         self.recalculateSize();
 
+        // Notify all viewers (including the new one) about the roster.
+        self.broadcastViewerState(if (self.viewers.items.len == 1) .welcome else .join);
+
         // Generate and send VT snapshot BEFORE enabling live forwarding
         const vt_snapshot = serializeViewportAsVT(self.alloc, &self.terminal_instance) catch |err| {
             self.removeViewer(fd);
@@ -270,7 +310,7 @@ pub const RemoteSession = struct {
 
         while (true) {
             // Process any complete frames from the buffer first
-            if (self.processClientFrames(&frame_buf)) break;
+            if (self.processClientFrames(&frame_buf, fd)) break;
 
             // If scrollback streaming is not done, check if we can send a chunk.
             // Use poll with timeout=0 to check for pending input without blocking.
@@ -302,6 +342,9 @@ pub const RemoteSession = struct {
             self.controller_id = session.shared.zero_uuid;
         }
         self.recalculateSize();
+        if (self.viewers.items.len > 0) {
+            self.broadcastViewerState(.leave);
+        }
         self.mutex.unlock();
     }
 
@@ -371,11 +414,12 @@ pub const RemoteSession = struct {
         }
     }
 
-    /// Process complete frames from the client input buffer.
+    /// Process complete frames from a viewer's input buffer.
     /// Returns true if the connection should be closed.
     fn processClientFrames(
         self: *RemoteSession,
         frame_buf: *std.ArrayList(u8),
+        viewer_fd: posix.fd_t,
     ) bool {
         while (frame_buf.items.len >= session.protocol.header_size) {
             const header = session.protocol.Header.parseFromBuf(
@@ -396,18 +440,28 @@ pub const RemoteSession = struct {
             const payload = frame_buf.items[session.protocol.header_size..total];
 
             switch (kind) {
-                .data_in => _ = posix.write(self.pty.master, payload) catch |err| {
-                    log.warn("session write failed id={s} err={}", .{ self.id, err });
-                    shiftBuf(frame_buf, total);
-                    return true;
+                .data_in => {
+                    // Implicit control: typing = instant takeover.
+                    self.mutex.lock();
+                    if (self.findViewer(viewer_fd)) |viewer| {
+                        if (!std.mem.eql(u8, &self.controller_id, &viewer.viewer_id)) {
+                            self.controller_id = viewer.viewer_id;
+                            self.broadcastViewerState(.control_change);
+                            if (self.size_mode == .leader_wins) self.recalculateSize();
+                        }
+                    }
+                    self.mutex.unlock();
+                    _ = posix.write(self.pty.master, payload) catch |err| {
+                        log.warn("session write failed id={s} err={}", .{ self.id, err });
+                        shiftBuf(frame_buf, total);
+                        return true;
+                    };
                 },
                 .resize => {
                     const parsed = session.protocol.Resize.parse(payload) catch {
                         shiftBuf(frame_buf, total);
                         return true;
                     };
-                    // width_px and height_px are allowed to be 0 ("unknown"), used
-                    // during reconnect and by terminals that don't report pixel size.
                     if (parsed.rows == 0 or parsed.cols == 0 or
                         parsed.rows > 10000 or parsed.cols > 10000 or
                         parsed.width_px > 100000 or parsed.height_px > 100000)
@@ -416,13 +470,26 @@ pub const RemoteSession = struct {
                             parsed.cols, parsed.rows, parsed.width_px, parsed.height_px,
                         });
                     } else {
-                        self.pty.setSize(.{
-                            .ws_row = parsed.rows,
-                            .ws_col = parsed.cols,
-                            .ws_xpixel = parsed.width_px,
-                            .ws_ypixel = parsed.height_px,
-                        }) catch {};
+                        // Update per-viewer size and recalculate negotiated size.
+                        self.mutex.lock();
+                        if (self.findViewer(viewer_fd)) |viewer| {
+                            viewer.rows = parsed.rows;
+                            viewer.cols = parsed.cols;
+                        }
+                        self.recalculateSize();
+                        self.mutex.unlock();
                     }
+                },
+                .size_mode_change => {
+                    const change = session.protocol.SizeModeChange.parse(payload) catch {
+                        shiftBuf(frame_buf, total);
+                        continue;
+                    };
+                    self.mutex.lock();
+                    self.size_mode = change.mode;
+                    self.recalculateSize();
+                    self.broadcastViewerState(.mode_change);
+                    self.mutex.unlock();
                 },
                 .layout => {
                     if (payload.len <= 64 * 1024) {
@@ -603,14 +670,7 @@ fn emitColorSGR(w: anytype, color: terminal.Style.Color, base: u8) !void {
     }
 }
 
-fn sendFrameFd(fd: posix.fd_t, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
-    var file: std.fs.File = .{ .handle = fd };
-    var wbuf: [1024]u8 = undefined;
-    var writer_ = file.writerStreaming(&wbuf);
-    const writer = &writer_.interface;
-    try session.protocol.writeFrame(writer, kind, target, payload);
-    try writer.flush();
-}
+const sendFrameFd = session.shared.sendFrameFd;
 
 fn closeFd(fd: posix.fd_t) void {
     posix.close(fd);

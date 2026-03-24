@@ -12,6 +12,22 @@ pub const remote_subcommand = "+ssh-session";
 /// Base URL for downloading pre-built headless binaries from CI releases.
 pub const release_base_url = "https://github.com/DAmesberger/ghostty/releases/download";
 
+const posix = std.posix;
+const protocol = @import("../session.zig").protocol;
+
+/// Write a single protocol frame to a file descriptor.
+/// This is the canonical frame-send function — use this everywhere
+/// instead of duplicating frame write logic.
+pub fn sendFrameFd(fd: posix.fd_t, kind: protocol.Kind, target: u16, payload: []const u8) !void {
+    if (payload.len > protocol.max_payload) return error.PayloadTooLarge;
+    var file: std.fs.File = .{ .handle = fd };
+    var buf: [1024]u8 = undefined;
+    var writer_ = file.writerStreaming(&buf);
+    const writer = &writer_.interface;
+    try protocol.writeFrame(writer, kind, target, payload);
+    try writer.flush();
+}
+
 pub const ControlCommand = enum {
     detach,
     reconnect,

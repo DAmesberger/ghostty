@@ -119,6 +119,9 @@ pub const Message = union(enum) {
     /// Scrollback restore progress update from the SSH thread.
     scrollback_progress: ScrollbackProgress,
 
+    /// Multi-viewer roster update from the daemon.
+    viewer_state: ViewerStateUpdate,
+
     /// Search progress update
     search_total: ?usize,
 
@@ -154,6 +157,15 @@ pub const Message = union(enum) {
     pub const ScrollbackProgress = struct {
         received: u32,
         total: u32,
+    };
+
+    pub const ViewerStateUpdate = struct {
+        reason: session.protocol.ViewerStateReason,
+        size_mode: session.protocol.SizeMode,
+        controller_id: session.shared.Uuid,
+        effective_rows: u16,
+        effective_cols: u16,
+        viewer_count: u16,
     };
 
     pub const ReportTitleStyle = enum {
