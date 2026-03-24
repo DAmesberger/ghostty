@@ -266,8 +266,20 @@ pub const RemoteSession = struct {
             // Flush accumulated data to all viewers as one frame.
             if (accum.items.len > 0) {
                 self.mutex.lock();
+                const comp_level = session.shared.negotiateCompressionLevel(self.viewers.items);
                 for (self.viewers.items) |viewer| {
-                    sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                    if (comp_level > 0) {
+                        session.shared.sendFrameFdCompressed(
+                            viewer.fd,
+                            .data_out,
+                            viewer.target,
+                            accum.items,
+                            comp_level,
+                            self.alloc,
+                        ) catch {};
+                    } else {
+                        sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                    }
                 }
                 self.mutex.unlock();
                 accum.clearRetainingCapacity();
@@ -278,8 +290,20 @@ pub const RemoteSession = struct {
         // Flush any remaining data.
         if (accum.items.len > 0) {
             self.mutex.lock();
+            const comp_level = session.shared.negotiateCompressionLevel(self.viewers.items);
             for (self.viewers.items) |viewer| {
-                sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                if (comp_level > 0) {
+                    session.shared.sendFrameFdCompressed(
+                        viewer.fd,
+                        .data_out,
+                        viewer.target,
+                        accum.items,
+                        comp_level,
+                        self.alloc,
+                    ) catch {};
+                } else {
+                    sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                }
             }
             self.mutex.unlock();
         }

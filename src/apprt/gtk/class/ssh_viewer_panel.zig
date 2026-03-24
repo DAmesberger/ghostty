@@ -5,6 +5,7 @@ const adw = @import("adw");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
+const apprt = @import("../../../apprt.zig");
 const session = @import("../../../session.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -61,25 +62,22 @@ pub const SshViewerPanel = extern struct {
         priv.revealer.setRevealChild(if (currently_visible) 0 else 1);
     }
 
-    /// Update the panel with new viewer state.
+    /// Update the panel with new viewer state including roster.
     pub fn update(
         self: *SshViewerPanel,
-        viewer_count: u16,
-        size_mode: session.protocol.SizeMode,
-        effective_rows: u16,
-        effective_cols: u16,
+        state: apprt.surface.Message.ViewerStateUpdate,
     ) void {
         const priv = self.private();
 
-        // Update header labels
+        // Update header labels.
         var title_buf: [32]u8 = undefined;
         const title = std.fmt.bufPrint(&title_buf, "{d} Viewer{s}", .{
-            viewer_count,
-            if (viewer_count != 1) "s" else "",
+            state.viewer_count,
+            @as([]const u8, if (state.viewer_count != 1) "s" else ""),
         }) catch "Viewers";
         priv.title_label.setText(@ptrCast(title.ptr));
 
-        const mode_text: [*:0]const u8 = switch (size_mode) {
+        const mode_text: [*:0]const u8 = switch (state.size_mode) {
             .smallest_wins => "smallest",
             .leader_wins => "leader",
         };
@@ -87,10 +85,46 @@ pub const SshViewerPanel = extern struct {
 
         var size_buf: [32]u8 = undefined;
         const size = std.fmt.bufPrint(&size_buf, "{d}\xc3\x97{d}", .{
-            effective_cols,
-            effective_rows,
+            state.effective_cols,
+            state.effective_rows,
         }) catch "?";
         priv.size_label.setText(@ptrCast(size.ptr));
+
+        // Clear and repopulate the viewer list.
+        priv.viewer_list.removeAll();
+
+        const count = @min(state.viewer_count, 8);
+        for (state.viewers[0..count]) |vi| {
+            if (vi.label_len == 0 and !vi.is_controller) continue;
+
+            // Create a row for this viewer.
+            const row_box = gtk.Box.new(.horizontal, 8);
+            row_box.as(gtk.Widget).setMarginStart(4);
+            row_box.as(gtk.Widget).setMarginEnd(4);
+
+            // Controller indicator.
+            const indicator = gtk.Label.new(if (vi.is_controller) "\xe2\x97\x8f" else "\xe2\x97\x8b"); // ● or ○
+            if (vi.is_controller) {
+                indicator.as(gtk.Widget).addCssClass("success");
+            }
+            row_box.append(indicator.as(gtk.Widget));
+
+            // Viewer label.
+            const label_text = vi.label[0..vi.label_len];
+            const name_label = gtk.Label.new(@ptrCast(if (label_text.len > 0) label_text.ptr else "anonymous"));
+            name_label.setHexpand(1);
+            name_label.setXalign(0);
+            row_box.append(name_label.as(gtk.Widget));
+
+            // Size info.
+            var dim_buf: [16]u8 = undefined;
+            const dim = std.fmt.bufPrint(&dim_buf, "{d}\xc3\x97{d}", .{ vi.cols, vi.rows }) catch "?";
+            const dim_label = gtk.Label.new(@ptrCast(dim.ptr));
+            dim_label.as(gtk.Widget).addCssClass("dim-label");
+            row_box.append(dim_label.as(gtk.Widget));
+
+            priv.viewer_list.append(row_box.as(gtk.Widget));
+        }
     }
 
     //---------------------------------------------------------------

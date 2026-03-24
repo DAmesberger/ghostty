@@ -159,6 +159,14 @@ pub const Message = union(enum) {
         total: u32,
     };
 
+    pub const ViewerInfo = struct {
+        label: [64]u8 = .{0} ** 64,
+        label_len: u16 = 0,
+        is_controller: bool = false,
+        rows: u16 = 0,
+        cols: u16 = 0,
+    };
+
     pub const ViewerStateUpdate = struct {
         reason: session.protocol.ViewerStateReason,
         size_mode: session.protocol.SizeMode,
@@ -166,6 +174,8 @@ pub const Message = union(enum) {
         effective_rows: u16,
         effective_cols: u16,
         viewer_count: u16,
+        /// Inline roster (up to 8 viewers; enough for the common case).
+        viewers: [8]ViewerInfo = @as([8]ViewerInfo, @splat(ViewerInfo{})),
     };
 
     pub const ReportTitleStyle = enum {

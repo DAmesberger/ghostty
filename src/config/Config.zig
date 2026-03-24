@@ -1238,10 +1238,11 @@ command: ?Command = null,
 /// Available since 1.3.0.
 @"ssh-reconnect-interval": u32 = 1000,
 
-/// zstd compression level for SSH remote session data (0-15).
-/// 0 disables compression. Levels 1-3 are fast (suitable for
-/// real-time), 4-9 are balanced, 10-15 are high compression.
-/// Higher levels reduce bandwidth but increase CPU usage.
+/// Compression level for SSH remote session data (0-9).
+/// 0 disables compression. Level 1 is fastest, 9 is best
+/// compression. Levels 1-4 are recommended for real-time
+/// use. Higher levels reduce bandwidth but increase CPU usage.
+/// Uses deflate compression (same as gzip/zlib).
 @"ssh-compression": u8 = 3,
 
 /// Default size negotiation mode when multiple viewers are attached

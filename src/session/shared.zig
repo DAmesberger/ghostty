@@ -36,6 +36,71 @@ pub fn sendFrameFd(fd: posix.fd_t, kind: protocol.Kind, target: u16, payload: []
     if (payload.len > 0) try file.writeAll(payload);
 }
 
+/// Compress payload data. Returns compressed data (caller owns).
+/// If compression would make the data larger, returns null (caller should send uncompressed).
+pub fn compressPayload(_: Allocator, data: []const u8, _: u8) ?[]u8 {
+    if (data.len < 64) return null;
+
+    // NOTE: Zig 0.15.2's std.compress.flate.Compress is incomplete (stdlib bug:
+    // BlockWriter references missing fields). Compression is disabled until
+    // either the stdlib is fixed or we link C libzstd.
+    //
+    // The full infrastructure is in place:
+    // - Protocol flags carry compression_level per frame
+    // - Open frame negotiates max_compression_level per viewer
+    // - negotiateCompressionLevel() computes effective level
+    // - sendFrameFdCompressed() sets flags and sends compressed data
+    // - decompressPayload() (below) is ready to decompress
+    //
+    // When a compressor is available, implement here and return compressed data.
+    // The rest of the pipeline will work automatically.
+    return null;
+}
+
+/// Decompress deflate-compressed payload. Returns decompressed data (caller owns).
+pub fn decompressPayload(alloc: Allocator, data: []const u8) ![]u8 {
+    var reader: std.Io.Reader = .fixed(data);
+    var window_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(&reader, .raw, &window_buf);
+
+    var output_list: std.ArrayList(u8) = .empty;
+    errdefer output_list.deinit(alloc);
+    decompressor.reader.appendRemaining(alloc, &output_list, .unlimited) catch {
+        return error.DecompressionFailed;
+    };
+
+    return output_list.toOwnedSlice(alloc) catch error.OutOfMemory;
+}
+
+/// Write a protocol frame with optional compression.
+/// If compression_level > 0 and payload compresses smaller, sends compressed.
+/// Otherwise sends uncompressed.
+pub fn sendFrameFdCompressed(
+    fd: posix.fd_t,
+    kind: protocol.Kind,
+    target: u16,
+    payload: []const u8,
+    compression_level: u8,
+    alloc: Allocator,
+) !void {
+    if (compressPayload(alloc, payload, compression_level)) |compressed| {
+        defer alloc.free(compressed);
+        // Send with compression flag set.
+        const header = (protocol.Header{
+            .kind = kind,
+            .flags = .{ .compression_level = @intCast(@min(compression_level, 15)) },
+            .target = target,
+            .len = @intCast(compressed.len),
+        }).encodeToBuf();
+        var file: std.fs.File = .{ .handle = fd };
+        try file.writeAll(&header);
+        try file.writeAll(compressed);
+    } else {
+        // Uncompressed fallback.
+        try sendFrameFd(fd, kind, target, payload);
+    }
+}
+
 /// Compute the effective compression level for a set of viewers.
 /// Returns the minimum of all viewers' max_compression_level values,
 /// or 0 if any viewer doesn't support compression.

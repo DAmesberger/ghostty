@@ -87,7 +87,7 @@ pub const header_size: usize = 8;
 
 /// Frame flags (byte 1 of header).
 pub const Flags = packed struct(u8) {
-    /// zstd compression level (0 = none, 1-15 = zstd level 1-15).
+    /// Deflate compression level (0 = none, 1-9 = deflate level, 10-15 reserved).
     compression_level: u4 = 0,
     _reserved: u4 = 0,
 

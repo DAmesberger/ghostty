@@ -888,17 +888,30 @@ fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
 
 fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
     while (frame_buf.items.len >= session.protocol.header_size) {
-        const kind_byte = frame_buf.items[0];
-        const frame_target = std.mem.readInt(u16, frame_buf.items[2..4], .little);
-        const payload_len = std.mem.readInt(u32, frame_buf.items[4..8], .little);
-        const total = session.protocol.header_size + payload_len;
-        if (frame_buf.items.len < total) break;
-
-        const kind = std.meta.intToEnum(session.protocol.Kind, kind_byte) catch {
-            shiftBuffer(frame_buf, total);
+        const header = session.protocol.Header.parseFromBuf(
+            frame_buf.items[0..session.protocol.header_size],
+        ) catch {
+            shiftBuffer(frame_buf, session.protocol.header_size);
             continue;
         };
-        const payload = frame_buf.items[session.protocol.header_size..total];
+        const kind = header.kind;
+        const frame_target = header.target;
+        const total = session.protocol.header_size + header.len;
+        if (frame_buf.items.len < total) break;
+
+        var payload = frame_buf.items[session.protocol.header_size..total];
+
+        // Decompress if flags indicate compression.
+        var decompressed: ?[]u8 = null;
+        defer if (decompressed) |d| entry.alloc.free(d);
+        if (header.flags.isCompressed()) {
+            decompressed = session.shared.decompressPayload(entry.alloc, payload) catch {
+                log.warn("decompression failed for {s} frame", .{@tagName(kind)});
+                shiftBuffer(frame_buf, total);
+                continue;
+            };
+            payload = decompressed.?;
+        }
 
         // Handle pong: update timestamp, don't dispatch to surfaces
         if (kind == .pong) {
@@ -1068,12 +1081,12 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                 log.warn("viewer_state: invalid payload", .{});
                 return;
             };
-            log.info("viewer_state: reason={s} viewers={d} controller={any}", .{
+            log.info("viewer_state: reason={s} viewers={d}", .{
                 @tagName(hdr.reason),
                 hdr.viewer_count,
-                hdr.controller_id,
             });
-            _ = s.surface_mailbox.push(.{
+
+            var msg: apprt.surface.Message = .{
                 .viewer_state = .{
                     .reason = hdr.reason,
                     .size_mode = hdr.size_mode,
@@ -1082,7 +1095,39 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                     .effective_cols = hdr.effective_cols,
                     .viewer_count = hdr.viewer_count,
                 },
-            }, .{ .forever = {} });
+            };
+
+            // Parse viewer entries from remaining payload.
+            var remaining = hdr.remaining;
+            const count = @min(hdr.viewer_count, 8); // Cap at inline roster size
+            for (0..count) |i| {
+                const uuid_end = session.protocol.uuid_size;
+                if (remaining.len < session.protocol.ViewerState.viewer_fixed_size) break;
+                // Skip UUID (16 bytes)
+                remaining = remaining[uuid_end..];
+                const label_len = std.mem.readInt(u16, remaining[0..2], .little);
+                remaining = remaining[2..];
+                const is_ctrl = remaining[0] != 0;
+                remaining = remaining[1..];
+                const rows = std.mem.readInt(u16, remaining[0..2], .little);
+                remaining = remaining[2..];
+                const cols = std.mem.readInt(u16, remaining[0..2], .little);
+                remaining = remaining[2..];
+                // Read label
+                const actual_label_len = @min(label_len, 64);
+                if (remaining.len < label_len) break;
+                var vi: apprt.surface.Message.ViewerInfo = .{
+                    .is_controller = is_ctrl,
+                    .rows = rows,
+                    .cols = cols,
+                    .label_len = @intCast(actual_label_len),
+                };
+                @memcpy(vi.label[0..actual_label_len], remaining[0..actual_label_len]);
+                remaining = remaining[label_len..];
+                msg.viewer_state.viewers[i] = vi;
+            }
+
+            _ = s.surface_mailbox.push(msg, .{ .forever = {} });
         },
         .info => log.info("remote info: {s}", .{payload}),
         .err => log.err("remote error: {s}", .{payload}),
