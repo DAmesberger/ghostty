@@ -2545,6 +2545,14 @@ pub const Window = extern struct {
         const target = std.mem.span(target_str orelse return);
         if (target.len == 0) return;
 
+        if (session.shared.validateSshTarget(target)) |err_msg| {
+            const dialog = adw.AlertDialog.new("Invalid SSH Target", @ptrCast(err_msg.ptr));
+            dialog.addResponse("ok", "OK");
+            dialog.setDefaultResponse("ok");
+            dialog.choose(self.as(gtk.Widget), null, null, null);
+            return;
+        }
+
         const priv = self.private();
         const alloc = Application.default().allocator();
 

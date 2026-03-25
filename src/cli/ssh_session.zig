@@ -125,6 +125,11 @@ pub fn run(alloc: Allocator) !u8 {
 /// Connect to the remote host via SSH, provision the binary/daemon,
 /// and execute the requested subcommand there.
 fn runRemote(alloc: Allocator, opts: Options) !u8 {
+    // Validate before attempting connection.
+    if (session.shared.validateSshTarget(opts.ssh)) |err_msg| {
+        std.debug.print("Error: invalid --ssh target: {s}\n", .{err_msg});
+        return 1;
+    }
     const parsed = session.shared.parseSshTarget(opts.ssh);
 
     var stderr_buf: [1024]u8 = undefined;

@@ -161,104 +161,98 @@ pub fn normalizeArch(uname_m: []const u8) []const u8 {
     return uname_m;
 }
 
-/// Parsed SSH target with optional jump host chain.
+/// A parsed and validated SSH connection target.
 /// Returned slices point into the original input string.
 pub const ParsedSshTarget = struct {
+    /// The target host segment (user@host or user@host:port).
     target: []const u8,
+    /// Comma-separated jump host chain, or null if direct connection.
     jump: ?[]const u8,
 };
 
-pub const SshTargetError = error{
-    EmptyTarget,
-    MissingUser,
-    MissingHost,
-    InvalidCharInUser,
-    InvalidCharInHost,
-    InvalidPort,
-    InvalidJumpHost,
-};
+/// Validate a single SSH host segment: `user@host` or `user@host:port`.
+/// No spaces allowed. Must have a `@` separating non-empty user and host.
+/// Returns a human-readable error message, or null if valid.
+pub fn validateHostSegment(segment: []const u8) ?[]const u8 {
+    if (segment.len == 0) return "empty host segment";
 
-/// Validate a single `user@host` or `user@host:port` segment.
-fn validateSshHostSegment(segment: []const u8) SshTargetError!void {
-    if (segment.len == 0) return error.EmptyTarget;
+    // No spaces allowed in a segment
+    if (std.mem.indexOf(u8, segment, " ") != null) return "spaces not allowed in host segment";
 
-    // Must contain @
-    const at_pos = std.mem.indexOf(u8, segment, "@") orelse return error.MissingUser;
+    // Must contain exactly one @
+    const at_pos = std.mem.indexOf(u8, segment, "@") orelse return "missing @ — use user@host";
     const user = segment[0..at_pos];
     const host_port = segment[at_pos + 1 ..];
 
-    if (user.len == 0) return error.MissingUser;
-    if (host_port.len == 0) return error.MissingHost;
+    if (user.len == 0) return "missing username before @";
+    if (host_port.len == 0) return "missing hostname after @";
 
-    // User: alphanumeric, dash, underscore, dot
+    // Validate user: alphanumeric, dash, underscore, dot
     for (user) |ch| {
         if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_' and ch != '.') {
-            return error.InvalidCharInUser;
+            return "invalid character in username";
         }
     }
 
-    // Split host:port if present
-    const host = if (std.mem.lastIndexOf(u8, host_port, ":")) |colon| blk: {
+    // Split host:port if colon present
+    var host = host_port;
+    if (std.mem.lastIndexOf(u8, host_port, ":")) |colon| {
         const port_str = host_port[colon + 1 ..];
         if (port_str.len > 0) {
-            _ = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
+            _ = std.fmt.parseInt(u16, port_str, 10) catch return "invalid port number";
         }
-        break :blk host_port[0..colon];
-    } else host_port;
+        host = host_port[0..colon];
+    }
 
-    if (host.len == 0) return error.MissingHost;
+    if (host.len == 0) return "missing hostname";
 
-    // Host: alphanumeric, dash, dot, brackets (IPv6)
+    // Validate host: alphanumeric, dash, dot, brackets/colon (IPv6)
     for (host) |ch| {
         if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '.' and
             ch != '[' and ch != ']' and ch != ':')
         {
-            return error.InvalidCharInHost;
-        }
-    }
-}
-
-/// Validate a full SSH target string (with optional " via " jump hosts).
-/// Returns a human-readable error message, or null if valid.
-pub fn validateSshTarget(raw: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return "Target is empty";
-
-    const parsed = parseSshTarget(raw);
-
-    validateSshHostSegment(parsed.target) catch |err| {
-        return switch (err) {
-            error.EmptyTarget => "Target is empty",
-            error.MissingUser => "Missing username — use user@host format",
-            error.MissingHost => "Missing hostname — use user@host format",
-            error.InvalidCharInUser => "Invalid character in username",
-            error.InvalidCharInHost => "Invalid character in hostname",
-            error.InvalidPort => "Invalid port number",
-            error.InvalidJumpHost => unreachable,
-        };
-    };
-
-    if (parsed.jump) |jump| {
-        // Jump can be comma-separated chain
-        var it = std.mem.splitScalar(u8, jump, ',');
-        while (it.next()) |hop| {
-            const trimmed_hop = std.mem.trim(u8, hop, " \t");
-            validateSshHostSegment(trimmed_hop) catch {
-                return "Invalid jump host — use user@host format";
-            };
+            return "invalid character in hostname";
         }
     }
 
     return null; // Valid
 }
 
-/// Parse an SSH target string that optionally contains a " via " jump host
-/// specifier.  Examples:
-///   "user@host"                → .{ .target = "user@host", .jump = null }
-///   "user@host via bastion"    → .{ .target = "user@host", .jump = "bastion" }
-///   "user@host via h1,h2"     → .{ .target = "user@host", .jump = "h1,h2" }
+/// Parse and validate a full SSH target string.
+///
+/// Format: `user@host[:port] [via jump1@host1,jump2@host2,...]`
+///
+/// 1. Split on ` via ` → left is target, right is jump chain
+/// 2. Split jump chain on `,` → individual jump host segments
+/// 3. Validate each segment with `validateHostSegment` (no spaces, has @, valid chars)
+///
+/// Returns a human-readable error message, or null if valid.
+pub fn validateSshTarget(raw: []const u8) ?[]const u8 {
+    const parsed = parseSshTarget(raw);
+
+    if (parsed.target.len == 0) return "target is empty";
+
+    if (validateHostSegment(parsed.target)) |err| {
+        return err;
+    }
+
+    if (parsed.jump) |jump| {
+        var it = std.mem.splitScalar(u8, jump, ',');
+        while (it.next()) |hop| {
+            const trimmed = std.mem.trim(u8, hop, " \t");
+            if (validateHostSegment(trimmed)) |err| {
+                return err;
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Parse an SSH target string, splitting on ` via ` for jump hosts.
+/// Does NOT validate — call `validateSshTarget` first for user input.
+/// Used internally where the format is already known-good (e.g., from config).
 pub fn parseSshTarget(raw: []const u8) ParsedSshTarget {
-    // Search before trimming so trailing " via " edge cases work.
     if (std.mem.indexOf(u8, raw, " via ")) |idx| {
         const target = std.mem.trim(u8, raw[0..idx], " \t\r\n");
         const jump = std.mem.trim(u8, raw[idx + 5 ..], " \t\r\n");
