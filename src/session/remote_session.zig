@@ -160,10 +160,28 @@ pub const RemoteSession = struct {
     /// Broadcast a viewer_state frame to all connected viewers.
     /// Must be called with mutex held.
     /// Force-disconnect a viewer by UUID. Must be called with mutex held.
-    pub fn kickViewer(self: *RemoteSession, viewer_id: Uuid) void {
+    /// If viewer_id is zero_uuid, kick all viewers EXCEPT the one on `sender_fd`.
+    pub fn kickViewer(self: *RemoteSession, viewer_id: Uuid, sender_fd: posix.fd_t) void {
+        if (session.shared.isZeroUuid(viewer_id)) {
+            // Kick all others — iterate backward since we're removing.
+            var i: usize = self.viewers.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (self.viewers.items[i].fd != sender_fd) {
+                    sendFrameFd(self.viewers.items[i].fd, .eof, self.viewers.items[i].target, "") catch {};
+                    _ = self.viewers.swapRemove(i);
+                }
+            }
+            self.controller_id = session.shared.zero_uuid;
+            self.recalculateSize();
+            if (self.viewers.items.len > 0) {
+                self.broadcastViewerState(.leave);
+            }
+            return;
+        }
+
         for (self.viewers.items) |viewer| {
             if (std.mem.eql(u8, &viewer.viewer_id, &viewer_id)) {
-                // Send EOF to the viewer to disconnect them.
                 sendFrameFd(viewer.fd, .eof, viewer.target, "") catch {};
                 self.removeViewer(viewer.fd);
                 if (std.mem.eql(u8, &self.controller_id, &viewer_id)) {
@@ -579,7 +597,7 @@ pub const RemoteSession = struct {
                     if (payload.len >= session.protocol.uuid_size) {
                         const target_id_bytes = payload[0..session.protocol.uuid_size];
                         self.mutex.lock();
-                        self.kickViewer(target_id_bytes.*);
+                        self.kickViewer(target_id_bytes.*, viewer_fd);
                         self.mutex.unlock();
                     }
                 },
