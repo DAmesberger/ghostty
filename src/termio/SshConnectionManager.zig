@@ -1098,8 +1098,15 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                     .effective_rows = hdr.effective_rows,
                     .effective_cols = hdr.effective_cols,
                     .viewer_count = hdr.viewer_count,
+                    .session_color = hdr.session_color,
                 },
             };
+
+            // Copy session label into fixed buffer.
+            const sl = hdr.session_label;
+            const sl_len = @min(sl.len, 64);
+            @memcpy(msg.viewer_state.session_label[0..sl_len], sl[0..sl_len]);
+            msg.viewer_state.session_label_len = @intCast(sl_len);
 
             // Parse viewer entries from remaining payload.
             var remaining = hdr.remaining;

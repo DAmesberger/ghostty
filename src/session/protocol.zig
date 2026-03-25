@@ -360,6 +360,7 @@ pub const ViewerStateReason = enum(u8) {
     control_change = 3, // Active controller changed (someone typed)
     size_change = 4, // Effective PTY size changed
     mode_change = 5, // Size mode changed
+    name_change = 6, // Session label or color changed
 };
 
 /// Single viewer entry within a ViewerState payload.
@@ -372,22 +373,25 @@ pub const ViewerEntry = struct {
 };
 
 /// Payload for `viewer_state` (kind 20).
-/// Sent to viewers on roster changes.
+/// Sent to viewers on roster changes. Includes authoritative session state.
 pub const ViewerState = struct {
     reason: ViewerStateReason,
     size_mode: SizeMode,
     controller_id: Uuid,
     effective_rows: u16,
     effective_cols: u16,
+    session_color: i8 = -1,
+    session_label: []const u8 = "",
     viewers: []const ViewerEntry,
 
-    /// Fixed header: reason(1) + size_mode(1) + controller_id(16) + rows(2) + cols(2) + count(2) = 24
-    pub const fixed_size = 24;
+    /// Fixed header: reason(1) + size_mode(1) + controller_id(16) + rows(2) + cols(2) +
+    ///   session_color(1) + label_len(2) + viewer_count(2) = 27
+    pub const fixed_size = 27;
     /// Per viewer: id(16) + label_len(2) + is_controller(1) + rows(2) + cols(2) = 23 + label
     pub const viewer_fixed_size = 23;
 
     pub fn encode(self: ViewerState, alloc: Allocator) ![]u8 {
-        var total: usize = fixed_size;
+        var total: usize = fixed_size + self.session_label.len;
         for (self.viewers) |v| {
             total += viewer_fixed_size + v.label.len;
         }
@@ -397,9 +401,17 @@ pub const ViewerState = struct {
         @memcpy(buf[2..18], &self.controller_id);
         std.mem.writeInt(u16, buf[18..20], self.effective_rows, .little);
         std.mem.writeInt(u16, buf[20..22], self.effective_cols, .little);
-        std.mem.writeInt(u16, buf[22..24], @intCast(self.viewers.len), .little);
+        // Session color + label
+        buf[22] = @bitCast(self.session_color);
+        std.mem.writeInt(u16, buf[23..25], @intCast(self.session_label.len), .little);
+        // Viewer count
+        std.mem.writeInt(u16, buf[25..27], @intCast(self.viewers.len), .little);
 
+        // Session label (variable length, before viewer entries)
         var off: usize = fixed_size;
+        @memcpy(buf[off..][0..self.session_label.len], self.session_label);
+        off += self.session_label.len;
+
         for (self.viewers) |v| {
             @memcpy(buf[off..][0..uuid_size], &v.id);
             off += uuid_size;
@@ -423,18 +435,27 @@ pub const ViewerState = struct {
         controller_id: Uuid,
         effective_rows: u16,
         effective_cols: u16,
+        session_color: i8,
+        session_label: []const u8,
         viewer_count: u16,
         remaining: []const u8,
     } {
         if (payload.len < fixed_size) return error.InvalidViewerStatePayload;
+        const session_color: i8 = @bitCast(payload[22]);
+        const label_len = std.mem.readInt(u16, payload[23..25], .little);
+        const viewer_count = std.mem.readInt(u16, payload[25..27], .little);
+        const label_end = fixed_size + label_len;
+        if (payload.len < label_end) return error.InvalidViewerStatePayload;
         return .{
             .reason = std.meta.intToEnum(ViewerStateReason, payload[0]) catch return error.InvalidViewerStatePayload,
             .size_mode = std.meta.intToEnum(SizeMode, payload[1]) catch return error.InvalidViewerStatePayload,
             .controller_id = payload[2..18].*,
             .effective_rows = std.mem.readInt(u16, payload[18..20], .little),
             .effective_cols = std.mem.readInt(u16, payload[20..22], .little),
-            .viewer_count = std.mem.readInt(u16, payload[22..24], .little),
-            .remaining = payload[fixed_size..],
+            .session_color = session_color,
+            .session_label = payload[fixed_size..label_end],
+            .viewer_count = viewer_count,
+            .remaining = payload[label_end..],
         };
     }
 };

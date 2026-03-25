@@ -2693,14 +2693,9 @@ pub const Window = extern struct {
         defer alloc.free(payload);
         SshConnectionManager.enqueueWrite(conn_entry, .rename, remote.target_id, payload);
 
-        // Update local label. Note: we can't safely free the old label
-        // (it may be from a different allocator/arena). Just overwrite.
-        remote.ssh_ctx.label = alloc.dupe(u8, name_copy) catch null;
-
-        // Trigger the tab title binding to re-evaluate by notifying
-        // the surface's title property changed. The computed title
-        // closure reads ssh_ctx.label via getRemoteInfo().
-        surface.setTitle(surface.getTitle());
+        // The daemon will broadcast the new name via viewer_state(.name_change).
+        // All clients (including this one) update their tab titles from
+        // the broadcast — no local hack needed.
     }
 
     /// React to a GTK action toggling the viewer panel.

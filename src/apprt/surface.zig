@@ -174,6 +174,11 @@ pub const Message = union(enum) {
         effective_rows: u16,
         effective_cols: u16,
         viewer_count: u16,
+        /// Authoritative session label from daemon.
+        session_label: [64]u8 = .{0} ** 64,
+        session_label_len: u8 = 0,
+        /// Session color: -1 = none, 0-7 = color index.
+        session_color: i8 = -1,
         /// Inline roster (up to 8 viewers; enough for the common case).
         viewers: [8]ViewerInfo = @as([8]ViewerInfo, @splat(ViewerInfo{})),
     };

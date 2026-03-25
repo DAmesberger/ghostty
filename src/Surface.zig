@@ -162,6 +162,8 @@ viewer_id: session.shared.Uuid = session.shared.zero_uuid,
 viewer_count: u16 = 0,
 is_controller: bool = false,
 size_mode_current: session.protocol.SizeMode = .smallest_wins,
+/// Session color from daemon (-1 = none, 0-7 = color index).
+session_color: i8 = -1,
 
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
@@ -1304,6 +1306,19 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             self.viewer_count = vs.viewer_count;
             self.is_controller = std.mem.eql(u8, &vs.controller_id, &self.viewer_id);
             self.size_mode_current = vs.size_mode;
+            self.session_color = vs.session_color;
+
+            // Update authoritative session label from daemon broadcast.
+            if (vs.session_label_len > 0) {
+                const label = vs.session_label[0..vs.session_label_len];
+                if (self.io.backend == .remote) {
+                    self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
+                }
+                // Trigger tab title re-evaluation via the GTK surface.
+                if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
+                    self.rt_surface.setTitle(self.rt_surface.getTitle());
+                }
+            }
         },
 
         .scrollback_progress => |sp| {

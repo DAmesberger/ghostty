@@ -322,6 +322,9 @@ pub const SessionGroup = struct {
     alloc: Allocator,
     id: Uuid,
     label: []u8,
+    /// Session color: -1 = none (no badge), 0-7 = color index.
+    /// Default derived from group UUID for consistency.
+    color: i8 = -1,
     surfaces: std.AutoArrayHashMap(Uuid, *RemoteSession),
     layout_blob: ?[]u8 = null,
     created_at: i64,
@@ -779,6 +782,13 @@ const Daemon = struct {
                 group.mutex.lock();
                 self.alloc.free(group.label);
                 group.label = new_label;
+
+                // Broadcast the new name to ALL viewers on ALL surfaces in the group.
+                for (group.surfaces.values()) |surf| {
+                    surf.mutex.lock();
+                    surf.broadcastViewerState(.name_change);
+                    surf.mutex.unlock();
+                }
                 group.mutex.unlock();
                 log.info("renamed group to '{s}'", .{new_label});
             },
@@ -826,6 +836,7 @@ const Daemon = struct {
             .alloc = self.alloc,
             .id = group_id,
             .label = label,
+            .color = @as(i8, @intCast(group_id[0] % 8)), // Deterministic color from UUID
             .surfaces = std.AutoArrayHashMap(Uuid, *RemoteSession).init(self.alloc),
             .created_at = std.time.timestamp(),
         };

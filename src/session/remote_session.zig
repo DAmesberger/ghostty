@@ -159,7 +159,7 @@ pub const RemoteSession = struct {
 
     /// Broadcast a viewer_state frame to all connected viewers.
     /// Must be called with mutex held.
-    fn broadcastViewerState(self: *RemoteSession, reason: session.protocol.ViewerStateReason) void {
+    pub fn broadcastViewerState(self: *RemoteSession, reason: session.protocol.ViewerStateReason) void {
         // Build viewer entries from current state.
         var entries_buf: [64]session.protocol.ViewerEntry = undefined;
         const count = @min(self.viewers.items.len, entries_buf.len);
@@ -177,12 +177,18 @@ pub const RemoteSession = struct {
         const eff_rows = self.terminal_instance.rows;
         const eff_cols = self.terminal_instance.cols;
 
+        // Get authoritative session label and color from the owning group.
+        const group_label: []const u8 = if (self.group) |g| g.label else "";
+        const group_color: i8 = if (self.group) |g| g.color else -1;
+
         const state = session.protocol.ViewerState{
             .reason = reason,
             .size_mode = self.size_mode,
             .controller_id = self.controller_id,
             .effective_rows = eff_rows,
             .effective_cols = eff_cols,
+            .session_color = group_color,
+            .session_label = group_label,
             .viewers = entries_buf[0..count],
         };
 
