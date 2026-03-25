@@ -168,6 +168,90 @@ pub const ParsedSshTarget = struct {
     jump: ?[]const u8,
 };
 
+pub const SshTargetError = error{
+    EmptyTarget,
+    MissingUser,
+    MissingHost,
+    InvalidCharInUser,
+    InvalidCharInHost,
+    InvalidPort,
+    InvalidJumpHost,
+};
+
+/// Validate a single `user@host` or `user@host:port` segment.
+fn validateSshHostSegment(segment: []const u8) SshTargetError!void {
+    if (segment.len == 0) return error.EmptyTarget;
+
+    // Must contain @
+    const at_pos = std.mem.indexOf(u8, segment, "@") orelse return error.MissingUser;
+    const user = segment[0..at_pos];
+    const host_port = segment[at_pos + 1 ..];
+
+    if (user.len == 0) return error.MissingUser;
+    if (host_port.len == 0) return error.MissingHost;
+
+    // User: alphanumeric, dash, underscore, dot
+    for (user) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_' and ch != '.') {
+            return error.InvalidCharInUser;
+        }
+    }
+
+    // Split host:port if present
+    const host = if (std.mem.lastIndexOf(u8, host_port, ":")) |colon| blk: {
+        const port_str = host_port[colon + 1 ..];
+        if (port_str.len > 0) {
+            _ = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
+        }
+        break :blk host_port[0..colon];
+    } else host_port;
+
+    if (host.len == 0) return error.MissingHost;
+
+    // Host: alphanumeric, dash, dot, brackets (IPv6)
+    for (host) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '.' and
+            ch != '[' and ch != ']' and ch != ':')
+        {
+            return error.InvalidCharInHost;
+        }
+    }
+}
+
+/// Validate a full SSH target string (with optional " via " jump hosts).
+/// Returns a human-readable error message, or null if valid.
+pub fn validateSshTarget(raw: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return "Target is empty";
+
+    const parsed = parseSshTarget(raw);
+
+    validateSshHostSegment(parsed.target) catch |err| {
+        return switch (err) {
+            error.EmptyTarget => "Target is empty",
+            error.MissingUser => "Missing username — use user@host format",
+            error.MissingHost => "Missing hostname — use user@host format",
+            error.InvalidCharInUser => "Invalid character in username",
+            error.InvalidCharInHost => "Invalid character in hostname",
+            error.InvalidPort => "Invalid port number",
+            error.InvalidJumpHost => unreachable,
+        };
+    };
+
+    if (parsed.jump) |jump| {
+        // Jump can be comma-separated chain
+        var it = std.mem.splitScalar(u8, jump, ',');
+        while (it.next()) |hop| {
+            const trimmed_hop = std.mem.trim(u8, hop, " \t");
+            validateSshHostSegment(trimmed_hop) catch {
+                return "Invalid jump host — use user@host format";
+            };
+        }
+    }
+
+    return null; // Valid
+}
+
 /// Parse an SSH target string that optionally contains a " via " jump host
 /// specifier.  Examples:
 ///   "user@host"                → .{ .target = "user@host", .jump = null }
@@ -585,4 +669,26 @@ test "formatSshTarget with jump" {
     const s = try formatSshTarget(std.testing.allocator, "user@host", "bastion");
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings("user@host via bastion", s);
+}
+
+test "validateSshTarget valid" {
+    try std.testing.expect(validateSshTarget("user@host") == null);
+    try std.testing.expect(validateSshTarget("user@host:22") == null);
+    try std.testing.expect(validateSshTarget("user@host via jump@bastion") == null);
+    try std.testing.expect(validateSshTarget("user@host via hop1@a,hop2@b") == null);
+    try std.testing.expect(validateSshTarget("root@192.168.1.1:2222") == null);
+}
+
+test "validateSshTarget invalid" {
+    try std.testing.expect(validateSshTarget("") != null);
+    try std.testing.expect(validateSshTarget("hostonly") != null);
+    try std.testing.expect(validateSshTarget("@host") != null);
+    try std.testing.expect(validateSshTarget("user@") != null);
+    try std.testing.expect(validateSshTarget("user@host:abc") != null);
+    try std.testing.expect(validateSshTarget("user@host via notvalid") != null);
+}
+
+test "validateSshTarget trailing via is treated as no jump" {
+    // "user@host via " trims to empty jump → equivalent to "user@host"
+    try std.testing.expect(validateSshTarget("user@host via ") == null);
 }

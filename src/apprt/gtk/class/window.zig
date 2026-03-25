@@ -2498,10 +2498,20 @@ pub const Window = extern struct {
     }
 
     /// React to the SSH connection overlay "connect" signal.
-    /// Parses "user@host via jumphost" syntax before creating the connection.
+    /// Validates and parses "user@host via jumphost" syntax before connecting.
     fn signalSshConnect(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, self: *Self) callconv(.c) void {
         const raw = std.mem.span(target_str orelse return);
         if (raw.len == 0) return;
+
+        // Validate the target format before attempting connection.
+        if (session.shared.validateSshTarget(raw)) |err_msg| {
+            // Show error dialog instead of silently failing.
+            const dialog = adw.AlertDialog.new("Invalid SSH Target", @ptrCast(err_msg.ptr));
+            dialog.addResponse("ok", "OK");
+            dialog.setDefaultResponse("ok");
+            dialog.choose(self.as(gtk.Widget), null, null, null);
+            return;
+        }
 
         const parsed = session.shared.parseSshTarget(raw);
         const mode = self.private().ssh_mode;
