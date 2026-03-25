@@ -1,0 +1,140 @@
+using Gtk 4.0;
+using Adw 1;
+
+Adw.Dialog dialog {
+  title: "Session Manager";
+  content-width: 400;
+  content-height: 360;
+  closed => $closed();
+
+  Adw.ToolbarView {
+    top-bar-style: flat;
+
+    [top]
+    Adw.HeaderBar {
+      show-end-title-buttons: false;
+      show-start-title-buttons: false;
+
+      [title]
+      Gtk.Label {
+        label: "Session Manager";
+
+        styles [
+          "heading",
+        ]
+      }
+    }
+
+    Gtk.Box {
+      orientation: vertical;
+      spacing: 16;
+      margin-start: 16;
+      margin-end: 16;
+      margin-top: 12;
+      margin-bottom: 16;
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 6;
+
+        Gtk.Label {
+          label: "Session Name";
+          halign: start;
+
+          styles [
+            "heading",
+            "caption",
+          ]
+        }
+
+        Gtk.Box {
+          orientation: horizontal;
+          spacing: 8;
+
+          Gtk.Entry name_entry {
+            hexpand: true;
+            placeholder-text: "Enter session name";
+          }
+
+          Gtk.Button rename_button {
+            label: "Rename";
+            clicked => $rename_clicked();
+
+            styles [
+              "suggested-action",
+            ]
+          }
+        }
+      }
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 6;
+
+        Gtk.Label {
+          label: "Info";
+          halign: start;
+
+          styles [
+            "heading",
+            "caption",
+          ]
+        }
+
+        Gtk.Box {
+          orientation: horizontal;
+          spacing: 12;
+          margin-start: 4;
+
+          Gtk.Label host_label {
+            halign: start;
+            hexpand: true;
+
+            styles [
+              "dim-label",
+            ]
+          }
+
+          Gtk.Label viewers_label {
+            styles [
+              "dim-label",
+            ]
+          }
+
+          Gtk.Label size_mode_label {
+            styles [
+              "dim-label",
+            ]
+          }
+        }
+      }
+
+      Gtk.Box {
+        vexpand: true;
+      }
+
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 8;
+
+        Gtk.Button detach_others_button {
+          label: "Detach All Other Viewers";
+          clicked => $detach_others_clicked();
+
+          styles [
+            "destructive-action",
+          ]
+        }
+
+        Gtk.Button delete_button {
+          label: "Delete Session";
+          clicked => $delete_clicked();
+
+          styles [
+            "destructive-action",
+          ]
+        }
+      }
+    }
+  }
+}
