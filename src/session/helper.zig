@@ -1150,8 +1150,8 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
                     const dpayload = s.read_buf.items[session.protocol.header_size..dtotal];
 
-                    // Rewrite target ID and forward to client
-                    sendFrameFile(stdout_file, dheader.kind, s.target, dpayload) catch {};
+                    // Rewrite target ID and forward to client (preserve flags)
+                    sendFrameFileFlags(stdout_file, dheader.kind, dheader.flags, s.target, dpayload) catch {};
                     shiftBuffer(&s.read_buf, dtotal);
                 }
             }
@@ -1493,9 +1493,14 @@ fn connectUnixSocket(path: []const u8) !posix.fd_t {
 const sendFrameFd = session.shared.sendFrameFd;
 
 fn sendFrameFile(file: std.fs.File, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
+    return sendFrameFileFlags(file, kind, .{}, target, payload);
+}
+
+fn sendFrameFileFlags(file: std.fs.File, kind: session.protocol.Kind, flags: session.protocol.Flags, target: u16, payload: []const u8) !void {
     if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;
     const header = (session.protocol.Header{
         .kind = kind,
+        .flags = flags,
         .target = target,
         .len = @intCast(payload.len),
     }).encodeToBuf();
