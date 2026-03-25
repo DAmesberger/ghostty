@@ -210,12 +210,9 @@ pub const RemoteSession = struct {
         if (self.command.pid) |pid| _ = posix.kill(pid, posix.SIG.TERM) catch {};
     }
 
-    /// Frame interval for output batching (nanoseconds). Accumulate PTY
-    /// output and flush at this rate. 16ms ≈ 60fps — good balance between
-    /// latency and throughput. Interactive keystrokes flush immediately
-    /// (when poll shows no more data ready).
+    /// Frame interval for output batching (nanoseconds).
     const frame_interval_ns: u64 = 16 * std.time.ns_per_ms;
-    /// Soft threshold for flushing early (avoid unbounded accumulation).
+    /// Soft threshold for flushing early.
     const flush_threshold: usize = 128 * 1024;
 
     /// Reader thread: reads PTY output, feeds the headless Terminal,
@@ -227,8 +224,9 @@ pub const RemoteSession = struct {
         var last_flush = std.time.nanoTimestamp();
 
         while (true) {
-            // Poll PTY for available data with frame-interval timeout.
-            const elapsed: u64 = @intCast(@max(0, std.time.nanoTimestamp() - last_flush));
+            // Poll PTY for data with frame-interval timeout.
+            const now_ts = std.time.nanoTimestamp();
+            const elapsed: u64 = @intCast(@max(0, now_ts - last_flush));
             const remaining_ms: i32 = if (elapsed >= frame_interval_ns)
                 0
             else
@@ -240,7 +238,6 @@ pub const RemoteSession = struct {
             const poll_result = posix.poll(&pollfds, remaining_ms) catch break;
 
             if (poll_result > 0 and (pollfds[0].revents & posix.POLL.IN != 0)) {
-                // Data available — read into accumulation buffer.
                 const n = posix.read(self.pty.master, &read_buf) catch |err| switch (err) {
                     error.WouldBlock => continue,
                     else => break,
@@ -253,17 +250,17 @@ pub const RemoteSession = struct {
 
                 accum.appendSlice(self.alloc, read_buf[0..n]) catch break;
 
-                // Check if we should flush (threshold exceeded or interval elapsed).
-                const now = std.time.nanoTimestamp();
-                const since_flush: u64 = @intCast(@max(0, now - last_flush));
+                // Keep accumulating if below threshold and within frame interval.
+                const flush_now = std.time.nanoTimestamp();
+                const since_flush: u64 = @intCast(@max(0, flush_now - last_flush));
                 if (accum.items.len < flush_threshold and since_flush < frame_interval_ns) {
-                    continue; // Keep accumulating
+                    continue;
                 }
-            } else if (pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
-                break; // PTY closed
+            } else if (poll_result > 0 and (pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0)) {
+                break;
             }
 
-            // Flush accumulated data to all viewers as one frame.
+            // Flush accumulated data to all viewers.
             if (accum.items.len > 0) {
                 self.mutex.lock();
                 const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
@@ -286,22 +283,11 @@ pub const RemoteSession = struct {
             }
         }
 
-        // Flush any remaining data.
+        // Flush remaining.
         if (accum.items.len > 0) {
             self.mutex.lock();
-            const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
             for (self.viewers.items) |viewer| {
-                if (use_compression) {
-                    session.shared.sendFrameFdCompressed(
-                        viewer.fd,
-                        .data_out,
-                        viewer.target,
-                        accum.items,
-                        self.alloc,
-                    ) catch {};
-                } else {
-                    sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
-                }
+                sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
             }
             self.mutex.unlock();
         }

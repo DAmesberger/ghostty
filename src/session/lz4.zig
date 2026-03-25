@@ -27,16 +27,17 @@ pub fn compress(alloc: Allocator, src: []const u8) ?[]u8 {
     var sp: usize = 0; // source position
     var anchor: usize = 0; // start of current literal run
 
-    // Hash table: maps 4-byte hash → position in src.
-    var table: [hash_size]u32 = @splat(0);
+    // Hash table: maps 4-byte hash → position in src. Empty = sentinel.
+    const empty: u32 = std.math.maxInt(u32);
+    var table: [hash_size]u32 = @splat(empty);
 
     while (sp + min_match <= src.len) {
         const h = hash4(src[sp..][0..4]);
         const ref = table[h];
         table[h] = @intCast(sp);
 
-        // Check for match.
-        if (ref > 0 and sp - ref <= max_distance and
+        // Check for match: ref must be valid and within max_distance.
+        if (ref != empty and sp > ref and sp - ref <= max_distance and
             std.mem.eql(u8, src[ref..][0..4], src[sp..][0..4]))
         {
             // Extend match forward.
