@@ -2708,24 +2708,75 @@ pub const Window = extern struct {
         const core = surface.core() orelse return;
         if (core.io.backend != .remote) return;
 
-        // TODO: Show the full session manager dialog (ssh_session_manager.zig).
-        // For now, show a simple info dialog with session state.
         const remote = &core.io.backend.remote;
-        const label = remote.ssh_ctx.label orelse "unnamed";
+        const current_label = remote.ssh_ctx.label orelse "unnamed";
         const target = remote.ssh_ctx.target;
 
-        var buf: [256]u8 = undefined;
-        const body = std.fmt.bufPrint(&buf, "Host: {s}\nSession: {s}\nViewers: {d}\nSize mode: {s}", .{
+        // Build info string for the dialog body.
+        var info_buf: [256]u8 = undefined;
+        const info = std.fmt.bufPrint(&info_buf, "Host: {s}\nViewers: {d} \xe2\x80\xa2 Size mode: {s}", .{
             target,
-            label,
             core.viewer_count,
             @tagName(core.size_mode_current),
-        }) catch "Session info unavailable";
+        }) catch "Session info";
 
-        const dialog = adw.AlertDialog.new("Session Manager", @ptrCast(body.ptr));
-        dialog.addResponse("ok", "OK");
-        dialog.setDefaultResponse("ok");
-        dialog.choose(surface.as(gtk.Widget), null, null, null);
+        const dialog = adw.AlertDialog.new("Manage Session", @ptrCast(info.ptr));
+        dialog.addResponse("cancel", "Close");
+        dialog.addResponse("rename", "Rename");
+        dialog.setDefaultResponse("rename");
+        dialog.setCloseResponse("cancel");
+
+        // Add entry pre-filled with current session name.
+        const entry = gtk.Entry.new();
+        entry.as(gtk.Widget).setMarginStart(24);
+        entry.as(gtk.Widget).setMarginEnd(24);
+        entry.getBuffer().setText(
+            @ptrCast(current_label.ptr),
+            @intCast(current_label.len),
+        );
+        dialog.setExtraChild(entry.as(gtk.Widget));
+
+        dialog.choose(surface.as(gtk.Widget), null, manageSessionReady, self);
+    }
+
+    fn manageSessionReady(
+        source: ?*gobject.Object,
+        result: *gio.AsyncResult,
+        ud: ?*anyopaque,
+    ) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(ud));
+        const dialog: *adw.AlertDialog = @ptrCast(source orelse return);
+
+        // Extract entry text BEFORE finishing (dialog may be finalized after).
+        const extra = dialog.getExtraChild() orelse return;
+        const entry = gobject.ext.cast(gtk.Entry, extra) orelse return;
+        const alloc = Application.default().allocator();
+        const name_z = entry.getBuffer().getText();
+        const name = std.mem.span(name_z);
+        const name_copy = alloc.dupe(u8, name) catch return;
+        defer alloc.free(name_copy);
+
+        const response = dialog.chooseFinish(result);
+        if (std.mem.orderZ(u8, "rename", response) != .eq) return;
+        if (name_copy.len == 0) return;
+
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+
+        const remote = &core.io.backend.remote;
+        const conn_entry = remote.conn_entry orelse return;
+
+        // Send rename frame. The daemon will broadcast the new name
+        // back to all clients via viewer_state(.name_change).
+        const rename_data = session.protocol.Rename{
+            .scope = .group,
+            .id = remote.ssh_ctx.group_id,
+            .label = name_copy,
+        };
+        const payload = rename_data.encode(alloc) catch return;
+        defer alloc.free(payload);
+        SshConnectionManager.enqueueWrite(conn_entry, .rename, remote.target_id, payload);
     }
 
     /// React to a GTK action requesting SSH session deletion.

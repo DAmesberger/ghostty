@@ -583,6 +583,30 @@ pub const RemoteSession = struct {
                         self.mutex.unlock();
                     }
                 },
+                .rename => {
+                    const rename_data = session.protocol.Rename.parse(payload) catch {
+                        shiftBuf(frame_buf, total);
+                        continue;
+                    };
+                    if (self.group) |group| {
+                        group.mutex.lock();
+                        if (rename_data.scope == .group) {
+                            const new_label = session.shared.sanitizeLabelAlloc(self.alloc, rename_data.label) catch {
+                                group.mutex.unlock();
+                                shiftBuf(frame_buf, total);
+                                continue;
+                            };
+                            self.alloc.free(group.label);
+                            group.label = new_label;
+                            for (group.surfaces.values()) |surf| {
+                                surf.mutex.lock();
+                                surf.broadcastViewerState(.name_change);
+                                surf.mutex.unlock();
+                            }
+                        }
+                        group.mutex.unlock();
+                    }
+                },
                 .session_meta => {
                     const meta = session.protocol.SessionMeta.parse(payload) catch {
                         shiftBuf(frame_buf, total);
