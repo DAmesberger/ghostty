@@ -210,17 +210,20 @@ pub const RemoteSession = struct {
         if (self.command.pid) |pid| _ = posix.kill(pid, posix.SIG.TERM) catch {};
     }
 
-    /// Frame interval for output batching (nanoseconds).
+    /// Frame interval for page diff serialization (nanoseconds).
+    /// 16ms ≈ 60fps — balances latency and throughput.
     const frame_interval_ns: u64 = 16 * std.time.ns_per_ms;
-    /// Soft threshold for flushing early.
-    const flush_threshold: usize = 128 * 1024;
 
     /// Reader thread: reads PTY output, feeds the headless Terminal,
-    /// and forwards accumulated bytes to viewers at the frame rate.
+    /// and sends binary page diffs to viewers at the frame rate.
+    ///
+    /// The daemon's Terminal is the single source of truth. Raw VT bytes
+    /// are consumed by HeadlessStreamHandler (updating page memory) and
+    /// NEVER forwarded to clients. Only the resulting state changes
+    /// (dirty rows as binary page diffs) are sent.
     pub fn readerMain(self: *RemoteSession) void {
         var read_buf: [65536]u8 = undefined;
-        var accum = std.ArrayList(u8).empty;
-        defer accum.deinit(self.alloc);
+        var has_new_data = false;
         var last_flush = std.time.nanoTimestamp();
 
         while (true) {
@@ -244,52 +247,63 @@ pub const RemoteSession = struct {
                 };
                 if (n == 0) break;
 
+                // Feed the headless terminal — this is the ONLY consumer of raw VT.
+                // Query responses (DA, DSR, OSC colors) are handled here and
+                // written back to the PTY. They are NOT forwarded to clients.
                 self.mutex.lock();
                 self.stream.nextSlice(read_buf[0..n]);
                 self.mutex.unlock();
 
-                accum.appendSlice(self.alloc, read_buf[0..n]) catch break;
+                has_new_data = true;
 
-                // Keep accumulating if below threshold and within frame interval.
+                // Keep reading if more data available within frame interval.
                 const flush_now = std.time.nanoTimestamp();
                 const since_flush: u64 = @intCast(@max(0, flush_now - last_flush));
-                if (accum.items.len < flush_threshold and since_flush < frame_interval_ns) {
+                if (since_flush < frame_interval_ns) {
                     continue;
                 }
             } else if (poll_result > 0 and (pollfds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0)) {
                 break;
             }
 
-            // Flush accumulated data to all viewers.
-            if (accum.items.len > 0) {
+            // Serialize dirty rows as binary page diff and send to viewers.
+            if (has_new_data) {
                 self.mutex.lock();
-                const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
-                for (self.viewers.items) |viewer| {
-                    if (use_compression) {
-                        session.shared.sendFrameFdCompressed(
-                            viewer.fd,
-                            .data_out,
-                            viewer.target,
-                            accum.items,
-                            self.alloc,
-                        ) catch {};
-                    } else {
-                        sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                if (self.viewers.items.len > 0) {
+                    if (page_diff.serializeDirtyRows(self.alloc, &self.terminal_instance) catch null) |diff| {
+                        defer self.alloc.free(diff);
+                        const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
+                        for (self.viewers.items) |viewer| {
+                            if (use_compression) {
+                                session.shared.sendFrameFdCompressed(
+                                    viewer.fd,
+                                    .data_out,
+                                    viewer.target,
+                                    diff,
+                                    self.alloc,
+                                ) catch {};
+                            } else {
+                                sendFrameFd(viewer.fd, .data_out, viewer.target, diff) catch {};
+                            }
+                        }
                     }
                 }
+                page_diff.clearDirtyFlags(&self.terminal_instance);
                 self.mutex.unlock();
-                accum.clearRetainingCapacity();
+                has_new_data = false;
                 last_flush = std.time.nanoTimestamp();
             }
         }
 
-        // Flush remaining.
-        if (accum.items.len > 0) {
-            self.mutex.lock();
-            for (self.viewers.items) |viewer| {
-                sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+        // Final flush of any remaining dirty state.
+        self.mutex.lock();
+        if (self.viewers.items.len > 0) {
+            if (page_diff.serializeDirtyRows(self.alloc, &self.terminal_instance) catch null) |diff| {
+                defer self.alloc.free(diff);
+                for (self.viewers.items) |viewer| {
+                    sendFrameFd(viewer.fd, .data_out, viewer.target, diff) catch {};
+                }
             }
-            self.mutex.unlock();
         }
 
         self.mutex.lock();
@@ -338,25 +352,24 @@ pub const RemoteSession = struct {
         // Notify all viewers (including the new one) about the roster.
         self.broadcastViewerState(if (self.viewers.items.len == 1) .welcome else .join);
 
-        // Generate and send VT snapshot BEFORE enabling live forwarding
-        const vt_snapshot = serializeViewportAsVT(self.alloc, &self.terminal_instance) catch |err| {
+        // Send binary full snapshot of the viewport (all rows).
+        // This replaces the old VT snapshot — no VT sequences cross the wire.
+        const snapshot = page_diff.serializeFullSnapshot(self.alloc, &self.terminal_instance) catch |err| {
             self.removeViewer(fd);
             self.mutex.unlock();
             return err;
         };
-        defer self.alloc.free(vt_snapshot);
+        defer self.alloc.free(snapshot);
 
         // Capture history state for background streaming
         const total_history = self.computeHistoryRows();
         const cols = self.terminal_instance.cols;
 
-        if (vt_snapshot.len > 0) {
-            sendFrameFd(fd, .data_out, target, vt_snapshot) catch |err| {
-                self.removeViewer(fd);
-                self.mutex.unlock();
-                return err;
-            };
-        }
+        sendFrameFd(fd, .data_out, target, snapshot) catch |err| {
+            self.removeViewer(fd);
+            self.mutex.unlock();
+            return err;
+        };
 
         self.mutex.unlock();
 
@@ -584,150 +597,6 @@ pub const RemoteSession = struct {
 
     const shiftBuf = session.shared.shiftBuffer;
 };
-
-/// Serialize the Terminal's viewport as VT escape sequences.
-fn serializeViewportAsVT(alloc: Allocator, t: *Terminal) ![]u8 {
-    const s: *Screen = t.screens.active;
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
-
-    // Reset client state: clear screen, reset attributes, home cursor
-    try w.writeAll("\x1b[0m\x1b[H\x1b[2J");
-
-    var cur_style: terminal.Style = .{};
-
-    var row_it = s.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-    var y: u16 = 0;
-    while (row_it.next()) |row_pin| : (y += 1) {
-        try w.print("\x1b[{d};1H", .{@as(u32, y) + 1});
-
-        const p: *page.Page = &row_pin.node.data;
-        const rac = row_pin.rowAndCell();
-        const row = rac.row;
-        const page_cells = p.getCells(row);
-
-        var last_content: u16 = 0;
-        for (page_cells, 0..) |cell, x| {
-            if (cell.codepoint() != 0 or cell.style_id != 0 or
-                cell.content_tag == .bg_color_palette or cell.content_tag == .bg_color_rgb)
-            {
-                last_content = @intCast(x + 1);
-            }
-        }
-
-        for (page_cells[0..last_content]) |cell| {
-            if (cell.wide == .spacer_tail) continue;
-            if (cell.wide == .spacer_head) continue;
-
-            const cell_style: terminal.Style = if (cell.style_id != 0)
-                p.styles.get(p.memory, cell.style_id).*
-            else
-                .{};
-
-            if (!cell_style.eql(cur_style)) {
-                try emitSGR(w, cell_style);
-                cur_style = cell_style;
-            }
-
-            const cp = cell.codepoint();
-            if (cp == 0) {
-                try w.writeByte(' ');
-            } else if (cell.content_tag == .codepoint_grapheme) {
-                var cp_buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cp, &cp_buf) catch 0;
-                if (len > 0) try w.writeAll(cp_buf[0..len]);
-                if (p.lookupGrapheme(&cell)) |extras| {
-                    for (extras) |extra_cp| {
-                        const elen = std.unicode.utf8Encode(extra_cp, &cp_buf) catch 0;
-                        if (elen > 0) try w.writeAll(cp_buf[0..elen]);
-                    }
-                }
-            } else {
-                var cp_buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cp, &cp_buf) catch 0;
-                if (len > 0) try w.writeAll(cp_buf[0..len]);
-            }
-        }
-    }
-
-    if (!cur_style.eql(.{})) {
-        try w.writeAll("\x1b[0m");
-    }
-
-    try w.print("\x1b[{d};{d}H", .{
-        @as(u32, s.cursor.y) + 1,
-        @as(u32, s.cursor.x) + 1,
-    });
-
-    if (!t.modes.get(.cursor_visible)) {
-        try w.writeAll("\x1b[?25l");
-    }
-
-    const blink = t.modes.get(.cursor_blinking);
-    const cs: u8 = switch (s.cursor.cursor_style) {
-        .block => if (blink) 1 else 2,
-        .underline => if (blink) 3 else 4,
-        .bar => if (blink) 5 else 6,
-        .block_hollow => if (blink) 1 else 2,
-    };
-    if (cs != 1) {
-        try w.print("\x1b[{d} q", .{cs});
-    }
-
-    if (t.modes.get(.alt_screen) or t.modes.get(.alt_screen_save_cursor_clear_enter)) {
-        try w.writeAll("\x1b[?1049h");
-    }
-
-    return buf.toOwnedSlice(alloc);
-}
-
-fn emitSGR(w: anytype, s: terminal.Style) !void {
-    try w.writeAll("\x1b[0");
-    if (s.flags.bold) try w.writeAll(";1");
-    if (s.flags.faint) try w.writeAll(";2");
-    if (s.flags.italic) try w.writeAll(";3");
-    switch (s.flags.underline) {
-        .none => {},
-        .single => try w.writeAll(";4"),
-        .double => try w.writeAll(";21"),
-        .curly => try w.writeAll(";4:3"),
-        .dotted => try w.writeAll(";4:4"),
-        .dashed => try w.writeAll(";4:5"),
-    }
-    if (s.flags.blink) try w.writeAll(";5");
-    if (s.flags.inverse) try w.writeAll(";7");
-    if (s.flags.invisible) try w.writeAll(";8");
-    if (s.flags.strikethrough) try w.writeAll(";9");
-    if (s.flags.overline) try w.writeAll(";53");
-    try emitColorSGR(w, s.fg_color, 30);
-    try emitColorSGR(w, s.bg_color, 40);
-    switch (s.underline_color) {
-        .none => {},
-        .palette => |idx| try w.print(";58;5;{d}", .{idx}),
-        .rgb => |rgb| try w.print(";58;2;{d};{d};{d}", .{ rgb.r, rgb.g, rgb.b }),
-    }
-    try w.writeByte('m');
-}
-
-fn emitColorSGR(w: anytype, color: terminal.Style.Color, base: u8) !void {
-    switch (color) {
-        .none => {},
-        .palette => |idx| {
-            if (idx < 8) {
-                try w.print(";{d}", .{base + idx});
-            } else if (idx < 16) {
-                try w.print(";{d}", .{base + 60 + idx - 8});
-            } else {
-                try w.print(";{d};5;{d}", .{ base + 8, idx });
-            }
-        },
-        .rgb => |rgb| {
-            try w.print(";{d};2;{d};{d};{d}", .{ base + 8, rgb.r, rgb.g, rgb.b });
-        },
-    }
-}
 
 const sendFrameFd = session.shared.sendFrameFd;
 
