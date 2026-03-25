@@ -959,12 +959,11 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
 fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, payload: []const u8) void {
     switch (kind) {
         .data_out => {
-            // Apply binary page diff directly to terminal state.
-            // No VT parsing — the daemon already processed all VT and
-            // sends only the resulting page state changes.
-            s.io.renderer_state.mutex.lock();
-            defer s.io.renderer_state.mutex.unlock();
-            page_diff.applyPageDiff(s.io.renderer_state.terminal, payload);
+            // Suppress write-back responses (DA, DSR, OSC colors, etc.) during
+            // remote data processing. The daemon already responded to queries.
+            s.io.terminal_stream.handler.suppress_responses = true;
+            defer s.io.terminal_stream.handler.suppress_responses = false;
+            @call(.always_inline, termio.Termio.processOutput, .{ s.io, payload });
         },
         .opened => {
             // Parse the bundled opened response

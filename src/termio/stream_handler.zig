@@ -78,6 +78,12 @@ pub const StreamHandler = struct {
     /// to wake up the termio thread.
     termio_messaged: bool = false,
 
+    /// When true, suppresses all write-back responses (DA, DSR, OSC
+    /// color queries, XTVERSION, etc.). Used when processing remote
+    /// SSH data_out frames — the daemon already responded to queries,
+    /// the client should only render, not respond.
+    suppress_responses: bool = false,
+
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
@@ -136,6 +142,10 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        // When processing remote data_out, suppress all write-back responses.
+        // The daemon already handled queries (DA, DSR, OSC colors, etc.) and
+        // wrote responses back to the PTY. The client only needs to render.
+        if (self.suppress_responses) return;
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }

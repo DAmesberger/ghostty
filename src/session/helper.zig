@@ -865,9 +865,13 @@ const Daemon = struct {
         errdefer self.alloc.free(command_args);
         command_args[0] = command_path;
 
+        // Start shell in user's home directory (daemon cwd is / from daemonization).
+        const home_dir = posix.getenv("HOME") orelse "/";
+
         var command: Command = .{
             .path = command_path,
             .args = command_args,
+            .cwd = home_dir,
             .stdin = .{ .handle = pty.slave },
             .stdout = .{ .handle = pty.slave },
             .stderr = .{ .handle = pty.slave },
