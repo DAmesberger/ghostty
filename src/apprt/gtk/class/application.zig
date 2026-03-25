@@ -789,7 +789,7 @@ pub const Application = extern struct {
 
             .ssh_toggle_size_mode => return false, // Handled in Surface.zig directly (sends frame)
 
-            .ssh_toggle_viewer_panel => return Action.sshToggleViewerPanel(target, value),
+            .ssh_manage_session => return Action.sshManageSession(target, value),
 
             // Unimplemented
             .secure_input,
@@ -2872,11 +2872,11 @@ const Action = struct {
         }
     }
 
-    pub fn sshToggleViewerPanel(target: apprt.Target, _: apprt.Action.Value(.ssh_toggle_viewer_panel)) bool {
+    pub fn sshManageSession(target: apprt.Target, _: apprt.Action.Value(.ssh_manage_session)) bool {
         switch (target) {
             .app => return false,
             .surface => |surface| {
-                return surface.rt_surface.gobj().sshToggleViewerPanel();
+                return surface.rt_surface.gobj().sshManageSession();
             },
         }
     }

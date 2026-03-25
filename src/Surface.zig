@@ -6015,9 +6015,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             return false;
         },
 
-        .ssh_toggle_viewer_panel => return try self.rt_app.performAction(
+        .ssh_manage_session => return try self.rt_app.performAction(
             .{ .surface = self },
-            .ssh_toggle_viewer_panel,
+            .ssh_manage_session,
             {},
         ),
 

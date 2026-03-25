@@ -159,6 +159,25 @@ pub const RemoteSession = struct {
 
     /// Broadcast a viewer_state frame to all connected viewers.
     /// Must be called with mutex held.
+    /// Force-disconnect a viewer by UUID. Must be called with mutex held.
+    pub fn kickViewer(self: *RemoteSession, viewer_id: Uuid) void {
+        for (self.viewers.items) |viewer| {
+            if (std.mem.eql(u8, &viewer.viewer_id, &viewer_id)) {
+                // Send EOF to the viewer to disconnect them.
+                sendFrameFd(viewer.fd, .eof, viewer.target, "") catch {};
+                self.removeViewer(viewer.fd);
+                if (std.mem.eql(u8, &self.controller_id, &viewer_id)) {
+                    self.controller_id = session.shared.zero_uuid;
+                }
+                self.recalculateSize();
+                if (self.viewers.items.len > 0) {
+                    self.broadcastViewerState(.leave);
+                }
+                return;
+            }
+        }
+    }
+
     pub fn broadcastViewerState(self: *RemoteSession, reason: session.protocol.ViewerStateReason) void {
         // Build viewer entries from current state.
         var entries_buf: [64]session.protocol.ViewerEntry = undefined;
@@ -555,6 +574,42 @@ pub const RemoteSession = struct {
                     self.recalculateSize();
                     self.broadcastViewerState(.mode_change);
                     self.mutex.unlock();
+                },
+                .kick_viewer => {
+                    if (payload.len >= session.protocol.uuid_size) {
+                        const target_id_bytes = payload[0..session.protocol.uuid_size];
+                        self.mutex.lock();
+                        self.kickViewer(target_id_bytes.*);
+                        self.mutex.unlock();
+                    }
+                },
+                .session_meta => {
+                    const meta = session.protocol.SessionMeta.parse(payload) catch {
+                        shiftBuf(frame_buf, total);
+                        continue;
+                    };
+                    if (self.group) |group| {
+                        group.mutex.lock();
+                        // Update label
+                        if (meta.label.len > 0) {
+                            const new_label = session.shared.sanitizeLabelAlloc(self.alloc, meta.label) catch {
+                                group.mutex.unlock();
+                                shiftBuf(frame_buf, total);
+                                continue;
+                            };
+                            self.alloc.free(group.label);
+                            group.label = new_label;
+                        }
+                        // Update color
+                        group.color = meta.color;
+                        // Broadcast to all surfaces in group
+                        for (group.surfaces.values()) |surf| {
+                            surf.mutex.lock();
+                            surf.broadcastViewerState(.name_change);
+                            surf.mutex.unlock();
+                        }
+                        group.mutex.unlock();
+                    }
                 },
                 .layout => {
                     if (payload.len <= 64 * 1024) {

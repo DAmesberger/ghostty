@@ -936,8 +936,8 @@ pub const Surface = extern struct {
         return self.as(gtk.Widget).activateAction("win.ssh-delete-session", null) != 0;
     }
 
-    pub fn sshToggleViewerPanel(self: *Self) bool {
-        return self.as(gtk.Widget).activateAction("win.ssh-toggle-viewer-panel", null) != 0;
+    pub fn sshManageSession(self: *Self) bool {
+        return self.as(gtk.Widget).activateAction("win.ssh-manage-session", null) != 0;
     }
 
     pub fn controlInspector(

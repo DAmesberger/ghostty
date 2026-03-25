@@ -368,8 +368,8 @@ pub const Action = union(Key) {
     /// Toggle size negotiation mode for multi-viewer.
     ssh_toggle_size_mode: void,
 
-    /// Toggle the viewer panel overlay.
-    ssh_toggle_viewer_panel: void,
+    /// Open the SSH session manager dialog.
+    ssh_manage_session: void,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -445,7 +445,7 @@ pub const Action = union(Key) {
         ssh_rename_session,
         ssh_delete_session,
         ssh_toggle_size_mode,
-        ssh_toggle_viewer_panel,
+        ssh_manage_session,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

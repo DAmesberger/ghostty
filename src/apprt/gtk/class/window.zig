@@ -400,7 +400,7 @@ pub const Window = extern struct {
             .init("ssh-session-attach", actionSshSessionAttach, s_variant_type),
             .init("ssh-rename-session", actionSshRenameSession, null),
             .init("ssh-delete-session", actionSshDeleteSession, null),
-            .init("ssh-toggle-viewer-panel", actionSshToggleViewerPanel, null),
+            .init("ssh-manage-session", actionSshManageSession, null),
             .init("toggle-inspector", actionToggleInspector, null),
         };
 
@@ -2698,17 +2698,34 @@ pub const Window = extern struct {
         // the broadcast — no local hack needed.
     }
 
-    /// React to a GTK action toggling the viewer panel.
-    fn actionSshToggleViewerPanel(
+    /// React to a GTK action opening the session manager dialog.
+    fn actionSshManageSession(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
-        _: *Window,
+        self: *Window,
     ) callconv(.c) void {
-        // The viewer panel is a per-surface overlay. Toggle is handled
-        // at the surface level via the apprt action dispatch.
-        // This window-level handler is a fallback — the real work
-        // happens in the surface's viewer_state mailbox handler.
-        log.info("ssh_toggle_viewer_panel: use keybinding on an SSH surface", .{});
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+
+        // TODO: Show the full session manager dialog (ssh_session_manager.zig).
+        // For now, show a simple info dialog with session state.
+        const remote = &core.io.backend.remote;
+        const label = remote.ssh_ctx.label orelse "unnamed";
+        const target = remote.ssh_ctx.target;
+
+        var buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&buf, "Host: {s}\nSession: {s}\nViewers: {d}\nSize mode: {s}", .{
+            target,
+            label,
+            core.viewer_count,
+            @tagName(core.size_mode_current),
+        }) catch "Session info unavailable";
+
+        const dialog = adw.AlertDialog.new("Session Manager", @ptrCast(body.ptr));
+        dialog.addResponse("ok", "OK");
+        dialog.setDefaultResponse("ok");
+        dialog.choose(surface.as(gtk.Widget), null, null, null);
     }
 
     /// React to a GTK action requesting SSH session deletion.

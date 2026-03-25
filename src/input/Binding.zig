@@ -817,12 +817,13 @@ pub const Action = union(enum) {
     /// when the surface is an SSH remote session.
     ssh_toggle_size_mode,
 
-    /// Toggle the viewer panel overlay for the current SSH remote session.
+    /// Open the session manager dialog for the current SSH remote session.
     ///
-    /// Shows or hides a floating panel listing connected viewers, who has
-    /// control, and the current size mode. Only effective when the surface
-    /// is an SSH remote session.
-    ssh_toggle_viewer_panel,
+    /// Shows a dialog with session name, color, size mode, and connected
+    /// viewers. Supports rename, color change, size mode toggle, and
+    /// force-disconnect of viewers. Only effective when the surface is
+    /// an SSH remote session.
+    ssh_manage_session,
 
     /// Toggle the quick terminal.
     ///
@@ -1437,7 +1438,7 @@ pub const Action = union(enum) {
             .ssh_rename_session,
             .ssh_delete_session,
             .ssh_toggle_size_mode,
-            .ssh_toggle_viewer_panel,
+            .ssh_manage_session,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

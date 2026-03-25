@@ -617,10 +617,10 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Toggle between smallest-wins and leader-wins size negotiation.",
         }},
 
-        .ssh_toggle_viewer_panel => comptime &.{.{
-            .action = .ssh_toggle_viewer_panel,
-            .title = "Toggle Viewer Panel",
-            .description = "Show or hide the multi-viewer presence panel.",
+        .ssh_manage_session => comptime &.{.{
+            .action = .ssh_manage_session,
+            .title = "Manage SSH Session",
+            .description = "Open the session manager: rename, change color, manage viewers.",
         }},
 
         .open_config => comptime &.{.{

@@ -146,6 +146,8 @@ pub const Kind = enum(u8) {
     // Multi-viewer
     viewer_state = 20, // Daemon → viewer(s): roster + session state
     size_mode_change = 21, // Client → daemon: change size negotiation mode
+    kick_viewer = 25, // Client → daemon: force-disconnect a viewer
+    session_meta = 26, // Client → daemon: update session label + color
 };
 
 pub const Header = struct {
@@ -472,6 +474,36 @@ pub const SizeModeChange = struct {
         if (payload.len < 1) return error.InvalidSizeModePayload;
         return .{
             .mode = std.meta.intToEnum(SizeMode, payload[0]) catch return error.InvalidSizeModePayload,
+        };
+    }
+};
+
+/// Payload for `session_meta` (kind 26): update session label + color atomically.
+pub const SessionMeta = struct {
+    group_id: Uuid,
+    color: i8,
+    label: []const u8,
+
+    pub const min_size = uuid_size + 1 + 2; // group_id(16) + color(1) + label_len(2)
+
+    pub fn encode(self: SessionMeta, alloc: Allocator) ![]u8 {
+        const total = min_size + self.label.len;
+        const buf = try alloc.alloc(u8, total);
+        @memcpy(buf[0..uuid_size], &self.group_id);
+        buf[uuid_size] = @bitCast(self.color);
+        std.mem.writeInt(u16, buf[uuid_size + 1 ..][0..2], @intCast(self.label.len), .little);
+        @memcpy(buf[min_size..], self.label);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !SessionMeta {
+        if (payload.len < min_size) return error.InvalidSessionMetaPayload;
+        const label_len = std.mem.readInt(u16, payload[uuid_size + 1 ..][0..2], .little);
+        if (payload.len < min_size + label_len) return error.InvalidSessionMetaPayload;
+        return .{
+            .group_id = payload[0..uuid_size].*,
+            .color = @bitCast(payload[uuid_size]),
+            .label = payload[min_size..][0..label_len],
         };
     }
 };

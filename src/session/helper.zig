@@ -1101,6 +1101,8 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                 .layout,
                 .rename,
                 .size_mode_change,
+                .kick_viewer,
+                .session_meta,
                 => {
                     if (findMuxSession(&sessions, target)) |s| {
                         sendFrameFd(s.daemon_fd, kind, target, payload) catch {
