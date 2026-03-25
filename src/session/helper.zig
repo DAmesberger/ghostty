@@ -400,6 +400,7 @@ const Daemon = struct {
             .session_new => {
                 // Create group with client-provided group_id + first surface
                 const raw_label = if (open_data.label.len > 0) open_data.label else "session";
+                log.info("session_new: label='{s}' (len={d})", .{ raw_label, raw_label.len });
                 const group_id = if (!session.shared.isZeroUuid(open_data.group_id))
                     open_data.group_id
                 else
