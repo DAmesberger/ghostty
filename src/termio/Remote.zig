@@ -191,6 +191,7 @@ pub fn threadEnter(
                 .group_id = self.ssh_ctx.group_id,
                 .surface_id = self.ssh_ctx.surface_id,
                 .max_scrollback = self.scrollback_limit,
+                .label = self.ssh_ctx.target, // Identify this viewer by SSH target
             }).encode(alloc) catch return error.OutOfMemory;
             defer alloc.free(open_payload);
             SshConnectionManager.enqueueWrite(entry, .open, self.target_id, open_payload);

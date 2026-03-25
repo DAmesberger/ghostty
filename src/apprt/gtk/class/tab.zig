@@ -596,15 +596,22 @@ pub const Tab = extern struct {
         // If the connection is degraded, prefix with state indicator.
         const remote_info = self.getRemoteInfo();
 
-        // Auto-assign a color for SSH tabs that don't have one yet.
-        // Same group_id → same color; different sessions → different colors.
+        // Use the daemon-authoritative session color for SSH tabs.
+        // If the daemon sent a color (>= 0), use it. Otherwise fall back
+        // to the tab's manual override or auto-hash.
         var effective_color = tab_color_;
-        if (tab_color_ < 0) {
+        if (remote_info.session_color >= 0) {
+            effective_color = remote_info.session_color;
+            const priv = self.private();
+            if (priv.tab_color != effective_color) {
+                priv.tab_color = effective_color;
+                self.as(gobject.Object).notifyByPspec(properties.@"tab-color".impl.param_spec);
+            }
+        } else if (tab_color_ < 0) {
             if (remote_info.group_id) |gid| {
                 var h: u8 = 0;
                 for (gid) |b| h ^= b;
                 effective_color = @intCast(h & 0x7);
-                // Persist so it sticks across title updates
                 const priv = self.private();
                 priv.tab_color = effective_color;
                 self.as(gobject.Object).notifyByPspec(properties.@"tab-color".impl.param_spec);
@@ -660,6 +667,8 @@ pub const Tab = extern struct {
         label: ?[]const u8 = null,
         conn_state: ?@import("../../../session.zig").protocol.ConnectionState = null,
         group_id: ?session.shared.Uuid = null,
+        /// Daemon-authoritative session color (-1 = none/use default).
+        session_color: i8 = -1,
     };
 
     /// Get SSH remote info from the active surface, if any.
@@ -677,6 +686,7 @@ pub const Tab = extern struct {
             .label = ctx.label,
             .conn_state = conn_state,
             .group_id = if (session.shared.isZeroUuid(gid)) null else gid,
+            .session_color = core.session_color,
         };
     }
 
