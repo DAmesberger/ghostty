@@ -178,6 +178,9 @@ fn runRemote(alloc: Allocator, opts: Options) !u8 {
 fn buildRemoteCommand(alloc: Allocator, remote_bin: []const u8, opts: Options) ![]const u8 {
     const subcommand = session.shared.remote_subcommand;
 
+    if (opts.@"kill-daemon") {
+        return std.fmt.allocPrint(alloc, "{s} {s} --kill-daemon", .{ remote_bin, subcommand });
+    }
     if (opts.list) {
         return std.fmt.allocPrint(alloc, "{s} {s} --list", .{ remote_bin, subcommand });
     }
