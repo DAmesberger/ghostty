@@ -350,7 +350,7 @@ pub fn ensureRemoteGhostty(
         try stderr.writeAll("Uploading ghostty-headless to remote...\n");
         try stderr.flush();
 
-        try uploadGhostty(alloc, sess, dest, local_headless, remote_home, remote_os, stderr, mailbox);
+        try uploadGhostty(alloc, sess, dest, local_headless, remote_home, remote_os, stderr, mailbox, .local_headless);
         return .{ .path = dest, .provisioned = true };
     }
 
@@ -370,7 +370,7 @@ pub fn ensureRemoteGhostty(
         try stderr.writeAll("Uploading ghostty to remote (as ghostty-headless)...\n");
         try stderr.flush();
 
-        try uploadGhostty(alloc, sess, dest, exe_path, remote_home, remote_os, stderr, mailbox);
+        try uploadGhostty(alloc, sess, dest, exe_path, remote_home, remote_os, stderr, mailbox, .local_self);
         return .{ .path = dest, .provisioned = true };
     }
 
@@ -589,7 +589,7 @@ fn downloadAndUploadLocal(
     try stderr.print("Uploading headless binary ({d} KB)... ", .{total_bytes / 1024});
     try stderr.flush();
 
-    pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes } });
+    pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes, .source = .github } });
 
     const ProgressCtx = struct {
         mbox: ?*Mailbox,
@@ -599,6 +599,7 @@ fn downloadAndUploadLocal(
             pushConnectionState(ctx.mbox, .{ .uploading = .{
                 .bytes_sent = bytes_sent,
                 .total_bytes = ctx.total,
+                .source = .github,
             } });
         }
     };
@@ -809,6 +810,7 @@ fn uploadGhostty(
     remote_os: []const u8,
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
+    source: protocol.ConnectionState.ProvisionSource,
 ) !void {
     const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(install_dir);
@@ -834,20 +836,22 @@ fn uploadGhostty(
     try stderr.flush();
 
     // Notify via mailbox of upload start
-    pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes } });
+    pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes, .source = source } });
 
     const ProgressCtx = struct {
         mbox: ?*Mailbox,
         total: u64,
+        src: protocol.ConnectionState.ProvisionSource,
 
         pub fn onProgress(ctx: @This(), bytes_sent: u64) void {
             pushConnectionState(ctx.mbox, .{ .uploading = .{
                 .bytes_sent = bytes_sent,
                 .total_bytes = ctx.total,
+                .source = ctx.src,
             } });
         }
     };
-    try sess.upload(local_binary_path, tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes });
+    try sess.upload(local_binary_path, tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes, .src = source });
 
     try stderr.writeAll("Done.\n");
     try stderr.flush();

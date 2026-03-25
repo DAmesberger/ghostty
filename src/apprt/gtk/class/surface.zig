@@ -1015,11 +1015,16 @@ pub const Surface = extern struct {
                 } else {
                     overlay.setProgress(0.0);
                 }
-                overlay.setStatus("Uploading Ghostty\xe2\x80\xa6");
+                const status_msg: [:0]const u8 = switch (progress.source) {
+                    .local_headless => "Uploading local headless binary\xe2\x80\xa6",
+                    .local_self => "Uploading local Ghostty binary\xe2\x80\xa6",
+                    .github => "Uploading from GitHub release\xe2\x80\xa6",
+                };
+                overlay.setStatus(status_msg);
             },
             .downloading => {
                 resetOverlayDefaults(overlay);
-                overlay.setStatus("Downloading headless binary\xe2\x80\xa6");
+                overlay.setStatus("Downloading from GitHub releases\xe2\x80\xa6");
             },
             .setup => {
                 resetOverlayDefaults(overlay);

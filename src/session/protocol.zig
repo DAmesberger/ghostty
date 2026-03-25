@@ -52,9 +52,16 @@ pub const ConnectionState = union(enum) {
         }
     };
 
+    pub const ProvisionSource = enum(u8) {
+        local_headless, // ghostty-headless binary next to the local executable
+        local_self, // the running ghostty binary itself (same platform)
+        github, // downloaded from GitHub releases (cross-platform)
+    };
+
     pub const UploadProgress = struct {
         bytes_sent: u64,
         total_bytes: u64,
+        source: ProvisionSource = .local_self,
     };
 
     pub const ReconnectInfo = struct {
