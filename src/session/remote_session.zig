@@ -357,11 +357,14 @@ pub const RemoteSession = struct {
         self.mutex.lock();
 
         // Add viewer to list — multi-viewer: no rejection.
+        // Copy the label string — open_data.label is a slice into the
+        // caller's payload buffer which may be freed after this returns.
+        const viewer_label = self.alloc.dupe(u8, open_data.label) catch "";
         self.viewers.append(self.alloc, .{
             .fd = fd,
             .target = target,
             .viewer_id = viewer_id,
-            .label = open_data.label,
+            .label = viewer_label,
             .rows = open_data.resize.rows,
             .cols = open_data.resize.cols,
             .compression_enabled = open_data.compression_enabled != 0,

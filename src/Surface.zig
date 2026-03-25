@@ -1316,16 +1316,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 }
             }
 
-            // Always trigger tab title re-evaluation after viewer_state
-            // (label, color, or viewer count may have changed).
-            // Force a title-override change to invalidate the GTK binding.
-            if (@hasDecl(apprt.runtime.Surface, "setTitleOverride")) {
-                // Toggle title-override to force the computed_title closure
-                // to re-read getRemoteInfo(). We set it to a sentinel then
-                // clear it — the net effect is null (no override) but the
-                // property change notification fires.
-                self.rt_surface.setTitleOverride("\x00");
-                self.rt_surface.setTitleOverride(null);
+            // Trigger tab title re-evaluation. The computed_title closure
+            // reads ssh_ctx.label via getRemoteInfo(). We need to fire a
+            // property notification on a bound parameter. Calling setTitle
+            // with the current value fires notifyByPspec unconditionally.
+            if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
+                const current = self.rt_surface.getTitle();
+                // Append a zero-width space then restore to force a change.
+                self.rt_surface.setTitle(current);
             }
         },
 
