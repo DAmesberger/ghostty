@@ -2633,10 +2633,16 @@ pub const Window = extern struct {
         dialog.setDefaultResponse("ok");
         dialog.setCloseResponse("cancel");
 
-        // Add a text entry as the extra child.
+        // Add a text entry pre-filled with the current session name.
         const entry = gtk.Entry.new();
         entry.as(gtk.Widget).setMarginStart(24);
         entry.as(gtk.Widget).setMarginEnd(24);
+        if (core.io.backend.remote.ssh_ctx.label) |current_label| {
+            entry.getBuffer().setText(
+                @ptrCast(current_label.ptr),
+                @intCast(current_label.len),
+            );
+        }
         dialog.setExtraChild(entry.as(gtk.Widget));
 
         dialog.choose(
@@ -2654,15 +2660,22 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         const self: *Window = @ptrCast(@alignCast(ud));
         const dialog: *adw.AlertDialog = @ptrCast(source orelse return);
-        const response = dialog.chooseFinish(result);
 
-        if (std.mem.orderZ(u8, "ok", response) != .eq) return;
-
-        // Get the text from the entry widget.
+        // Get the extra child (Entry) BEFORE finishing — dialog may
+        // be finalized after chooseFinish.
         const extra = dialog.getExtraChild() orelse return;
         const entry = gobject.ext.cast(gtk.Entry, extra) orelse return;
-        const name = std.mem.span(entry.getBuffer().getText());
-        if (name.len == 0) return;
+
+        // Copy the text from the entry buffer before finishing.
+        const alloc = Application.default().allocator();
+        const name_z = entry.getBuffer().getText();
+        const name = std.mem.span(name_z);
+        const name_copy = alloc.dupe(u8, name) catch return;
+        defer alloc.free(name_copy);
+
+        const response = dialog.chooseFinish(result);
+        if (std.mem.orderZ(u8, "ok", response) != .eq) return;
+        if (name_copy.len == 0) return;
 
         const surface = self.getActiveSurface() orelse return;
         const core = surface.core() orelse return;
@@ -2671,15 +2684,17 @@ pub const Window = extern struct {
         const remote = &core.io.backend.remote;
         const conn_entry = remote.conn_entry orelse return;
 
-        const alloc = Application.default().allocator();
         const rename_data = session.protocol.Rename{
             .scope = .group,
             .id = remote.ssh_ctx.group_id,
-            .label = name,
+            .label = name_copy,
         };
         const payload = rename_data.encode(alloc) catch return;
         defer alloc.free(payload);
         SshConnectionManager.enqueueWrite(conn_entry, .rename, remote.target_id, payload);
+
+        // Update local label so the tab title reflects the change.
+        remote.ssh_ctx.label = alloc.dupe(u8, name_copy) catch null;
     }
 
     /// React to a GTK action toggling the viewer panel.
