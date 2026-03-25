@@ -1093,7 +1093,12 @@ pub const Surface = extern struct {
                 priv.pending_auth_state = prompt.auth_state;
                 resetOverlayDefaults(overlay);
                 overlay.setShowPassword(true);
-                overlay.setStatus("Enter password:");
+                const host = prompt.hostSlice();
+                var status_buf: [193]u8 = undefined;
+                const label: []const u8 = if (host.len > 0) host else "host";
+                const status = std.fmt.bufPrint(status_buf[0..192], "Password for {s}:", .{label}) catch unreachable;
+                status_buf[status.len] = 0;
+                overlay.setStatus(@ptrCast(status_buf[0..status.len :0]));
             },
         }
     }

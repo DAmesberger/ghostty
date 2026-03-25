@@ -2498,14 +2498,16 @@ pub const Window = extern struct {
     }
 
     /// React to the SSH connection overlay "connect" signal.
+    /// Parses "user@host via jumphost" syntax before creating the connection.
     fn signalSshConnect(_: *SshConnectionOverlay, target_str: ?[*:0]const u8, self: *Self) callconv(.c) void {
-        const target = std.mem.span(target_str orelse return);
-        if (target.len == 0) return;
+        const raw = std.mem.span(target_str orelse return);
+        if (raw.len == 0) return;
 
+        const parsed = session.shared.parseSshTarget(raw);
         const mode = self.private().ssh_mode;
         switch (mode) {
-            .new_window => Application.default().newSshWindow(target, null),
-            .new_tab => self.newSshTab(target, null),
+            .new_window => Application.default().newSshWindow(parsed.target, null, parsed.jump),
+            .new_tab => self.newSshTab(parsed.target, null, parsed.jump),
         }
     }
 
@@ -2563,14 +2565,15 @@ pub const Window = extern struct {
         session_id: ?[*:0]const u8,
         self: *Self,
     ) callconv(.c) void {
-        const target = std.mem.span(ssh_target orelse return);
+        const raw_target = std.mem.span(ssh_target orelse return);
         const sid = std.mem.span(session_id orelse return);
-        if (target.len == 0 or sid.len == 0) return;
+        if (raw_target.len == 0 or sid.len == 0) return;
 
+        const parsed = session.shared.parseSshTarget(raw_target);
         const mode = self.private().ssh_mode;
         switch (mode) {
-            .new_window => Application.default().newSshWindow(target, sid),
-            .new_tab => self.newSshTab(target, sid),
+            .new_window => Application.default().newSshWindow(parsed.target, sid, parsed.jump),
+            .new_tab => self.newSshTab(parsed.target, sid, parsed.jump),
         }
     }
 
@@ -2734,9 +2737,9 @@ pub const Window = extern struct {
 
     /// Open a new SSH session tab in the current window.
     /// If `session_id` is provided, attaches to an existing remote session.
-    fn newSshTab(self: *Self, ssh_target: []const u8, session_id: ?[]const u8) void {
+    fn newSshTab(self: *Self, ssh_target: []const u8, session_id: ?[]const u8, jump: ?[]const u8) void {
         self.newTabForWindow(null, .{
-            .ssh_ctx = .{ .target = ssh_target, .session_id = session_id },
+            .ssh_ctx = .{ .target = ssh_target, .jump = jump, .session_id = session_id },
         });
     }
 

@@ -36,6 +36,20 @@ pub const ConnectionState = union(enum) {
         /// Typed pointer to the shared AuthState for password prompts.
         /// The GTK handler uses this to submit the password.
         auth_state: ?*@import("shared.zig").AuthState = null,
+        /// The host being authenticated (e.g., "user@host"). Fixed buffer
+        /// so it can safely cross thread boundaries via the mailbox.
+        host: [128]u8 = .{0} ** 128,
+        host_len: u8 = 0,
+
+        pub fn hostSlice(self: *const PasswordPrompt) []const u8 {
+            return self.host[0..self.host_len];
+        }
+
+        pub fn setHost(self: *PasswordPrompt, name: []const u8) void {
+            const len = @min(name.len, self.host.len);
+            @memcpy(self.host[0..len], name[0..len]);
+            self.host_len = @intCast(len);
+        }
     };
 
     pub const UploadProgress = struct {

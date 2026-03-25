@@ -282,8 +282,14 @@ fn setupConnection(
                 for_jump = (result == .password_required_jump);
 
                 // Tell the GTK overlay to show the password prompt
+                var prompt: session.protocol.ConnectionState.PasswordPrompt = .{
+                    .is_jump = for_jump,
+                    .auth_state = @ptrCast(&entry.auth_state),
+                };
+                const host_name = if (for_jump) (entry.ctx.jump orelse "jump host") else entry.ctx.ssh_target;
+                prompt.setHost(host_name);
                 _ = mailbox.push(.{ .connection_state = .{
-                    .password_required = .{ .is_jump = for_jump, .auth_state = @ptrCast(&entry.auth_state) },
+                    .password_required = prompt,
                 } }, .{ .forever = {} });
 
                 // Wait for the GTK thread to provide a password
