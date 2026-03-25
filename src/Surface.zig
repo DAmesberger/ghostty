@@ -1314,10 +1314,18 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 if (self.io.backend == .remote) {
                     self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
                 }
-                // Trigger tab title re-evaluation via the GTK surface.
-                if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
-                    self.rt_surface.setTitle(self.rt_surface.getTitle());
-                }
+            }
+
+            // Always trigger tab title re-evaluation after viewer_state
+            // (label, color, or viewer count may have changed).
+            // Force a title-override change to invalidate the GTK binding.
+            if (@hasDecl(apprt.runtime.Surface, "setTitleOverride")) {
+                // Toggle title-override to force the computed_title closure
+                // to re-read getRemoteInfo(). We set it to a sentinel then
+                // clear it — the net effect is null (no override) but the
+                // property change notification fires.
+                self.rt_surface.setTitleOverride("\x00");
+                self.rt_surface.setTitleOverride(null);
             }
         },
 
