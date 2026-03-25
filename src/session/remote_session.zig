@@ -76,7 +76,7 @@ pub const RemoteSession = struct {
         label: []const u8,
         rows: u16,
         cols: u16,
-        max_compression_level: u8 = 0,
+        compression_enabled: bool = false,
     };
 
     /// Number of rows to serialize per scrollback chunk. Targets ~64KB.
@@ -266,15 +266,14 @@ pub const RemoteSession = struct {
             // Flush accumulated data to all viewers as one frame.
             if (accum.items.len > 0) {
                 self.mutex.lock();
-                const comp_level = session.shared.negotiateCompressionLevel(self.viewers.items);
+                const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
                 for (self.viewers.items) |viewer| {
-                    if (comp_level > 0) {
+                    if (use_compression) {
                         session.shared.sendFrameFdCompressed(
                             viewer.fd,
                             .data_out,
                             viewer.target,
                             accum.items,
-                            comp_level,
                             self.alloc,
                         ) catch {};
                     } else {
@@ -290,15 +289,14 @@ pub const RemoteSession = struct {
         // Flush any remaining data.
         if (accum.items.len > 0) {
             self.mutex.lock();
-            const comp_level = session.shared.negotiateCompressionLevel(self.viewers.items);
+            const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
             for (self.viewers.items) |viewer| {
-                if (comp_level > 0) {
+                if (use_compression) {
                     session.shared.sendFrameFdCompressed(
                         viewer.fd,
                         .data_out,
                         viewer.target,
                         accum.items,
-                        comp_level,
                         self.alloc,
                     ) catch {};
                 } else {
@@ -337,7 +335,7 @@ pub const RemoteSession = struct {
             .label = open_data.label,
             .rows = open_data.resize.rows,
             .cols = open_data.resize.cols,
-            .max_compression_level = open_data.max_compression_level,
+            .compression_enabled = open_data.compression_enabled != 0,
         }) catch {
             self.mutex.unlock();
             return error.OutOfMemory;

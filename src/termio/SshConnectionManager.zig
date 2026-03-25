@@ -904,7 +904,7 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
         // Decompress if flags indicate compression.
         var decompressed: ?[]u8 = null;
         defer if (decompressed) |d| entry.alloc.free(d);
-        if (header.flags.isCompressed()) {
+        if (header.flags.compressed) {
             decompressed = session.shared.decompressPayload(entry.alloc, payload) catch {
                 log.warn("decompression failed for {s} frame", .{@tagName(kind)});
                 shiftBuffer(frame_buf, total);

@@ -1238,11 +1238,10 @@ command: ?Command = null,
 /// Available since 1.3.0.
 @"ssh-reconnect-interval": u32 = 1000,
 
-/// Compression level for SSH remote session data (0-9).
-/// 0 disables compression. Level 1 is fastest, 9 is best
-/// compression. Levels 1-4 are recommended for real-time
-/// use. Higher levels reduce bandwidth but increase CPU usage.
-/// Uses deflate compression (same as gzip/zlib).
+/// Compression level for SSH remote session data.
+/// 0 disables compression. Any non-zero value (1-15) enables
+/// LZ4 block compression, which is optimized for real-time
+/// streaming (~4GB/s compress, ~8GB/s decompress).
 @"ssh-compression": u8 = 3,
 
 /// Default size negotiation mode when multiple viewers are attached

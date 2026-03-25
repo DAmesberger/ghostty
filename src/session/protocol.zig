@@ -87,14 +87,10 @@ pub const header_size: usize = 8;
 
 /// Frame flags (byte 1 of header).
 pub const Flags = packed struct(u8) {
-    /// Deflate compression level (0 = none, 1-9 = deflate level, 10-15 reserved).
-    compression_level: u4 = 0,
-    _reserved: u4 = 0,
-
-    /// Convenience: true if any compression is applied.
-    pub fn isCompressed(self: Flags) bool {
-        return self.compression_level > 0;
-    }
+    /// Payload is LZ4-compressed. When set, the payload starts with a
+    /// 4-byte LE original length, followed by LZ4 block data.
+    compressed: bool = false,
+    _reserved: u7 = 0,
 };
 
 /// Frame types. Every kind is a first-class enum variant — no sub-typing.
@@ -179,7 +175,7 @@ pub const uuid_size = 16;
 ///   [16] surface_id (zero = auto-generate or first-alive)
 ///   [8]  resize
 ///   [4]  max_scrollback (u32 LE, 0 = use daemon default)
-///   [1]  max_compression_level (0=none, 1-15=zstd, client's preferred max)
+///   [1]  compression_enabled (0=no, 1=yes — client supports LZ4)
 ///   [2]  frame_interval_ms (0=no debounce, default 16; client's preferred rate)
 ///   [N]  label (remaining bytes, UTF-8, may be empty)
 pub const Open = struct {
@@ -188,7 +184,7 @@ pub const Open = struct {
     surface_id: Uuid = zero_uuid,
     resize: Resize,
     max_scrollback: u32 = 0,
-    max_compression_level: u8 = 3,
+    compression_enabled: u8 = 1,
     frame_interval_ms: u16 = 16,
     label: []const u8 = "",
 
@@ -208,7 +204,7 @@ pub const Open = struct {
         const resize_bytes = self.resize.bytes();
         @memcpy(buf[1 + uuid_size * 2 .. 1 + uuid_size * 2 + 8], &resize_bytes);
         std.mem.writeInt(u32, buf[legacy_min_payload_size..][0..4], self.max_scrollback, .little);
-        buf[v1_min_payload_size] = self.max_compression_level;
+        buf[v1_min_payload_size] = self.compression_enabled;
         std.mem.writeInt(u16, buf[v1_min_payload_size + 1 ..][0..2], self.frame_interval_ms, .little);
         @memcpy(buf[min_payload_size..], self.label);
         return buf;
@@ -225,7 +221,7 @@ pub const Open = struct {
                 std.mem.readInt(u32, payload[legacy_min_payload_size..][0..4], .little)
             else
                 0,
-            .max_compression_level = if (payload.len >= min_payload_size)
+            .compression_enabled = if (payload.len >= min_payload_size)
                 payload[v1_min_payload_size]
             else
                 0,
@@ -838,14 +834,14 @@ test "header parseFromBuf/encodeToBuf roundtrip" {
     const testing = std.testing;
     const h = Header{
         .kind = .data_out,
-        .flags = .{ .compression_level = 3 },
+        .flags = .{ .compressed = true },
         .target = 42,
         .len = 12345,
     };
     const buf = h.encodeToBuf();
     const parsed = try Header.parseFromBuf(&buf);
     try testing.expectEqual(h.kind, parsed.kind);
-    try testing.expect(parsed.flags.isCompressed());
+    try testing.expect(parsed.flags.compressed);
     try testing.expectEqual(@as(u16, 42), parsed.target);
     try testing.expectEqual(@as(u32, 12345), parsed.len);
 }
@@ -856,11 +852,11 @@ test "flags roundtrip" {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
 
-    try writeFrameFlags(buf.writer(testing.allocator), .data_out, .{ .compression_level = 3 }, 1, "test");
+    try writeFrameFlags(buf.writer(testing.allocator), .data_out, .{ .compressed = true }, 1, "test");
 
     var stream = std.io.fixedBufferStream(buf.items);
     const header = try readHeader(stream.reader());
-    try testing.expect(header.flags.isCompressed());
+    try testing.expect(header.flags.compressed);
     try testing.expectEqual(.data_out, header.kind);
 }
 
@@ -1093,19 +1089,17 @@ test "size_mode_change encode/parse" {
     try testing.expectEqual(SizeMode.leader_wins, parsed.mode);
 }
 
-test "compression level in flags" {
+test "compressed flag in header" {
     const testing = std.testing;
-    const flags = Flags{ .compression_level = 9 };
-    try testing.expect(flags.isCompressed());
-    try testing.expectEqual(@as(u4, 9), flags.compression_level);
+    const flags = Flags{ .compressed = true };
+    try testing.expect(flags.compressed);
 
     const no_comp = Flags{};
-    try testing.expect(!no_comp.isCompressed());
-    try testing.expectEqual(@as(u4, 0), no_comp.compression_level);
+    try testing.expect(!no_comp.compressed);
 
     // Roundtrip through header
     const h = Header{ .kind = .data_out, .flags = flags, .target = 1, .len = 100 };
     const buf = h.encodeToBuf();
     const parsed = try Header.parseFromBuf(&buf);
-    try testing.expectEqual(@as(u4, 9), parsed.flags.compression_level);
+    try testing.expect(parsed.flags.compressed);
 }

@@ -36,59 +36,46 @@ pub fn sendFrameFd(fd: posix.fd_t, kind: protocol.Kind, target: u16, payload: []
     if (payload.len > 0) try file.writeAll(payload);
 }
 
-/// Compress payload data. Returns compressed data (caller owns).
-/// If compression would make the data larger, returns null (caller should send uncompressed).
-pub fn compressPayload(_: Allocator, data: []const u8, _: u8) ?[]u8 {
-    if (data.len < 64) return null;
+const lz4 = @import("lz4.zig");
 
-    // NOTE: Zig 0.15.2's std.compress.flate.Compress is incomplete (stdlib bug:
-    // BlockWriter references missing fields). Compression is disabled until
-    // either the stdlib is fixed or we link C libzstd.
-    //
-    // The full infrastructure is in place:
-    // - Protocol flags carry compression_level per frame
-    // - Open frame negotiates max_compression_level per viewer
-    // - negotiateCompressionLevel() computes effective level
-    // - sendFrameFdCompressed() sets flags and sends compressed data
-    // - decompressPayload() (below) is ready to decompress
-    //
-    // When a compressor is available, implement here and return compressed data.
-    // The rest of the pipeline will work automatically.
-    return null;
+/// Compress payload data using LZ4 block format. Returns compressed data
+/// with a 4-byte LE original length prefix (caller owns).
+/// Returns null if compression doesn't reduce size or data is too small.
+pub fn compressPayload(alloc: Allocator, data: []const u8, level: u8) ?[]u8 {
+    if (level == 0 or data.len < 64) return null;
+
+    const compressed = lz4.compress(alloc, data) orelse return null;
+    defer alloc.free(compressed);
+
+    // Prepend original length (4 bytes LE) so decompressor knows the output size.
+    const result = alloc.alloc(u8, 4 + compressed.len) catch return null;
+    std.mem.writeInt(u32, result[0..4], @intCast(data.len), .little);
+    @memcpy(result[4..], compressed);
+    return result;
 }
 
-/// Decompress deflate-compressed payload. Returns decompressed data (caller owns).
+/// Decompress LZ4-compressed payload. The first 4 bytes are the original
+/// uncompressed length (LE). Returns decompressed data (caller owns).
 pub fn decompressPayload(alloc: Allocator, data: []const u8) ![]u8 {
-    var reader: std.Io.Reader = .fixed(data);
-    var window_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompressor: std.compress.flate.Decompress = .init(&reader, .raw, &window_buf);
-
-    var output_list: std.ArrayList(u8) = .empty;
-    errdefer output_list.deinit(alloc);
-    decompressor.reader.appendRemaining(alloc, &output_list, .unlimited) catch {
-        return error.DecompressionFailed;
-    };
-
-    return output_list.toOwnedSlice(alloc) catch error.OutOfMemory;
+    if (data.len < 4) return error.InvalidLz4Data;
+    const orig_len = std.mem.readInt(u32, data[0..4], .little);
+    return lz4.decompress(alloc, data[4..], orig_len);
 }
 
-/// Write a protocol frame with optional compression.
-/// If compression_level > 0 and payload compresses smaller, sends compressed.
-/// Otherwise sends uncompressed.
+/// Write a protocol frame with LZ4 compression if beneficial.
+/// Falls back to uncompressed if compression doesn't reduce size.
 pub fn sendFrameFdCompressed(
     fd: posix.fd_t,
     kind: protocol.Kind,
     target: u16,
     payload: []const u8,
-    compression_level: u8,
     alloc: Allocator,
 ) !void {
-    if (compressPayload(alloc, payload, compression_level)) |compressed| {
+    if (compressPayload(alloc, payload, 1)) |compressed| {
         defer alloc.free(compressed);
-        // Send with compression flag set.
         const header = (protocol.Header{
             .kind = kind,
-            .flags = .{ .compression_level = @intCast(@min(compression_level, 15)) },
+            .flags = .{ .compressed = true },
             .target = target,
             .len = @intCast(compressed.len),
         }).encodeToBuf();
@@ -96,22 +83,16 @@ pub fn sendFrameFdCompressed(
         try file.writeAll(&header);
         try file.writeAll(compressed);
     } else {
-        // Uncompressed fallback.
         try sendFrameFd(fd, kind, target, payload);
     }
 }
 
-/// Compute the effective compression level for a set of viewers.
-/// Returns the minimum of all viewers' max_compression_level values,
-/// or 0 if any viewer doesn't support compression.
-pub fn negotiateCompressionLevel(viewers: []const @import("remote_session.zig").RemoteSession.ViewerSlot) u8 {
-    if (viewers.len == 0) return 0;
-    var min_level: u8 = 15;
+/// Check if all viewers support compression.
+pub fn allViewersSupportsCompression(viewers: []const @import("remote_session.zig").RemoteSession.ViewerSlot) bool {
     for (viewers) |v| {
-        if (v.max_compression_level == 0) return 0; // Any viewer without compression → disable
-        min_level = @min(min_level, v.max_compression_level);
+        if (!v.compression_enabled) return false;
     }
-    return min_level;
+    return viewers.len > 0;
 }
 
 pub const ControlCommand = enum {
@@ -497,6 +478,29 @@ test "generate readable name" {
 
     // adj index 0x02 & 0x3F = 2 → "cool", noun index 0x05 & 0x3F = 5 → "bone"
     try testing.expectEqualStrings("cool-bone", name);
+}
+
+test "lz4 compress/decompress roundtrip via shared API" {
+    const testing = std.testing;
+    // Repetitive data (like VT sequences) should compress well.
+    const input = "\x1b[38;2;255;128;0m" ** 100 ++ "Hello, World! " ** 50;
+
+    const compressed = compressPayload(testing.allocator, input, 3) orelse
+        return error.CompressionFailed;
+    defer testing.allocator.free(compressed);
+
+    // Verify it actually compressed (4-byte header + compressed data < input).
+    try testing.expect(compressed.len < input.len);
+
+    // Decompress and verify roundtrip.
+    const decompressed = try decompressPayload(testing.allocator, compressed);
+    defer testing.allocator.free(decompressed);
+    try testing.expectEqualSlices(u8, input, decompressed);
+}
+
+test "compressPayload returns null for tiny data" {
+    const result = compressPayload(std.testing.allocator, "hi", 3);
+    try std.testing.expect(result == null);
 }
 
 test "sanitize label" {
