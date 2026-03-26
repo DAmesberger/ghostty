@@ -33,6 +33,9 @@ pub const Options = struct {
     /// Rename the specified remote session id. Requires --label.
     rename: ?[]const u8 = null,
 
+    /// Detach all other viewers from the specified remote session id.
+    @"detach-others": ?[]const u8 = null,
+
     /// Remote session identifier to operate on.
     session: ?[]const u8 = null,
 
@@ -113,6 +116,7 @@ pub fn run(alloc: Allocator) !u8 {
         .@"stdio-attach" = opts.@"stdio-attach",
         .kill = opts.kill,
         .rename = opts.rename,
+        .@"detach-others" = opts.@"detach-others",
         .session = opts.session,
         .new = opts.new,
         .label = opts.label,
@@ -190,6 +194,9 @@ fn buildRemoteCommand(alloc: Allocator, remote_bin: []const u8, opts: Options) !
     if (opts.rename) |id| {
         const label = opts.label orelse return error.MissingLabel;
         return std.fmt.allocPrint(alloc, "{s} {s} --rename={s} --label={s}", .{ remote_bin, subcommand, id, label });
+    }
+    if (opts.@"detach-others") |id| {
+        return std.fmt.allocPrint(alloc, "{s} {s} --detach-others={s}", .{ remote_bin, subcommand, id });
     }
     return error.MissingSubcommand;
 }

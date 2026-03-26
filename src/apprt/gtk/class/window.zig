@@ -2724,7 +2724,7 @@ pub const Window = extern struct {
             self,
             .{},
         );
-        picker.presentAsManager(self);
+        picker.present(self);
         @import("ssh_session_picker.zig").queryAndPopulate(picker, target_z);
     }
 

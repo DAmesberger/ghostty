@@ -43,6 +43,7 @@ pub const Options = struct {
     @"stdio-attach": bool = false,
     kill: ?[]const u8 = null,
     rename: ?[]const u8 = null,
+    @"detach-others": ?[]const u8 = null,
     session: ?[]const u8 = null,
     new: bool = false,
     label: ?[]const u8 = null,
@@ -97,6 +98,11 @@ pub fn run(
             return 1;
         };
         try renameSession(alloc, id, new_label, stdout);
+        return 0;
+    }
+
+    if (opts.@"detach-others") |id| {
+        try detachOthersSession(alloc, id, stdout);
         return 0;
     }
 
@@ -1436,6 +1442,73 @@ fn renameSession(
     const rename_payload = try rename_data.encode(alloc);
     defer alloc.free(rename_payload);
     try sendFrameFd(fd, .rename, 0, rename_payload);
+    try writer.writeAll("OK\n");
+    try writer.flush();
+}
+
+/// Detach all other viewers from a session by sending a kick_viewer frame
+/// with zero UUID (meaning "kick everyone except the sender").
+fn detachOthersSession(
+    alloc: Allocator,
+    id: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    const socket_path = try session.shared.socketPath(alloc);
+    defer alloc.free(socket_path);
+    const fd = try connectUnixSocket(socket_path);
+    defer closeFd(fd);
+
+    const uuid = session.shared.parseUuid(id) catch
+        session.shared.parseUuidDashed(id) catch {
+        log.warn("invalid session id for detach-others: {s}", .{id});
+        return;
+    };
+
+    // The kick_viewer payload is: 16-byte target viewer UUID.
+    // Zero UUID means "kick all viewers except the sender".
+    // We also need to tell the daemon which session group to act on,
+    // so we prepend the group UUID followed by the zero target UUID.
+    // However, the kick_viewer frame is handled per-session in
+    // processClientFrames, so we send it with the group UUID as target
+    // for the multiplexer to route, and zero UUID as the payload.
+    var payload: [session.protocol.uuid_size]u8 = session.shared.zero_uuid;
+
+    // We need to open the session first to get routed to it.
+    // Send an open frame to attach temporarily, then send kick_viewer.
+    const open_data = session.protocol.Open{
+        .open_type = .session_attach,
+        .group_id = uuid,
+        .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
+    };
+    const open_payload = try open_data.encode(alloc);
+    defer alloc.free(open_payload);
+    try sendFrameFd(fd, .open, 0, open_payload);
+
+    // Wait for the opened response.
+    var hdr_buf: [session.protocol.header_size]u8 = undefined;
+    const file: std.fs.File = .{ .handle = fd };
+    _ = file.readAll(&hdr_buf) catch return;
+    const hdr = session.protocol.Header.parseFromBuf(&hdr_buf) catch return;
+
+    // Skip the opened payload.
+    if (hdr.len > 0) {
+        var skip_buf: [512]u8 = undefined;
+        var remaining = hdr.len;
+        while (remaining > 0) {
+            const to_read = @min(remaining, skip_buf.len);
+            const n = file.read(skip_buf[0..to_read]) catch break;
+            if (n == 0) break;
+            remaining -= @intCast(n);
+        }
+    }
+
+    if (hdr.kind != .opened) {
+        log.warn("detach-others: expected opened response, got {}", .{hdr.kind});
+        return;
+    }
+
+    // Now we're attached to the session. Send kick_viewer with zero UUID.
+    try sendFrameFd(fd, .kick_viewer, 0, &payload);
     try writer.writeAll("OK\n");
     try writer.flush();
 }

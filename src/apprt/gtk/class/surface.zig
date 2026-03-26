@@ -2394,7 +2394,7 @@ pub const Surface = extern struct {
         priv.session_label = null;
         if (label) |l| {
             if (l.len > 0) {
-                priv.session_label = glib.ext.dupeZ(u8, @ptrCast(l.ptr));
+                priv.session_label = glib.ext.dupeZ(u8, l);
             }
         }
         self.as(gobject.Object).notifyByPspec(properties.@"session-label".impl.param_spec);

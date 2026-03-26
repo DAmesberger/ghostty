@@ -59,117 +59,17 @@ Adw.Dialog dialog {
 
       Gtk.StackPage {
         name: "list";
-        child: Gtk.Box {
-          orientation: vertical;
+        child: Gtk.ScrolledWindow {
+          vexpand: true;
+          min-content-height: 300;
 
-          Gtk.ScrolledWindow {
-            vexpand: true;
-            min-content-height: 300;
+          Gtk.ListBox list_box {
+            selection-mode: single;
+            row-activated => $row_activated();
 
-            Gtk.ListView view {
-              single-click-activate: true;
-              activate => $row_activated();
-
-              model: Gtk.SingleSelection model {
-                model: Gio.ListStore source {
-                  item-type: typeof<$GhosttySshSessionEntry>;
-                };
-              };
-
-              styles [
-                "navigation-sidebar",
-              ]
-
-              factory: Gtk.BuilderListItemFactory {
-                template Gtk.ListItem {
-                  child: Gtk.Box {
-                    orientation: horizontal;
-                    spacing: 12;
-                    margin-start: 12;
-                    margin-end: 12;
-                    margin-top: 8;
-                    margin-bottom: 8;
-
-                    Gtk.Box {
-                      orientation: vertical;
-                      valign: center;
-                      spacing: 2;
-                      hexpand: true;
-
-                      Gtk.Label {
-                        halign: start;
-                        ellipsize: end;
-                        single-line-mode: true;
-
-                        styles [
-                          "heading",
-                        ]
-
-                        label: bind template.item as <$GhosttySshSessionEntry>.title;
-                      }
-
-                      Gtk.Label {
-                        halign: start;
-                        ellipsize: end;
-                        single-line-mode: true;
-
-                        styles [
-                          "dim-label",
-                          "caption",
-                        ]
-
-                        label: bind template.item as <$GhosttySshSessionEntry>.subtitle;
-                      }
-                    }
-
-                    Gtk.Label {
-                      valign: center;
-
-                      styles [
-                        "dim-label",
-                        "caption",
-                      ]
-
-                      label: bind template.item as <$GhosttySshSessionEntry>.status;
-                    }
-                  };
-                }
-              };
-            }
-          }
-
-          // Action bar at bottom — acts on the selected session
-          Gtk.ActionBar action_bar {
-            revealed: false;
-
-            [center]
-            Gtk.Box {
-              orientation: horizontal;
-              spacing: 8;
-
-              Gtk.Button attach_button {
-                label: "Attach";
-                clicked => $attach_clicked();
-
-                styles [
-                  "suggested-action",
-                ]
-              }
-
-              Gtk.Button rename_button {
-                label: "Rename";
-                clicked => $rename_clicked();
-              }
-
-              Gtk.Button kill_button {
-                label: "Kill Session";
-                clicked => $kill_clicked();
-
-                styles [
-                  "destructive-action",
-                ]
-              }
-            }
+            styles [
+              "navigation-sidebar",
+            ]
           }
         };
       }

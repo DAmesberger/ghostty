@@ -44,6 +44,14 @@ pub const SshSessionPicker = extern struct {
         };
     };
 
+    /// Per-row data for session entries in the ListBox.
+    const RowData = struct {
+        alloc: Allocator,
+        picker: *SshSessionPicker,
+        session_id: [:0]u8,
+        current_title: [:0]u8,
+    };
+
     const Private = struct {
         /// The dialog object containing the picker UI.
         dialog: *adw.Dialog,
@@ -54,17 +62,8 @@ pub const SshSessionPicker = extern struct {
         /// The error label.
         error_label: *gtk.Label,
 
-        /// The list view.
-        view: *gtk.ListView,
-
-        /// The selection model.
-        model: *gtk.SingleSelection,
-
-        /// The list store backing the model.
-        source: *gio.ListStore,
-
-        /// The action bar at the bottom (revealed when a session is selected).
-        action_bar: *gtk.ActionBar,
+        /// The list box for session rows.
+        list_box: *gtk.ListBox,
 
         /// The SSH target this picker is querying.
         ssh_target: ?[:0]const u8 = null,
@@ -72,8 +71,8 @@ pub const SshSessionPicker = extern struct {
         /// Back-reference to the window that opened us.
         window: ?*Window = null,
 
-        /// Whether the picker is in manager mode (show action bar).
-        manager_mode: bool = false,
+        /// Tracked row data allocations for cleanup.
+        row_data: std.ArrayListUnmanaged(*RowData) = .empty,
 
         pub var offset: c_int = 0;
     };
@@ -98,7 +97,7 @@ pub const SshSessionPicker = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
-        priv.source.removeAll();
+        self.clearRows();
 
         if (priv.ssh_target) |t| {
             Application.default().allocator().free(t);
@@ -128,40 +127,42 @@ pub const SshSessionPicker = extern struct {
         self.unref();
     }
 
-    fn rowActivated(_: *gtk.ListView, pos: c_uint, self: *SshSessionPicker) callconv(.c) void {
-        self.activated(pos);
-    }
-
-    fn selectionChanged(_: *gtk.SingleSelection, _: c_uint, _: c_uint, self: *SshSessionPicker) callconv(.c) void {
+    fn rowActivated(_: *gtk.ListBox, row: *gtk.ListBoxRow, self: *SshSessionPicker) callconv(.c) void {
+        const index = row.getIndex();
+        if (index < 0) return;
+        const idx: usize = @intCast(index);
         const priv = self.private();
-        // Show action bar when a session is selected.
-        priv.action_bar.setRevealed(1);
+        if (idx >= priv.row_data.items.len) return;
+        const rd = priv.row_data.items[idx];
+
+        self.close();
+
+        const ssh_target: ?[*:0]const u8 = if (priv.ssh_target) |t| t.ptr else null;
+        const sid_ptr: [*:0]const u8 = rd.session_id.ptr;
+
+        signals.@"session-selected".impl.emit(
+            self,
+            null,
+            .{ ssh_target, @as(?[*:0]const u8, sid_ptr) },
+            null,
+        );
     }
 
     fn refreshClicked(_: *gtk.Button, self: *SshSessionPicker) callconv(.c) void {
         const priv = self.private();
-        priv.source.removeAll();
+        self.clearRows();
         priv.stack.setVisibleChildName("loading");
-        priv.action_bar.setRevealed(0);
         if (priv.ssh_target) |target| {
             queryAndPopulate(self, target);
         }
     }
 
-    fn attachClicked(_: *gtk.Button, self: *SshSessionPicker) callconv(.c) void {
-        const priv = self.private();
-        const pos = priv.model.getSelected();
-        self.activated(pos);
-    }
+    //---------------------------------------------------------------
+    // Inline row button handlers (connected programmatically)
 
-    fn renameClicked(_: *gtk.Button, self: *SshSessionPicker) callconv(.c) void {
-        const priv = self.private();
-        const pos = priv.model.getSelected();
-        const object_ = priv.model.as(gio.ListModel).getObject(pos);
-        defer if (object_) |o| o.unref();
-        const entry = gobject.ext.cast(SshSessionEntry, object_ orelse return) orelse return;
-        const session_id: [:0]const u8 = entry.propGetSessionId() orelse return;
-        const current_title: [:0]const u8 = entry.propGetTitle() orelse "";
+    fn onRenameRow(_: *gtk.Button, rd: *RowData) callconv(.c) void {
+        const picker = rd.picker;
+        const priv = picker.private();
 
         // Show a simple rename dialog.
         const dialog = adw.AlertDialog.new("Rename Session", null);
@@ -173,10 +174,10 @@ pub const SshSessionPicker = extern struct {
         const name_entry = gtk.Entry.new();
         name_entry.as(gtk.Widget).setMarginStart(24);
         name_entry.as(gtk.Widget).setMarginEnd(24);
-        name_entry.getBuffer().setText(@ptrCast(current_title.ptr), @intCast(current_title.len));
+        name_entry.getBuffer().setText(@ptrCast(rd.current_title.ptr), @intCast(rd.current_title.len));
         dialog.setExtraChild(name_entry.as(gtk.Widget));
 
-        // Store session_id and picker ref for the callback.
+        // Store context for the async callback.
         const alloc = Application.default().allocator();
         const RenameCtx = struct {
             picker: *SshSessionPicker,
@@ -184,8 +185,8 @@ pub const SshSessionPicker = extern struct {
         };
         const ctx = alloc.create(RenameCtx) catch return;
         ctx.* = .{
-            .picker = self,
-            .sid = alloc.dupeZ(u8, session_id) catch {
+            .picker = picker,
+            .sid = alloc.dupeZ(u8, rd.session_id) catch {
                 alloc.destroy(ctx);
                 return;
             },
@@ -206,33 +207,126 @@ pub const SshSessionPicker = extern struct {
                     const extra = d.getExtraChild() orelse return;
                     const e = gobject.ext.cast(gtk.Entry, extra) orelse return;
                     const name = std.mem.span(e.getBuffer().getText());
-                    const name_copy = a.dupe(u8, name) catch return;
-                    defer a.free(name_copy);
 
                     const response = d.chooseFinish(result);
                     if (std.mem.orderZ(u8, "ok", response) != .eq) return;
-                    if (name_copy.len == 0) return;
+                    if (name.len == 0) return;
 
                     // Run rename on remote via background thread.
-                    _ = c.picker;
-                    // TODO: actually send the rename command
-                    log.info("rename session {s} to '{s}'", .{ c.sid, name_copy });
+                    const p = c.picker.private();
+                    const ssh_target = p.ssh_target orelse return;
+
+                    const RenameData = struct {
+                        alloc: Allocator,
+                        ssh_t: [:0]const u8,
+                        session_id: [:0]const u8,
+                        new_label: [:0]u8,
+                        picker: *SshSessionPicker,
+                    };
+                    const rnd = a.create(RenameData) catch return;
+                    rnd.* = .{
+                        .alloc = a,
+                        .ssh_t = ssh_target,
+                        .session_id = c.sid,
+                        .new_label = a.dupeZ(u8, name) catch {
+                            a.destroy(rnd);
+                            return;
+                        },
+                        .picker = c.picker,
+                    };
+                    // Keep sid alive — steal it from ctx
+                    c.sid = a.dupeZ(u8, "") catch return;
+
+                    _ = std.Thread.spawn(.{}, renameSessionThread, .{rnd}) catch {
+                        a.free(rnd.new_label);
+                        a.free(rnd.session_id);
+                        a.destroy(rnd);
+                        return;
+                    };
                 }
             }.cb,
             ctx,
         );
     }
 
-    fn killClicked(_: *gtk.Button, self: *SshSessionPicker) callconv(.c) void {
-        const priv = self.private();
-        const pos = priv.model.getSelected();
-        const object_ = priv.model.as(gio.ListModel).getObject(pos);
-        defer if (object_) |o| o.unref();
-        const entry = gobject.ext.cast(SshSessionEntry, object_ orelse return) orelse return;
-        const session_id: [:0]const u8 = entry.propGetSessionId() orelse return;
+    fn onDetachRow(_: *gtk.Button, rd: *RowData) callconv(.c) void {
+        const picker = rd.picker;
+        const priv = picker.private();
 
-        // Confirm before killing.
-        const dialog = adw.AlertDialog.new("Kill Session?", "This will terminate all surfaces in this session.");
+        const dialog = adw.AlertDialog.new(
+            "Detach Others?",
+            "This will disconnect all other viewers from this session.",
+        );
+        dialog.addResponse("cancel", "Cancel");
+        dialog.addResponse("detach", "Detach Others");
+        dialog.setResponseAppearance("detach", .destructive);
+        dialog.setDefaultResponse("cancel");
+        dialog.setCloseResponse("cancel");
+
+        const alloc = Application.default().allocator();
+        const DetachCtx = struct {
+            picker: *SshSessionPicker,
+            sid: [:0]u8,
+        };
+        const ctx = alloc.create(DetachCtx) catch return;
+        ctx.* = .{
+            .picker = picker,
+            .sid = alloc.dupeZ(u8, rd.session_id) catch {
+                alloc.destroy(ctx);
+                return;
+            },
+        };
+
+        dialog.choose(
+            priv.dialog.as(gtk.Widget),
+            null,
+            struct {
+                fn cb(source: ?*gobject.Object, result: *gio.AsyncResult, ud: ?*anyopaque) callconv(.c) void {
+                    const c: *DetachCtx = @ptrCast(@alignCast(ud));
+                    const a = Application.default().allocator();
+                    defer {
+                        a.free(c.sid);
+                        a.destroy(c);
+                    }
+                    const d: *adw.AlertDialog = @ptrCast(source orelse return);
+                    const response = d.chooseFinish(result);
+                    if (std.mem.orderZ(u8, "detach", response) != .eq) return;
+
+                    const p = c.picker.private();
+                    const ssh_target = p.ssh_target orelse return;
+
+                    const DetachData = struct {
+                        alloc: Allocator,
+                        ssh_t: [:0]const u8,
+                        session_id: [:0]const u8,
+                    };
+                    const dd = a.create(DetachData) catch return;
+                    dd.* = .{
+                        .alloc = a,
+                        .ssh_t = ssh_target,
+                        .session_id = c.sid,
+                    };
+                    c.sid = a.dupeZ(u8, "") catch return;
+
+                    _ = std.Thread.spawn(.{}, detachOthersThread, .{dd}) catch {
+                        a.free(dd.session_id);
+                        a.destroy(dd);
+                        return;
+                    };
+                }
+            }.cb,
+            ctx,
+        );
+    }
+
+    fn onKillRow(_: *gtk.Button, rd: *RowData) callconv(.c) void {
+        const picker = rd.picker;
+        const priv = picker.private();
+
+        const dialog = adw.AlertDialog.new(
+            "Kill Session?",
+            "This will terminate all surfaces in this session.",
+        );
         dialog.addResponse("cancel", "Cancel");
         dialog.addResponse("kill", "Kill");
         dialog.setResponseAppearance("kill", .destructive);
@@ -243,16 +337,14 @@ pub const SshSessionPicker = extern struct {
         const KillCtx = struct {
             picker: *SshSessionPicker,
             sid: [:0]u8,
-            pos: c_uint,
         };
         const ctx = alloc.create(KillCtx) catch return;
         ctx.* = .{
-            .picker = self,
-            .sid = alloc.dupeZ(u8, session_id) catch {
+            .picker = picker,
+            .sid = alloc.dupeZ(u8, rd.session_id) catch {
                 alloc.destroy(ctx);
                 return;
             },
-            .pos = pos,
         };
 
         dialog.choose(
@@ -270,31 +362,29 @@ pub const SshSessionPicker = extern struct {
                     const response = d.chooseFinish(result);
                     if (std.mem.orderZ(u8, "kill", response) != .eq) return;
 
-                    // Run kill on remote via the helper CLI.
                     const p = c.picker.private();
                     const ssh_target = p.ssh_target orelse return;
 
-                    // Run in background thread.
-                    const thread_alloc = a;
                     const KillData = struct {
                         alloc: Allocator,
                         ssh_t: [:0]const u8,
                         session_id: [:0]const u8,
                         picker: *SshSessionPicker,
-                        remove_pos: c_uint,
                     };
-                    const kd = thread_alloc.create(KillData) catch return;
+                    const kd = a.create(KillData) catch return;
                     kd.* = .{
-                        .alloc = thread_alloc,
+                        .alloc = a,
                         .ssh_t = ssh_target,
                         .session_id = c.sid,
                         .picker = c.picker,
-                        .remove_pos = c.pos,
                     };
-                    // Keep sid alive — steal it from c
                     c.sid = a.dupeZ(u8, "") catch return;
 
-                    _ = std.Thread.spawn(.{}, killSessionThread, .{kd}) catch return;
+                    _ = std.Thread.spawn(.{}, killSessionThread, .{kd}) catch {
+                        a.free(kd.session_id);
+                        a.destroy(kd);
+                        return;
+                    };
                 }
             }.cb,
             ctx,
@@ -305,33 +395,15 @@ pub const SshSessionPicker = extern struct {
     // Public API
 
     /// Show the picker as a dialog over the given window.
-    /// If `manager_mode` is true, single-click selects (shows action bar)
-    /// instead of auto-attaching. Double-click or Attach button still works.
     pub fn present(self: *SshSessionPicker, window: *Window) void {
-        self.presentWithMode(window, false);
-    }
-
-    pub fn presentAsManager(self: *SshSessionPicker, window: *Window) void {
-        self.presentWithMode(window, true);
-    }
-
-    fn presentWithMode(self: *SshSessionPicker, window: *Window, manager_mode: bool) void {
         const priv = self.private();
         priv.window = window;
-
-        // In manager mode, disable single-click-activate so clicking
-        // selects the row and reveals the action bar instead.
-        priv.view.setSingleClickActivate(if (manager_mode) 0 else 1);
-
-        // In manager mode, action bar will be shown when sessions load.
-        priv.manager_mode = manager_mode;
 
         // Show the dialog
         priv.dialog.present(window.as(gtk.Widget));
 
         // Start in loading state
         priv.stack.setVisibleChildName("loading");
-        priv.action_bar.setRevealed(0);
     }
 
     /// Set the SSH target associated with this picker.
@@ -342,7 +414,7 @@ pub const SshSessionPicker = extern struct {
         priv.ssh_target = alloc.dupeZ(u8, target) catch null;
     }
 
-    /// Add a session entry to the list.
+    /// Add a session entry to the list as a rich row with inline action buttons.
     pub fn addSession(
         self: *SshSessionPicker,
         id: [:0]const u8,
@@ -351,19 +423,99 @@ pub const SshSessionPicker = extern struct {
         status: [:0]const u8,
     ) void {
         const priv = self.private();
-        const entry = SshSessionEntry.newFromData(id, label, detail, status) orelse return;
-        priv.source.append(entry.as(gobject.Object));
-        entry.unref();
+        const alloc = Application.default().allocator();
+
+        // Allocate row data for signal handlers.
+        const rd = alloc.create(RowData) catch return;
+        rd.* = .{
+            .alloc = alloc,
+            .picker = self,
+            .session_id = alloc.dupeZ(u8, id) catch {
+                alloc.destroy(rd);
+                return;
+            },
+            .current_title = alloc.dupeZ(u8, label) catch {
+                alloc.free(rd.session_id);
+                alloc.destroy(rd);
+                return;
+            },
+        };
+        priv.row_data.append(alloc, rd) catch {
+            alloc.free(rd.current_title);
+            alloc.free(rd.session_id);
+            alloc.destroy(rd);
+            return;
+        };
+
+        // Build row widget hierarchy:
+        //   Box(horizontal) {
+        //     Box(vertical) { title_label, subtitle_label }  -- hexpand
+        //     Label(status)  -- dim caption
+        //     Button(rename) Button(detach) Button(kill)
+        //   }
+        const row_box = gtk.Box.new(.horizontal, 12);
+        row_box.as(gtk.Widget).setMarginStart(12);
+        row_box.as(gtk.Widget).setMarginEnd(12);
+        row_box.as(gtk.Widget).setMarginTop(8);
+        row_box.as(gtk.Widget).setMarginBottom(8);
+
+        // Info section
+        const info_box = gtk.Box.new(.vertical, 2);
+        info_box.as(gtk.Widget).setValign(.center);
+        info_box.as(gtk.Widget).setHexpand(1);
+
+        const title_label = gtk.Label.new(@ptrCast(label.ptr));
+        title_label.as(gtk.Widget).setHalign(.start);
+        title_label.setEllipsize(.end);
+        title_label.setSingleLineMode(1);
+        title_label.as(gtk.Widget).addCssClass("heading");
+        info_box.append(title_label.as(gtk.Widget));
+
+        // Subtitle: combine detail and status
+        var sub_buf: [256]u8 = undefined;
+        const subtitle = std.fmt.bufPrintZ(&sub_buf, "{s} · {s}", .{ detail, status }) catch detail;
+        const subtitle_label = gtk.Label.new(subtitle);
+        subtitle_label.as(gtk.Widget).setHalign(.start);
+        subtitle_label.setEllipsize(.end);
+        subtitle_label.setSingleLineMode(1);
+        subtitle_label.as(gtk.Widget).addCssClass("dim-label");
+        subtitle_label.as(gtk.Widget).addCssClass("caption");
+        info_box.append(subtitle_label.as(gtk.Widget));
+
+        row_box.append(info_box.as(gtk.Widget));
+
+        // Action buttons
+        const btn_box = gtk.Box.new(.horizontal, 4);
+        btn_box.as(gtk.Widget).setValign(.center);
+
+        const rename_btn = gtk.Button.newFromIconName("document-edit-symbolic");
+        rename_btn.as(gtk.Widget).addCssClass("flat");
+        rename_btn.as(gtk.Widget).setTooltipText("Rename session");
+        _ = gtk.Button.signals.clicked.connect(rename_btn, *RowData, onRenameRow, rd, .{});
+        btn_box.append(rename_btn.as(gtk.Widget));
+
+        const detach_btn = gtk.Button.newFromIconName("system-log-out-symbolic");
+        detach_btn.as(gtk.Widget).addCssClass("flat");
+        detach_btn.as(gtk.Widget).setTooltipText("Detach other viewers");
+        _ = gtk.Button.signals.clicked.connect(detach_btn, *RowData, onDetachRow, rd, .{});
+        btn_box.append(detach_btn.as(gtk.Widget));
+
+        const kill_btn = gtk.Button.newFromIconName("edit-delete-symbolic");
+        kill_btn.as(gtk.Widget).addCssClass("flat");
+        kill_btn.as(gtk.Widget).addCssClass("error");
+        kill_btn.as(gtk.Widget).setTooltipText("Kill session");
+        _ = gtk.Button.signals.clicked.connect(kill_btn, *RowData, onKillRow, rd, .{});
+        btn_box.append(kill_btn.as(gtk.Widget));
+
+        row_box.append(btn_box.as(gtk.Widget));
+
+        priv.list_box.append(row_box.as(gtk.Widget));
     }
 
     /// Transition the stack to the list view.
     pub fn setLoaded(self: *SshSessionPicker) void {
         const priv = self.private();
         priv.stack.setVisibleChildName("list");
-        // In manager mode, always show the action bar.
-        if (priv.manager_mode) {
-            priv.action_bar.setRevealed(1);
-        }
     }
 
     /// Show an error message.
@@ -376,27 +528,24 @@ pub const SshSessionPicker = extern struct {
     //---------------------------------------------------------------
     // Internal
 
-    /// Emit the session-selected signal with the selected entry.
-    fn activated(self: *SshSessionPicker, pos: c_uint) void {
+    /// Remove all rows and free associated data.
+    fn clearRows(self: *SshSessionPicker) void {
         const priv = self.private();
+        const alloc = Application.default().allocator();
 
-        const object_ = priv.model.as(gio.ListModel).getObject(pos);
-        defer if (object_) |object| object.unref();
+        // Remove all children from the ListBox.
+        // Iterate from first row until none remain.
+        while (priv.list_box.getRowAtIndex(0)) |row| {
+            priv.list_box.remove(row.as(gtk.Widget));
+        }
 
-        self.close();
-
-        const entry = gobject.ext.cast(SshSessionEntry, object_ orelse return) orelse return;
-
-        const session_id = entry.propGetSessionId() orelse return;
-        const ssh_target: ?[*:0]const u8 = if (priv.ssh_target) |t| t.ptr else null;
-        const sid_ptr: [*:0]const u8 = session_id.ptr;
-
-        signals.@"session-selected".impl.emit(
-            self,
-            null,
-            .{ ssh_target, @as(?[*:0]const u8, sid_ptr) },
-            null,
-        );
+        // Free row data.
+        for (priv.row_data.items) |rd| {
+            alloc.free(rd.session_id);
+            alloc.free(rd.current_title);
+            alloc.destroy(rd);
+        }
+        priv.row_data.clearRetainingCapacity();
     }
 
     const C = Common(Self, Private);
@@ -412,7 +561,6 @@ pub const SshSessionPicker = extern struct {
         pub const Instance = Self;
 
         fn init(class: *Class) callconv(.c) void {
-            gobject.ext.ensureType(SshSessionEntry);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
@@ -426,18 +574,12 @@ pub const SshSessionPicker = extern struct {
             class.bindTemplateChildPrivate("dialog", .{});
             class.bindTemplateChildPrivate("stack", .{});
             class.bindTemplateChildPrivate("error_label", .{});
-            class.bindTemplateChildPrivate("view", .{});
-            class.bindTemplateChildPrivate("model", .{});
-            class.bindTemplateChildPrivate("source", .{});
-            class.bindTemplateChildPrivate("action_bar", .{});
+            class.bindTemplateChildPrivate("list_box", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("closed", &dialogClosed);
             class.bindTemplateCallback("row_activated", &rowActivated);
             class.bindTemplateCallback("refresh_clicked", &refreshClicked);
-            class.bindTemplateCallback("attach_clicked", &attachClicked);
-            class.bindTemplateCallback("rename_clicked", &renameClicked);
-            class.bindTemplateCallback("kill_clicked", &killClicked);
 
             // Signals
             signals.@"session-selected".impl.register(.{});
@@ -452,7 +594,7 @@ pub const SshSessionPicker = extern struct {
     };
 };
 
-/// GObject wrapper for an SSH session entry in the list model.
+/// GObject wrapper for an SSH session entry (used for data transport only).
 pub const SshSessionEntry = extern struct {
     pub const Self = @This();
     pub const Parent = gobject.Object;
@@ -655,19 +797,116 @@ pub const SshSessionEntry = extern struct {
     };
 };
 
-/// Spawn a background thread to query SSH sessions and populate the picker.
+/// Background thread to rename a session on the remote.
+fn renameSessionThread(rnd: anytype) void {
+    defer {
+        // Trigger a refresh on the GTK thread.
+        _ = glib.idleAdd(struct {
+            fn cb(data: ?*anyopaque) callconv(.c) c_int {
+                const d: @TypeOf(rnd) = @ptrCast(@alignCast(data));
+                // Refresh the picker to show the updated name.
+                refreshClicked: {
+                    const p = d.picker.private();
+                    if (p.ssh_target) |target| {
+                        d.picker.clearRows();
+                        p.stack.setVisibleChildName("loading");
+                        queryAndPopulate(d.picker, target);
+                    }
+                    break :refreshClicked;
+                }
+                d.alloc.free(d.new_label);
+                d.alloc.free(d.session_id);
+                d.alloc.destroy(d);
+                return 0; // G_SOURCE_REMOVE
+            }
+        }.cb, rnd);
+    }
+
+    const alloc = rnd.alloc;
+    const parsed = session.shared.parseSshTarget(rnd.ssh_t);
+
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_writer_.interface;
+
+    var ctx: session.client.SshContext = .{
+        .alloc = alloc,
+        .ssh_target = parsed.target,
+        .jump = parsed.jump,
+    };
+    defer ctx.deinit();
+
+    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch return;
+    defer alloc.free(provision.path);
+    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
+
+    const cmd = std.fmt.allocPrint(alloc, "{s} {s} --rename={s} --label={s}", .{
+        provision.path,
+        session.shared.remote_subcommand,
+        rnd.session_id,
+        rnd.new_label,
+    }) catch return;
+    defer alloc.free(cmd);
+
+    const result = session.client.runRemoteCapture(alloc, &ctx, cmd) catch return;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    log.info("rename session result: exit={d}", .{result.exit_code});
+}
+
+/// Background thread to detach other viewers from a session on the remote.
+fn detachOthersThread(dd: anytype) void {
+    defer {
+        dd.alloc.free(dd.session_id);
+        dd.alloc.destroy(dd);
+    }
+
+    const alloc = dd.alloc;
+    const parsed = session.shared.parseSshTarget(dd.ssh_t);
+
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_writer_.interface;
+
+    var ctx: session.client.SshContext = .{
+        .alloc = alloc,
+        .ssh_target = parsed.target,
+        .jump = parsed.jump,
+    };
+    defer ctx.deinit();
+
+    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch return;
+    defer alloc.free(provision.path);
+    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
+
+    const cmd = std.fmt.allocPrint(alloc, "{s} {s} --detach-others={s}", .{
+        provision.path,
+        session.shared.remote_subcommand,
+        dd.session_id,
+    }) catch return;
+    defer alloc.free(cmd);
+
+    const result = session.client.runRemoteCapture(alloc, &ctx, cmd) catch return;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    log.info("detach others result: exit={d}", .{result.exit_code});
+}
+
 /// Background thread to kill a session on the remote.
 fn killSessionThread(kd: anytype) void {
     defer {
-        // Remove the session from the list on the GTK thread.
+        // Remove the session from the list on the GTK thread by refreshing.
         _ = glib.idleAdd(struct {
             fn cb(data: ?*anyopaque) callconv(.c) c_int {
                 const d: @TypeOf(kd) = @ptrCast(@alignCast(data));
+                // Refresh to reflect the killed session.
                 const p = d.picker.private();
-                p.source.remove(d.remove_pos);
-                if (p.source.as(gio.ListModel).getNItems() == 0) {
-                    p.stack.setVisibleChildName("empty");
-                    p.action_bar.setRevealed(0);
+                if (p.ssh_target) |target| {
+                    d.picker.clearRows();
+                    p.stack.setVisibleChildName("loading");
+                    queryAndPopulate(d.picker, target);
                 }
                 d.alloc.free(d.session_id);
                 d.alloc.destroy(d);
