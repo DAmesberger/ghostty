@@ -1179,7 +1179,7 @@ pub const Surface = extern struct {
         const auth_state = priv.pending_auth_state orelse return;
 
         const password = if (text) |t| std.mem.span(t) else "";
-        const owned = std.heap.page_allocator.dupe(u8, password) catch return;
+        const owned = Application.default().allocator().dupe(u8, password) catch return;
 
         auth_state.mutex.lock();
         auth_state.password = owned;

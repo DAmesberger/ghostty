@@ -268,10 +268,10 @@ fn setupConnection(
             return err;
         };
 
-        // Zero and free the previous password after use (allocated by GTK thread via page_allocator)
+        // Zero and free the previous password after use
         if (entry.auth_state.password) |pw| {
             @memset(@constCast(pw), 0);
-            std.heap.page_allocator.free(pw);
+            entry.alloc.free(pw);
             entry.auth_state.password = null;
         }
 

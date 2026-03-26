@@ -52,6 +52,10 @@ pub fn setScrollbackLoading(self: *Self, loading: bool) void {
     self.surface.setScrollbackLoading(loading);
 }
 
+pub fn updateSessionState(self: *Self, label: ?[]const u8, color: i8) void {
+    self.surface.updateSessionState(label, color);
+}
+
 pub fn getContentScale(self: *const Self) !apprt.ContentScale {
     return self.surface.getContentScale();
 }
