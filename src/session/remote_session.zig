@@ -196,7 +196,20 @@ pub const RemoteSession = struct {
         }
     }
 
+    /// Broadcast viewer state. If `group_label_override` is provided, use it
+    /// instead of reading from self.group (avoids re-locking group.mutex when
+    /// caller already holds it, e.g., from .rename handler).
     pub fn broadcastViewerState(self: *RemoteSession, reason: session.protocol.ViewerStateReason) void {
+        self.broadcastViewerStateWithLabel(reason, null, -1);
+    }
+
+    /// Broadcast with explicit label/color (caller provides them from under group.mutex).
+    pub fn broadcastViewerStateWithLabel(
+        self: *RemoteSession,
+        reason: session.protocol.ViewerStateReason,
+        label_override: ?[]const u8,
+        color_override: i8,
+    ) void {
         // Build viewer entries from current state.
         var entries_buf: [64]session.protocol.ViewerEntry = undefined;
         const count = @min(self.viewers.items.len, entries_buf.len);
@@ -214,21 +227,21 @@ pub const RemoteSession = struct {
         const eff_rows = self.terminal_instance.rows;
         const eff_cols = self.terminal_instance.cols;
 
-        // Get authoritative session label and color from the owning group.
-        // Copy the label under group.mutex to avoid use-after-free from
-        // concurrent handleRename. Release group.mutex immediately — do NOT
-        // hold both surface and group mutexes (deadlock risk with rename
-        // which locks group then surface).
+        // Get session label and color. If caller provided an override (when
+        // group.mutex is already held), use it. Otherwise read from group
+        // under its mutex.
         var label_buf: [256]u8 = undefined;
-        var group_label: []const u8 = "";
-        var group_color: i8 = -1;
-        if (self.group) |g| {
-            g.mutex.lock();
-            const len = @min(g.label.len, label_buf.len);
-            @memcpy(label_buf[0..len], g.label[0..len]);
-            group_label = label_buf[0..len];
-            group_color = g.color;
-            g.mutex.unlock();
+        var group_label: []const u8 = label_override orelse "";
+        var group_color: i8 = color_override;
+        if (label_override == null) {
+            if (self.group) |g| {
+                g.mutex.lock();
+                const len = @min(g.label.len, label_buf.len);
+                @memcpy(label_buf[0..len], g.label[0..len]);
+                group_label = label_buf[0..len];
+                group_color = g.color;
+                g.mutex.unlock();
+            }
         }
 
         log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d}", .{
@@ -639,9 +652,10 @@ pub const RemoteSession = struct {
                             };
                             self.alloc.free(group.label);
                             group.label = new_label;
+                            // Pass label/color explicitly — group.mutex is held.
                             for (group.surfaces.values()) |surf| {
                                 surf.mutex.lock();
-                                surf.broadcastViewerState(.name_change);
+                                surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
                                 surf.mutex.unlock();
                             }
                         }
@@ -667,10 +681,11 @@ pub const RemoteSession = struct {
                         }
                         // Update color
                         group.color = meta.color;
-                        // Broadcast to all surfaces in group
+                        // Broadcast to all surfaces — pass label/color explicitly
+                        // since group.mutex is held.
                         for (group.surfaces.values()) |surf| {
                             surf.mutex.lock();
-                            surf.broadcastViewerState(.name_change);
+                            surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
                             surf.mutex.unlock();
                         }
                         group.mutex.unlock();

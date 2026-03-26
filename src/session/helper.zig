@@ -796,10 +796,10 @@ const Daemon = struct {
                 self.alloc.free(group.label);
                 group.label = new_label;
 
-                // Broadcast the new name to ALL viewers on ALL surfaces in the group.
+                // Broadcast — pass label/color explicitly since group.mutex is held.
                 for (group.surfaces.values()) |surf| {
                     surf.mutex.lock();
-                    surf.broadcastViewerState(.name_change);
+                    surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
                     surf.mutex.unlock();
                 }
                 group.mutex.unlock();
