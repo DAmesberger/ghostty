@@ -971,7 +971,7 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                 log.warn("opened: invalid payload", .{});
                 return;
             };
-            log.info("remote session opened history_rows={d}", .{parsed.history_rows});
+            log.info("remote session opened history_rows={d} label='{s}' (len={d})", .{ parsed.history_rows, parsed.label, parsed.label.len });
 
             // Move surface to the correct session and update surface_id.
             // surfaces_mutex is held by caller.
@@ -1091,9 +1091,11 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
                 log.warn("viewer_state: invalid payload", .{});
                 return;
             };
-            log.info("viewer_state: reason={s} viewers={d}", .{
+            log.info("viewer_state: reason={s} viewers={d} label='{s}' (len={d})", .{
                 @tagName(hdr.reason),
                 hdr.viewer_count,
+                hdr.session_label,
+                hdr.session_label.len,
             });
 
             var msg: apprt.surface.Message = .{
