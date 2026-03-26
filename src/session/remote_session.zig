@@ -215,16 +215,21 @@ pub const RemoteSession = struct {
         const eff_cols = self.terminal_instance.cols;
 
         // Get authoritative session label and color from the owning group.
-        // MUST hold group.mutex while reading label — it can be freed/reallocated
-        // by handleRename/session_meta on another thread.
+        // Copy the label under group.mutex to avoid use-after-free from
+        // concurrent handleRename. Release group.mutex immediately — do NOT
+        // hold both surface and group mutexes (deadlock risk with rename
+        // which locks group then surface).
+        var label_buf: [256]u8 = undefined;
         var group_label: []const u8 = "";
         var group_color: i8 = -1;
-        const group_locked = if (self.group) |g| blk: {
+        if (self.group) |g| {
             g.mutex.lock();
-            group_label = g.label;
+            const len = @min(g.label.len, label_buf.len);
+            @memcpy(label_buf[0..len], g.label[0..len]);
+            group_label = label_buf[0..len];
             group_color = g.color;
-            break :blk g;
-        } else null;
+            g.mutex.unlock();
+        }
 
         log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d}", .{
             @tagName(reason),
@@ -244,14 +249,8 @@ pub const RemoteSession = struct {
             .viewers = entries_buf[0..count],
         };
 
-        const payload = state.encode(self.alloc) catch {
-            if (group_locked) |g| g.mutex.unlock();
-            return;
-        };
+        const payload = state.encode(self.alloc) catch return;
         defer self.alloc.free(payload);
-
-        // Release group mutex — payload is now an owned copy of the label.
-        if (group_locked) |g| g.mutex.unlock();
 
         for (self.viewers.items) |viewer| {
             sendFrameFd(viewer.fd, .viewer_state, viewer.target, payload) catch {};
