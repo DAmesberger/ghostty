@@ -1042,29 +1042,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .title = slice },
             );
 
-            // For remote surfaces, sync the title to the remote daemon so it
-            // survives reconnect. Also update the local SurfaceSlot label.
+            // For remote surfaces, sync the surface title to the daemon
+            // for reconnect. This is a SURFACE rename, NOT a group rename —
+            // the session name is only changed by explicit user action.
             if (self.io.backend == .remote) {
                 const remote = &self.io.backend.remote;
                 if (remote.conn_entry) |entry| {
-                    // Update local slot label for reconnect
                     termio.SshConnectionManager.updateSurfaceLabel(entry, remote.target_id, slice);
-
-                    // Send rename frame to daemon.
-                    const label_len = @min(slice.len, 256);
-                    if ((session.protocol.Rename{
-                        .scope = .group,
-                        .id = remote.ssh_ctx.group_id,
-                        .label = slice[0..label_len],
-                    }).encode(entry.alloc)) |rename_payload| {
-                        defer entry.alloc.free(rename_payload);
-                        termio.SshConnectionManager.enqueueWrite(
-                            entry,
-                            .rename,
-                            remote.target_id,
-                            rename_payload,
-                        );
-                    } else |_| {}
                 }
             }
         },
