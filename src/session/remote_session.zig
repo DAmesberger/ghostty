@@ -244,13 +244,17 @@ pub const RemoteSession = struct {
             }
         }
 
-        log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d} has_override={any}", .{
-            @tagName(reason),
-            group_label,
-            group_label.len,
-            group_color,
-            label_override != null,
-        });
+        // Direct write to stderr (daemon.log) — std.log.info is no-op in release.
+        {
+            var dbuf: [512]u8 = undefined;
+            const dmsg = std.fmt.bufPrint(&dbuf, "broadcast: reason={s} label='{s}' len={d} override={any}\n", .{
+                @tagName(reason),
+                group_label,
+                group_label.len,
+                label_override != null,
+            }) catch "";
+            _ = posix.write(2, dmsg) catch {};
+        }
 
         const state = session.protocol.ViewerState{
             .reason = reason,
@@ -643,6 +647,15 @@ pub const RemoteSession = struct {
                         shiftBuf(frame_buf, total);
                         continue;
                     };
+                    // Diagnostic: log every rename frame arrival.
+                    {
+                        var dbuf: [256]u8 = undefined;
+                        const dmsg = std.fmt.bufPrint(&dbuf, "processClientFrames: .rename scope={s} label='{s}'\n", .{
+                            @tagName(rename_data.scope),
+                            rename_data.label,
+                        }) catch "";
+                        _ = posix.write(2, dmsg) catch {};
+                    }
                     if (self.group) |group| {
                         group.mutex.lock();
                         if (rename_data.scope == .group) {

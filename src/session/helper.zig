@@ -26,6 +26,14 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
 
 const log = std.log.scoped(.ssh_session);
 
+/// Write a diagnostic line to stderr (which is daemon.log in daemon mode).
+/// Works in release builds unlike std.log.info.
+fn daemonLog(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    _ = std.posix.write(2, msg) catch {};
+}
+
 pub const Options = struct {
     daemonize: bool = false,
     daemon: bool = false,
@@ -205,10 +213,11 @@ fn daemonMain(alloc: Allocator) !void {
     const log_file = std.fs.cwd().createFile(log_path, .{ .truncate = true }) catch null;
     defer if (log_file) |f| f.close();
     if (log_file) |f| {
-        // Redirect stderr to the log file so std.log output is captured.
+        // Redirect stderr to the log file. Note: std.log.info is a no-op
+        // in ReleaseFast, so we write directly for daemon diagnostics.
         const stderr_fd: c_int = 2;
         _ = c.dup2(f.handle, stderr_fd);
-        log.info("daemon started, log file: {s}", .{log_path});
+        f.writeAll("daemon started\n") catch {};
     }
 
     // Secure the state directory permissions
@@ -424,7 +433,7 @@ const Daemon = struct {
                 defer if (generated_label) |gl| self.alloc.free(gl);
                 const raw_label = generated_label orelse
                     if (open_data.label.len > 0) open_data.label else "session";
-                log.info("session_new: label='{s}' (generated={any})", .{ raw_label, generated_label != null });
+                daemonLog("session_new: label='{s}' generated={any}", .{ raw_label, generated_label != null });
                 const group = try self.createGroup(raw_label, group_id);
 
                 const surface_id = if (!session.shared.isZeroUuid(open_data.surface_id))
