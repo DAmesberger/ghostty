@@ -59,100 +59,39 @@ pub const SshContext = struct {
 
     /// Establish the SSH connection and authenticate.
     /// Tries agent/key auth first; falls back to password prompt on stderr.
+    /// Delegates to connectWithAuth(), reading passwords from stdin when needed.
     pub fn connect(self: *SshContext, stderr: *std.Io.Writer) !void {
-        if (self.session != null) return;
-
-        ssh.globalInit();
-        const target = try ssh.SshTarget.parse(self.ssh_target);
-
-        if (self.jump) |jump_str| {
-            const jump = try ssh.SshTarget.parse(jump_str);
-
-            // Connect and authenticate to the jump host
-            var jump_sess = ssh.SshSession.connect(self.alloc, jump.host, jump.port) catch {
-                try stderr.print("Failed to connect to jump host {s}\n", .{jump_str});
-                try stderr.flush();
-                return error.RemoteAuthRequired;
-            };
-            // Once tunnel() succeeds, target_sess.close() owns the jump
-            // resources (session, socket, channel). Only close independently
-            // if we fail before that point.
-            var jump_needs_close = true;
-            errdefer if (jump_needs_close) jump_sess.close();
-
-            jump_sess.authAuto(jump.user) catch {
-                try stderr.print("Password for {s}: ", .{jump_str});
-                try stderr.flush();
-                const pass = readPassword(self.alloc) catch |err| {
-                    try stderr.print("Failed to read password: {}\n", .{err});
+        var for_jump: bool = false;
+        var password: ?[]const u8 = null;
+        while (true) {
+            defer {
+                if (password) |pw| secureZeroAndFree(self.alloc, @constCast(pw));
+                password = null;
+            }
+            const result = try self.connectWithAuth(stderr, password, for_jump);
+            switch (result) {
+                .success => return,
+                .password_required_jump => {
+                    for_jump = true;
+                    try stderr.print("Password for {s}: ", .{self.jump orelse "jump host"});
                     try stderr.flush();
-                    return error.RemoteAuthRequired;
-                };
-                defer secureZeroAndFree(self.alloc, pass);
-                jump_sess.authPassword(jump.user, pass) catch {
-                    try stderr.writeAll("Authentication failed for jump host.\n");
+                    password = readPassword(self.alloc) catch |err| {
+                        try stderr.print("Failed to read password: {}\n", .{err});
+                        try stderr.flush();
+                        return error.RemoteAuthRequired;
+                    };
+                },
+                .password_required_target => {
+                    for_jump = false;
+                    try stderr.print("Password for {s}: ", .{self.ssh_target});
                     try stderr.flush();
-                    return error.RemoteAuthRequired;
-                };
-                try stderr.writeAll("Jump host password auth OK.\n");
-                try stderr.flush();
-            };
-
-            try stderr.writeAll("Opening tunnel...\n");
-            try stderr.flush();
-
-            // Tunnel through jump to target and authenticate
-            var target_sess = jump_sess.tunnel(target.host, target.port) catch |err| {
-                try stderr.print("Failed to tunnel to {s} via {s}: {}\n", .{ self.ssh_target, jump_str, err });
-                try stderr.flush();
-                return error.RemoteAuthRequired;
-            };
-            jump_needs_close = false; // target_sess now owns jump resources
-            errdefer target_sess.close();
-
-            target_sess.authAuto(target.user) catch {
-                try stderr.print("Password for {s}: ", .{self.ssh_target});
-                try stderr.flush();
-                const pass = readPassword(self.alloc) catch |err| {
-                    try stderr.print("Failed to read password: {}\n", .{err});
-                    try stderr.flush();
-                    return error.RemoteAuthRequired;
-                };
-                defer secureZeroAndFree(self.alloc, pass);
-                target_sess.authPassword(target.user, pass) catch {
-                    try stderr.writeAll("Authentication failed for target host.\n");
-                    try stderr.flush();
-                    return error.RemoteAuthRequired;
-                };
-            };
-
-            self.jump_session = jump_sess;
-            self.session = target_sess;
-        } else {
-            var sess = ssh.SshSession.connect(self.alloc, target.host, target.port) catch {
-                try stderr.print("Failed to connect to {s}\n", .{self.ssh_target});
-                try stderr.flush();
-                return error.RemoteAuthRequired;
-            };
-            errdefer sess.close();
-
-            sess.authAuto(target.user) catch {
-                try stderr.print("Password for {s}: ", .{self.ssh_target});
-                try stderr.flush();
-                const pass = readPassword(self.alloc) catch |err| {
-                    try stderr.print("Failed to read password: {}\n", .{err});
-                    try stderr.flush();
-                    return error.RemoteAuthRequired;
-                };
-                defer secureZeroAndFree(self.alloc, pass);
-                sess.authPassword(target.user, pass) catch {
-                    try stderr.writeAll("Authentication failed.\n");
-                    try stderr.flush();
-                    return error.RemoteAuthRequired;
-                };
-            };
-
-            self.session = sess;
+                    password = readPassword(self.alloc) catch |err| {
+                        try stderr.print("Failed to read password: {}\n", .{err});
+                        try stderr.flush();
+                        return error.RemoteAuthRequired;
+                    };
+                },
+            }
         }
     }
 
@@ -183,10 +122,10 @@ pub const SshContext = struct {
 
             // --- Jump host connection & auth ---
             if (self.jump_session == null) {
-                var jump_sess = ssh.SshSession.connect(self.alloc, jump.host, jump.port) catch {
-                    try stderr.print("Failed to connect to jump host {s}\n", .{jump_str});
+                var jump_sess = ssh.SshSession.connect(self.alloc, jump.host, jump.port) catch |err| {
+                    try stderr.print("Failed to connect to jump host {s}: {}\n", .{ jump_str, err });
                     try stderr.flush();
-                    return error.RemoteAuthRequired;
+                    return err;
                 };
                 var jump_needs_close = true;
                 errdefer if (jump_needs_close) jump_sess.close();
@@ -197,7 +136,7 @@ pub const SshContext = struct {
                             jump_sess.authPassword(jump.user, pass) catch {
                                 try stderr.writeAll("Authentication failed for jump host.\n");
                                 try stderr.flush();
-                                return error.RemoteAuthRequired;
+                                return error.SshAuthFailed;
                             };
                             try stderr.writeAll("Jump host password auth OK.\n");
                             try stderr.flush();
@@ -222,7 +161,7 @@ pub const SshContext = struct {
             var target_sess = self.jump_session.?.tunnel(target.host, target.port) catch |err| {
                 try stderr.print("Failed to tunnel to {s} via {s}: {}\n", .{ self.ssh_target, jump_str, err });
                 try stderr.flush();
-                return error.RemoteAuthRequired;
+                return err;
             };
             errdefer target_sess.close();
 
@@ -233,7 +172,7 @@ pub const SshContext = struct {
                         target_sess.authPassword(target.user, pass) catch {
                             try stderr.writeAll("Authentication failed for target host.\n");
                             try stderr.flush();
-                            return error.RemoteAuthRequired;
+                            return error.SshAuthFailed;
                         };
                     } else {
                         return .password_required_target;
@@ -248,10 +187,10 @@ pub const SshContext = struct {
             return .success;
         } else {
             // --- Direct connection (no jump host) ---
-            var sess = ssh.SshSession.connect(self.alloc, target.host, target.port) catch {
-                try stderr.print("Failed to connect to {s}\n", .{self.ssh_target});
+            var sess = ssh.SshSession.connect(self.alloc, target.host, target.port) catch |err| {
+                try stderr.print("Failed to connect to {s}: {}\n", .{ self.ssh_target, err });
                 try stderr.flush();
-                return error.RemoteAuthRequired;
+                return err;
             };
             errdefer sess.close();
 
@@ -260,7 +199,7 @@ pub const SshContext = struct {
                     sess.authPassword(target.user, pass) catch {
                         try stderr.writeAll("Authentication failed.\n");
                         try stderr.flush();
-                        return error.RemoteAuthRequired;
+                        return error.SshAuthFailed;
                     };
                 } else {
                     return .password_required_target;

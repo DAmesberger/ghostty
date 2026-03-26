@@ -66,23 +66,7 @@ pub const SshSession = struct {
         const session = sessionInit() orelse return error.SshInitFailed;
         errdefer _ = ssh2.libssh2_session_free(session);
 
-        // Handshake in non-blocking mode with a 30s timeout,
-        // matching the tunnel handshake timeout.
-        ssh2.libssh2_session_set_blocking(session, 0);
-        const handshake_deadline = std.time.nanoTimestamp() + 30 * std.time.ns_per_s;
-        while (true) {
-            if (std.time.nanoTimestamp() > handshake_deadline) {
-                return error.SshHandshakeFailed;
-            }
-            const rc = ssh2.libssh2_session_handshake(session, sock);
-            if (rc == 0) break;
-            if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
-                waitsocketTimeout(session, sock, 100);
-                continue;
-            }
-            return error.SshHandshakeFailed;
-        }
-        ssh2.libssh2_session_set_blocking(session, 1);
+        try performHandshake(session, sock, session, sock);
 
         try verifyHostKey(alloc, session, host, port);
 
@@ -137,45 +121,10 @@ pub const SshSession = struct {
         const dummy_fd = c.open("/dev/null", c.O_RDWR);
         if (dummy_fd < 0) return error.SshConnectFailed;
 
-        // Handshake in non-blocking mode since the callbacks may
-        // return EAGAIN when the tunnel channel isn't ready.
-        // Timeout after 30 seconds to avoid hanging indefinitely.
-        ssh2.libssh2_session_set_blocking(inner, 0);
-        const handshake_deadline = std.time.nanoTimestamp() + 30 * std.time.ns_per_s;
-        var handshake_iters: u32 = 0;
-        while (true) {
-            if (std.time.nanoTimestamp() > handshake_deadline) {
-                _ = c.close(dummy_fd);
-                return error.SshHandshakeFailed;
-            }
-            handshake_iters += 1;
-            const rc = ssh2.libssh2_session_handshake(inner, dummy_fd);
-            if (rc == 0) break;
-            if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
-                if (handshake_iters % 500 == 0) {
-                    const dbg = std.fs.File.stderr();
-                    var hb: [60]u8 = undefined;
-                    const hm = std.fmt.bufPrint(&hb, "[tunnel] handshake EAGAIN iter={d}\n", .{handshake_iters}) catch "";
-                    dbg.writeAll(hm) catch {};
-                }
-                waitsocket(self.session, self.sock);
-                continue;
-            }
-            {
-                const dbg = std.fs.File.stderr();
-                var hb: [60]u8 = undefined;
-                const hm = std.fmt.bufPrint(&hb, "[tunnel] handshake failed rc={d}\n", .{rc}) catch "";
-                dbg.writeAll(hm) catch {};
-            }
+        performHandshake(inner, dummy_fd, self.session, self.sock) catch {
             _ = c.close(dummy_fd);
             return error.SshHandshakeFailed;
-        }
-
-        // Restore blocking mode for the inner session. Subsequent
-        // operations (auth, exec) expect blocking semantics. In
-        // blocking mode, libssh2 handles EAGAIN from our custom
-        // callbacks internally by retrying.
-        ssh2.libssh2_session_set_blocking(inner, 1);
+        };
 
         try verifyHostKey(self.alloc, inner, target_host, target_port);
 
@@ -200,15 +149,7 @@ pub const SshSession = struct {
         defer ssh2.libssh2_agent_free(agent);
 
         if (ssh2.libssh2_agent_connect(agent) != 0) {
-            const dbg = std.fs.File.stderr();
-            var errmsg: [*c]u8 = null;
-            var errmsg_len: c_int = 0;
-            _ = ssh2.libssh2_session_last_error(self.session, &errmsg, &errmsg_len, 0);
-            if (errmsg != null and errmsg_len > 0) {
-                dbg.writeAll("[auth] agent connect error: ") catch {};
-                dbg.writeAll(errmsg[0..@intCast(errmsg_len)]) catch {};
-                dbg.writeAll("\n") catch {};
-            }
+            logSshError(self.session, "[auth] agent connect error: ");
             return error.SshAgentFailed;
         }
         defer _ = ssh2.libssh2_agent_disconnect(agent);
@@ -280,18 +221,7 @@ pub const SshSession = struct {
             if (pass_z) |p| p.ptr else null,
         );
         if (rc != 0) {
-            const dbg = std.fs.File.stderr();
-            var errmsg: [*c]u8 = null;
-            var errmsg_len: c_int = 0;
-            _ = ssh2.libssh2_session_last_error(self.session, &errmsg, &errmsg_len, 0);
-            if (errmsg != null and errmsg_len > 0) {
-                dbg.writeAll("[auth] pubkey error: ") catch {};
-                dbg.writeAll(errmsg[0..@intCast(errmsg_len)]) catch {};
-                dbg.writeAll("\n") catch {};
-            }
-            var b: [60]u8 = undefined;
-            const m = std.fmt.bufPrint(&b, "[auth] pubkey rc={d}\n", .{rc}) catch "";
-            dbg.writeAll(m) catch {};
+            logSshError(self.session, "[auth] pubkey error: ");
             return error.SshAuthFailed;
         }
     }
@@ -878,6 +808,44 @@ fn verifyHostKey(
             // LIBSSH2_KNOWNHOST_CHECK_FAILURE or other
             log.warn("host key check failed for {s} (result={d})", .{ host, check_result });
         },
+    }
+}
+
+/// Perform SSH handshake in non-blocking mode with a 30s timeout.
+/// `hs_session`/`hs_fd` are the session and fd to handshake.
+/// `poll_session`/`poll_sock` are used for waitsocket polling (may
+/// differ for tunneled sessions where the poll socket is the jump host's).
+fn performHandshake(
+    hs_session: *ssh2.LIBSSH2_SESSION,
+    hs_fd: posix.fd_t,
+    poll_session: *ssh2.LIBSSH2_SESSION,
+    poll_sock: posix.fd_t,
+) !void {
+    ssh2.libssh2_session_set_blocking(hs_session, 0);
+    const deadline = std.time.nanoTimestamp() + 30 * std.time.ns_per_s;
+    while (true) {
+        if (std.time.nanoTimestamp() > deadline) return error.SshHandshakeFailed;
+        const rc = ssh2.libssh2_session_handshake(hs_session, hs_fd);
+        if (rc == 0) break;
+        if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
+            waitsocketTimeout(poll_session, poll_sock, 100);
+            continue;
+        }
+        return error.SshHandshakeFailed;
+    }
+    ssh2.libssh2_session_set_blocking(hs_session, 1);
+}
+
+/// Log the last libssh2 session error to stderr with a prefix.
+fn logSshError(session: *ssh2.LIBSSH2_SESSION, prefix: []const u8) void {
+    var errmsg: [*c]u8 = null;
+    var errmsg_len: c_int = 0;
+    _ = ssh2.libssh2_session_last_error(session, &errmsg, &errmsg_len, 0);
+    if (errmsg != null and errmsg_len > 0) {
+        const dbg = std.fs.File.stderr();
+        dbg.writeAll(prefix) catch {};
+        dbg.writeAll(errmsg[0..@intCast(errmsg_len)]) catch {};
+        dbg.writeAll("\n") catch {};
     }
 }
 

@@ -1613,19 +1613,11 @@ fn connectUnixSocket(path: []const u8) !posix.fd_t {
 const sendFrameFd = session.shared.sendFrameFd;
 
 fn sendFrameFile(file: std.fs.File, kind: session.protocol.Kind, target: u16, payload: []const u8) !void {
-    return sendFrameFileFlags(file, kind, .{}, target, payload);
+    return session.shared.sendFrameFile(file, kind, .{}, target, payload);
 }
 
 fn sendFrameFileFlags(file: std.fs.File, kind: session.protocol.Kind, flags: session.protocol.Flags, target: u16, payload: []const u8) !void {
-    if (payload.len > session.protocol.max_payload) return error.PayloadTooLarge;
-    const header = (session.protocol.Header{
-        .kind = kind,
-        .flags = flags,
-        .target = target,
-        .len = @intCast(payload.len),
-    }).encodeToBuf();
-    try file.writeAll(&header);
-    try file.writeAll(payload);
+    return session.shared.sendFrameFile(file, kind, flags, target, payload);
 }
 
 /// Read exactly `buf.len` bytes from fd using raw posix.read.

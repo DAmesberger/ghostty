@@ -998,7 +998,11 @@ fn sessionQueryThread(data: *SessionQueryData) void {
         const msg: [:0]const u8 = switch (err) {
             error.PasswordRequired => "Password authentication required. Open a regular SSH tab first, then retry.",
             error.SessionQueryFailed => "Failed to query remote sessions. Check that the daemon is running.",
-            else => "Failed to connect or query sessions",
+            error.NoActiveConnection => "Could not establish SSH connection. Verify host, port, and SSH keys.",
+            error.SshConnectFailed => "Connection refused or host unreachable. Check the hostname and port.",
+            error.SshHandshakeFailed => "SSH handshake timed out. The host may be unreachable or firewalled.",
+            error.SshAuthFailed => "SSH authentication failed. Check your keys or credentials.",
+            else => "Unexpected error querying sessions. Check logs for details.",
         };
         const err_data = alloc.create(QueryErrorData) catch return;
         err_data.* = .{ .picker = data.picker.ref(), .msg = msg };
@@ -1173,8 +1177,10 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
         var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
         const stderr = &stderr_writer_.interface;
 
-        const connect_result = ctx.connectWithAuth(stderr, null, false) catch
-            return error.NoActiveConnection;
+        const connect_result = ctx.connectWithAuth(stderr, null, false) catch |err| {
+            log.warn("session query: connectWithAuth failed: {}", .{err});
+            return err;
+        };
         switch (connect_result) {
             .success => {},
             .password_required_target, .password_required_jump =>

@@ -264,7 +264,12 @@ fn setupConnection(
     var for_jump: bool = false;
     while (true) {
         const result = entry.ctx.connectWithAuth(stderr, entry.auth_state.password, for_jump) catch |err| {
-            _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
+            const reason: session.protocol.ConnectionState.FailReason = switch (err) {
+                error.SshConnectFailed, error.SshHandshakeFailed => .timeout,
+                error.SshAuthFailed => .auth_failed,
+                else => .unknown,
+            };
+            _ = mailbox.push(.{ .connection_state = .{ .failed = reason } }, .{ .forever = {} });
             return err;
         };
 

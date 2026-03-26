@@ -25,13 +25,17 @@ const protocol = @import("../session.zig").protocol;
 /// better than the previous streaming approach that split large
 /// payloads into many 1KB writes.
 pub fn sendFrameFd(fd: posix.fd_t, kind: protocol.Kind, target: u16, payload: []const u8) !void {
+    try sendFrameFile(.{ .handle = fd }, kind, .{}, target, payload);
+}
+
+pub fn sendFrameFile(file: std.fs.File, kind: protocol.Kind, flags: protocol.Flags, target: u16, payload: []const u8) !void {
     if (payload.len > protocol.max_payload) return error.PayloadTooLarge;
     const header = (protocol.Header{
         .kind = kind,
+        .flags = flags,
         .target = target,
         .len = @intCast(payload.len),
     }).encodeToBuf();
-    var file: std.fs.File = .{ .handle = fd };
     try file.writeAll(&header);
     if (payload.len > 0) try file.writeAll(payload);
 }
