@@ -851,15 +851,46 @@ fn sessionResultCallback(user_data: ?*anyopaque) callconv(.c) c_int {
 /// using key-based auth and runs the remote `--list` command directly.
 fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEntry {
     const raw_output = blk: {
-        // Fast path: use existing multiplexed connection if available
+        // Fast path: use existing multiplexed connection if available.
+        // querySessions returns raw binary ListResponse frames. We need to
+        // convert them to the same text format the slow path produces so
+        // the parser below can handle both uniformly.
         const mgr = &Application.default().core().ssh_connection_manager;
         log.info("session query: looking up target='{s}'", .{ssh_target});
         if (mgr.findEntry(ssh_target, null)) |entry| {
             log.info("session query: found entry, state={s}", .{@tagName(entry.conn_state.load(.seq_cst))});
             if (entry.conn_state.load(.seq_cst) == .ready) {
-                const result = SshConnectionManager.querySessions(entry, alloc, 5000);
-                log.info("session query: fast path result={any}", .{result != null});
-                break :blk result orelse return error.SessionQueryFailed;
+                const raw_binary = SshConnectionManager.querySessions(entry, alloc, 5000);
+                log.info("session query: fast path result={any}", .{raw_binary != null});
+                if (raw_binary) |binary| {
+                    defer alloc.free(binary);
+                    // Parse binary ListResponse and convert to text format.
+                    const entries = session.protocol.ListResponse.parse(alloc, binary) catch
+                        return error.SessionQueryFailed;
+                    defer alloc.free(entries);
+
+                    var text_buf: std.ArrayList(u8) = .empty;
+                    errdefer text_buf.deinit(alloc);
+                    const w = text_buf.writer(alloc);
+                    for (entries) |e| {
+                        const gid_hex = session.shared.formatUuid(e.group_id);
+                        const status_str: []const u8 = switch (e.status) {
+                            .dead => "dead",
+                            .attached => "attached",
+                            .detached => "detached",
+                        };
+                        w.print("{s}|{s}|{d} surfaces ({d} alive)|{d}|{s}\n", .{
+                            &gid_hex,
+                            e.label,
+                            e.surface_count,
+                            e.alive_count,
+                            e.created_at,
+                            status_str,
+                        }) catch {};
+                    }
+                    break :blk (text_buf.toOwnedSlice(alloc) catch return error.SessionQueryFailed);
+                }
+                return error.SessionQueryFailed;
             }
         } else {
             log.info("session query: no entry found for target", .{});
