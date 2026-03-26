@@ -832,7 +832,7 @@ fn sessionResultCallback(user_data: ?*anyopaque) callconv(.c) c_int {
     data.picker.setSshTarget(data.ssh_target);
 
     if (data.sessions.len == 0) {
-        data.picker.setError("No detached sessions found on this host");
+        data.picker.private().stack.setVisibleChildName("empty");
         return 0;
     }
 
