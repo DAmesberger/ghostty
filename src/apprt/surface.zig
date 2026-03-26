@@ -134,6 +134,8 @@ pub const Message = union(enum) {
         /// Daemon-authoritative session label. Fixed buffer for mailbox safety.
         label: [64]u8 = .{0} ** 64,
         label_len: u8 = 0,
+        /// Session color (-1 = none, 0-7 = color index).
+        color: i8 = -1,
     };
 
     pub const LayoutRestore = struct {

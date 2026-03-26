@@ -1264,14 +1264,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 if (!session.shared.isZeroUuid(ro.surface_id)) {
                     self.io.backend.remote.ssh_ctx.surface_id = ro.surface_id;
                 }
-                // Set the daemon-authoritative session label.
+                // Set the daemon-authoritative session label and color.
                 if (ro.label_len > 0) {
                     const label = ro.label[0..ro.label_len];
                     self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
-                    // Trigger tab title refresh.
-                    if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
-                        self.rt_surface.setTitle(self.rt_surface.getTitle());
-                    }
+                }
+                self.session_color = ro.color;
+                // Trigger tab title refresh.
+                if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
+                    self.rt_surface.setTitle(self.rt_surface.getTitle());
                 }
             }
         },

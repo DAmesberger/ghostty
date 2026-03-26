@@ -993,6 +993,7 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
             const ol_len = @min(ol.len, 64);
             @memcpy(opened_msg.remote_opened.label[0..ol_len], ol[0..ol_len]);
             opened_msg.remote_opened.label_len = @intCast(ol_len);
+            opened_msg.remote_opened.color = parsed.color;
             _ = s.surface_mailbox.push(opened_msg, .{ .forever = {} });
 
             // Pre-allocate blank history pages for scrollback restore.

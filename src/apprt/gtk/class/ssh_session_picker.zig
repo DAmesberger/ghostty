@@ -851,11 +851,16 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
     const raw_output = blk: {
         // Fast path: use existing multiplexed connection if available
         const mgr = &Application.default().core().ssh_connection_manager;
+        log.info("session query: looking up target='{s}'", .{ssh_target});
         if (mgr.findEntry(ssh_target, null)) |entry| {
+            log.info("session query: found entry, state={s}", .{@tagName(entry.conn_state.load(.seq_cst))});
             if (entry.conn_state.load(.seq_cst) == .ready) {
-                break :blk SshConnectionManager.querySessions(entry, alloc, 5000) orelse
-                    return error.SessionQueryFailed;
+                const result = SshConnectionManager.querySessions(entry, alloc, 5000);
+                log.info("session query: fast path result={any}", .{result != null});
+                break :blk result orelse return error.SessionQueryFailed;
             }
+        } else {
+            log.info("session query: no entry found for target", .{});
         }
 
         // Slow path: establish a temporary SSH connection for the query

@@ -618,6 +618,8 @@ pub const Opened = struct {
     history_rows: u32 = 0,
     /// Daemon-authoritative session label. Set on first open, updated by rename.
     label: []const u8 = "",
+    /// Session color (-1 = none, 0-7 = index). Deterministic from group UUID.
+    color: i8 = -1,
     layout_blob: ?[]const u8 = null,
     states: []const SurfaceState = &.{},
 
@@ -631,8 +633,8 @@ pub const Opened = struct {
 
     pub fn encode(self: Opened, alloc: Allocator) ![]u8 {
         const layout_len: u32 = if (self.layout_blob) |b| @intCast(b.len) else 0;
-        // uuid*2 + caps(4) + history_rows(4) + label_len(2) + label + layout_len(4) + layout + state_count(2)
-        var total: usize = uuid_size * 2 + 4 + 4 + 2 + self.label.len + 4 + layout_len + 2;
+        // uuid*2 + caps(4) + history_rows(4) + label_len(2) + label + color(1) + layout_len(4) + layout + state_count(2)
+        var total: usize = uuid_size * 2 + 4 + 4 + 2 + self.label.len + 1 + 4 + layout_len + 2;
         for (self.states) |s| {
             total += uuid_size + 4 + s.data.len;
         }
@@ -652,6 +654,9 @@ pub const Opened = struct {
         offset += 2;
         @memcpy(buf[offset..][0..self.label.len], self.label);
         offset += self.label.len;
+        // Color
+        buf[offset] = @bitCast(self.color);
+        offset += 1;
         std.mem.writeInt(u32, buf[offset..][0..4], layout_len, .little);
         offset += 4;
         if (self.layout_blob) |b| {
@@ -677,12 +682,13 @@ pub const Opened = struct {
         caps: u32,
         history_rows: u32,
         label: []const u8,
+        color: i8,
         layout_blob: ?[]const u8,
         state_count: u16,
         remaining: []const u8,
     } {
-        // uuid*2 + caps(4) + history_rows(4) + label_len(2) + layout_len(4) + state_count(2)
-        const min_size = uuid_size * 2 + 4 + 4 + 2 + 4 + 2;
+        // uuid*2 + caps(4) + history_rows(4) + label_len(2) + color(1) + layout_len(4) + state_count(2)
+        const min_size = uuid_size * 2 + 4 + 4 + 2 + 1 + 4 + 2;
         if (payload.len < min_size) return error.InvalidOpenedPayload;
         var offset: usize = 0;
         const group_id = payload[0..uuid_size].*;
@@ -699,6 +705,10 @@ pub const Opened = struct {
         if (offset + label_len > payload.len) return error.InvalidOpenedPayload;
         const label = payload[offset..][0..label_len];
         offset += label_len;
+        // Color
+        if (offset >= payload.len) return error.InvalidOpenedPayload;
+        const color: i8 = @bitCast(payload[offset]);
+        offset += 1;
         const layout_len = std.mem.readInt(u32, payload[offset..][0..4], .little);
         offset += 4;
         if (offset + layout_len > payload.len) return error.InvalidOpenedPayload;
@@ -716,6 +726,7 @@ pub const Opened = struct {
             .caps = caps,
             .history_rows = history_rows,
             .label = label,
+            .color = color,
             .layout_blob = layout_blob,
             .state_count = state_count,
             .remaining = payload[offset..],

@@ -444,7 +444,7 @@ const Daemon = struct {
                 const sess = try self.createSurface(group, surface_id, open_data.resize, open_data.max_scrollback);
 
                 // Send opened response with no layout (new session)
-                const opened = session.protocol.Opened{ .label = group.label,
+                const opened = session.protocol.Opened{ .label = group.label, .color = group.color,
                     .group_id = group.id,
                     .surface_id = surface_id,
                 };
@@ -563,7 +563,7 @@ const Daemon = struct {
                     break :blk s.computeHistoryRows();
                 } else 0;
 
-                const opened = session.protocol.Opened{ .label = group.label,
+                const opened = session.protocol.Opened{ .label = group.label, .color = group.color,
                     .group_id = group.id,
                     .surface_id = attached_sid,
                     .history_rows = history_rows,
@@ -654,7 +654,7 @@ const Daemon = struct {
         switch (open_data.open_type) {
             .surface_new => {
                 const sess = try self.createSurface(group, open_data.surface_id, open_data.resize, open_data.max_scrollback);
-                const opened = session.protocol.Opened{ .label = group.label,
+                const opened = session.protocol.Opened{ .label = group.label, .color = group.color,
                     .group_id = group.id,
                     .surface_id = open_data.surface_id,
                 };
@@ -686,7 +686,7 @@ const Daemon = struct {
                     const surf_history = s.computeHistoryRows();
                     s.mutex.unlock();
 
-                    const opened = session.protocol.Opened{ .label = group.label,
+                    const opened = session.protocol.Opened{ .label = group.label, .color = group.color,
                         .group_id = group.id,
                         .surface_id = open_data.surface_id,
                         .history_rows = surf_history,
