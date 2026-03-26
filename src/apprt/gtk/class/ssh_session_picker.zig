@@ -831,6 +831,8 @@ fn sessionResultCallback(user_data: ?*anyopaque) callconv(.c) c_int {
 
     data.picker.setSshTarget(data.ssh_target);
 
+    log.info("session query result: {d} sessions found for target '{s}'", .{ data.sessions.len, data.ssh_target });
+
     if (data.sessions.len == 0) {
         data.picker.private().stack.setVisibleChildName("empty");
         return 0;

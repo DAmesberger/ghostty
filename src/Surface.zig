@@ -1270,9 +1270,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
                 }
                 self.session_color = ro.color;
-                // Trigger tab title refresh.
-                if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
-                    self.rt_surface.setTitle(self.rt_surface.getTitle());
+                // Update the GTK surface's session properties to trigger
+                // the tab title binding re-evaluation.
+                if (@hasDecl(apprt.runtime.Surface, "updateSessionState")) {
+                    self.rt_surface.updateSessionState(
+                        self.io.backend.remote.ssh_ctx.label,
+                        ro.color,
+                    );
                 }
             }
         },
@@ -1312,14 +1316,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 }
             }
 
-            // Trigger tab title re-evaluation. The computed_title closure
-            // reads ssh_ctx.label via getRemoteInfo(). We need to fire a
-            // property notification on a bound parameter. Calling setTitle
-            // with the current value fires notifyByPspec unconditionally.
-            if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
-                const current = self.rt_surface.getTitle();
-                // Append a zero-width space then restore to force a change.
-                self.rt_surface.setTitle(current);
+            // Update GTK surface session state to trigger tab binding.
+            if (@hasDecl(apprt.runtime.Surface, "updateSessionState")) {
+                if (self.io.backend == .remote) {
+                    self.rt_surface.updateSessionState(
+                        self.io.backend.remote.ssh_ctx.label,
+                        self.session_color,
+                    );
+                }
             }
         },
 

@@ -556,8 +556,10 @@ pub const Tab = extern struct {
         bell_ringing_: c_int,
         scrollback_loading_: c_int,
         tab_color_: i8,
+        session_label_: ?[*:0]const u8,
         _: *gobject.ParamSpec,
     ) callconv(.c) ?[*:0]const u8 {
+        _ = session_label_; // Used as binding trigger; actual label read from getRemoteInfo()
         const zoomed = zoomed_ != 0;
         const bell_ringing = bell_ringing_ != 0;
         const scrollback_loading = scrollback_loading_ != 0;

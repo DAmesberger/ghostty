@@ -288,6 +288,19 @@ pub const Surface = extern struct {
             );
         };
 
+        pub const @"session-label" = struct {
+            pub const name = "session-label";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("session_label"),
+                },
+            );
+        };
+
         pub const zoom = struct {
             pub const name = "zoom";
             const impl = gobject.ext.defineProperty(
@@ -602,6 +615,9 @@ pub const Surface = extern struct {
 
         /// The manually overridden title of this surface from `promptTitle`.
         title_override: ?[:0]const u8 = null,
+
+        /// The daemon-authoritative session label (GObject property).
+        session_label: ?[:0]const u8 = null,
 
         /// The current focus state of the terminal based on the
         /// focus events.
@@ -2369,6 +2385,25 @@ pub const Surface = extern struct {
 
     /// Overridden title. This will be generally be shown over the title
     /// unless this is unset (null).
+    /// Update session label and color from daemon. Fires GObject property
+    /// notifications so the tab title binding re-evaluates.
+    pub fn updateSessionState(self: *Self, label: ?[]const u8, color: i8) void {
+        const priv = self.private();
+        // Update session-label property.
+        if (priv.session_label) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.session_label = null;
+        if (label) |l| {
+            if (l.len > 0) {
+                priv.session_label = glib.ext.dupeZ(u8, @ptrCast(l.ptr));
+            }
+        }
+        self.as(gobject.Object).notifyByPspec(properties.@"session-label".impl.param_spec);
+        // Color is read via getRemoteInfo().session_color in closureComputedTitle.
+        // Notifying session-label is enough to trigger re-evaluation since it's
+        // a bound parameter.
+        _ = color;
+    }
+
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
         if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
@@ -4052,6 +4087,7 @@ pub const Surface = extern struct {
                 properties.pwd.impl,
                 properties.title.impl,
                 properties.@"title-override".impl,
+                properties.@"session-label".impl,
                 properties.zoom.impl,
                 properties.@"is-split".impl,
                 properties.readonly.impl,
