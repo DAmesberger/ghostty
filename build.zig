@@ -128,13 +128,13 @@ pub fn build(b: *std.Build) !void {
             resources.install();
             if (i18n) |v| v.install();
         }
-    } else if (config.emit_headless) {
-        // Headless build: install the exe as "ghostty-headless" (no resources/i18n/libs).
-        // Used to produce cross-platform binaries for SSH remote sessions.
-        const headless_install = b.addInstallArtifact(exe.exe, .{
-            .dest_sub_path = "ghostty-headless",
+    } else if (config.emit_daemon) {
+        // Daemon build: install as "ghostty-daemon" (no resources/i18n/libs).
+        // Used for SSH remote session daemon on remote hosts.
+        const daemon_install = b.addInstallArtifact(exe.exe, .{
+            .dest_sub_path = "ghostty-daemon",
         });
-        b.getInstallStep().dependOn(&headless_install.step);
+        b.getInstallStep().dependOn(&daemon_install.step);
     } else {
         // Libghostty
         //

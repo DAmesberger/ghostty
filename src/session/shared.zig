@@ -5,11 +5,11 @@ const internal_os = @import("../os/main.zig");
 
 pub const state_subdir = "ghostty/remote-session";
 pub const remote_binary_name = "ghostty";
-pub const remote_headless_binary_name = "ghostty-headless";
+pub const remote_daemon_binary_name = "ghostty-daemon";
 /// The CLI subcommand used to invoke the remote session modes.
 pub const remote_subcommand = "+ssh-session";
 
-/// Base URL for downloading pre-built headless binaries from CI releases.
+/// Base URL for downloading pre-built daemon binaries from CI releases.
 pub const release_base_url = "https://github.com/DAmesberger/ghostty/releases/download";
 
 const posix = std.posix;
@@ -139,10 +139,10 @@ pub fn remoteInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: [
     return try std.fs.path.join(alloc, &.{ dir, remote_binary_name });
 }
 
-pub fn remoteHeadlessInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
+pub fn remoteDaemonInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
     const dir = try remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, remote_headless_binary_name });
+    return try std.fs.path.join(alloc, &.{ dir, remote_daemon_binary_name });
 }
 
 /// Normalize raw `uname -s` output to the OS name used in release artifacts.
@@ -273,9 +273,9 @@ pub fn formatSshTarget(alloc: Allocator, target: []const u8, jump: ?[]const u8) 
     return try alloc.dupe(u8, target);
 }
 
-/// Construct the full download URL for a headless binary release asset.
+/// Construct the full download URL for a daemon binary release asset.
 /// Caller owns the returned string.
-pub fn headlessDownloadUrl(
+pub fn daemonDownloadUrl(
     alloc: Allocator,
     proto_version: u16,
     os: []const u8,
@@ -283,7 +283,7 @@ pub fn headlessDownloadUrl(
 ) ![]const u8 {
     return try std.fmt.allocPrint(
         alloc,
-        "{s}/ghostty-headless-v{d}/ghostty-headless-{s}-{s}",
+        "{s}/ghostty-daemon-v{d}/ghostty-daemon-{s}-{s}",
         .{ release_base_url, proto_version, os, arch },
     );
 }
@@ -606,21 +606,21 @@ test "normalizeArch" {
     try testing.expectEqualStrings("x86_64", normalizeArch("x86_64"));
 }
 
-test "headlessDownloadUrl" {
+test "daemonDownloadUrl" {
     const testing = std.testing;
-    const url = try headlessDownloadUrl(testing.allocator, 1, "linux", "x86_64");
+    const url = try daemonDownloadUrl(testing.allocator, 1, "linux", "x86_64");
     defer testing.allocator.free(url);
     try testing.expectEqualStrings(
-        "https://github.com/DAmesberger/ghostty/releases/download/ghostty-headless-v1/ghostty-headless-linux-x86_64",
+        "https://github.com/DAmesberger/ghostty/releases/download/ghostty-daemon-v1/ghostty-daemon-linux-x86_64",
         url,
     );
 }
 
-test "remoteHeadlessInstallPath" {
+test "remoteDaemonInstallPath" {
     const testing = std.testing;
-    const path = try remoteHeadlessInstallPath(testing.allocator, "/home/user", "Linux");
+    const path = try remoteDaemonInstallPath(testing.allocator, "/home/user", "Linux");
     defer testing.allocator.free(path);
-    try testing.expectEqualStrings("/home/user/.local/state/ghostty/bin/ghostty-headless", path);
+    try testing.expectEqualStrings("/home/user/.local/state/ghostty/bin/ghostty-daemon", path);
 }
 
 test "parseSshTarget simple" {

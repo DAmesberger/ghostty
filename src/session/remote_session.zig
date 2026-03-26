@@ -244,7 +244,7 @@ pub const RemoteSession = struct {
             }
         }
 
-        log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d}", .{
+        log.debug("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d}", .{
             @tagName(reason),
             group_label,
             group_label.len,

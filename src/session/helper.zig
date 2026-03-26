@@ -424,7 +424,7 @@ const Daemon = struct {
                 defer if (generated_label) |gl| self.alloc.free(gl);
                 const raw_label = generated_label orelse
                     if (open_data.label.len > 0) open_data.label else "session";
-                log.info("session_new: label='{s}' (generated={any})", .{ raw_label, generated_label != null });
+                log.debug("session_new: label='{s}' (generated={any})", .{ raw_label, generated_label != null });
                 const group = try self.createGroup(raw_label, group_id);
 
                 const surface_id = if (!session.shared.isZeroUuid(open_data.surface_id))

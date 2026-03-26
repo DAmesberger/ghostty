@@ -1016,7 +1016,7 @@ pub const Surface = extern struct {
                     overlay.setProgress(0.0);
                 }
                 const status_msg: [:0]const u8 = switch (progress.source) {
-                    .local_headless => "Uploading local headless binary\xe2\x80\xa6",
+                    .local_daemon => "Uploading local daemon binary\xe2\x80\xa6",
                     .local_self => "Uploading local Ghostty binary\xe2\x80\xa6",
                     .github => "Uploading from GitHub release\xe2\x80\xa6",
                 };

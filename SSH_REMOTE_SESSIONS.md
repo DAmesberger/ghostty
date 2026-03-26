@@ -104,7 +104,7 @@ ghostty +ssh-session --rename=SESSION_ID --label=new-name --ssh user@host
 ```
 Local Ghostty                          Remote Host
 +-----------------+                    +------------------+
-| GTK Surface     |   SSH channel      | ghostty-headless |
+| GTK Surface     |   SSH channel      | ghostty-daemon |
 |  +- Remote.zig  | <=== binary ====>  |  +- Daemon       |
 |  +- SshConn.Mgr |   protocol (v1)    |  +- RemoteSession|
 |  +- Tab colors  |                    |  +- Terminal      |

@@ -53,7 +53,7 @@ pub const ConnectionState = union(enum) {
     };
 
     pub const ProvisionSource = enum(u8) {
-        local_headless, // ghostty-headless binary next to the local executable
+        local_daemon, // ghostty-daemon binary next to the local executable
         local_self, // the running ghostty binary itself (same platform)
         github, // downloaded from GitHub releases (cross-platform)
     };
@@ -211,12 +211,10 @@ pub const Open = struct {
     frame_interval_ms: u16 = 16,
     label: []const u8 = "",
 
-    /// Old min size (without max_scrollback) for backward compat parsing.
-    const legacy_min_payload_size = 1 + uuid_size * 2 + 8;
-    /// Size with max_scrollback but without capabilities.
-    const v1_min_payload_size = legacy_min_payload_size + 4;
-    /// Current min size: v1 + compression(1) + frame_interval(2) = v1 + 3.
-    pub const min_payload_size = v1_min_payload_size + 3;
+    /// Fixed part: open_type(1) + group_id(16) + surface_id(16) + resize(8) +
+    /// max_scrollback(4) + compression_enabled(1) + frame_interval_ms(2) = 48
+    const fixed_size = 1 + uuid_size * 2 + 8 + 4 + 1 + 2;
+    pub const min_payload_size = fixed_size;
 
     pub fn encode(self: Open, alloc: Allocator) ![]u8 {
         const total = min_payload_size + self.label.len;
@@ -226,38 +224,26 @@ pub const Open = struct {
         @memcpy(buf[1 + uuid_size .. 1 + uuid_size * 2], &self.surface_id);
         const resize_bytes = self.resize.bytes();
         @memcpy(buf[1 + uuid_size * 2 .. 1 + uuid_size * 2 + 8], &resize_bytes);
-        std.mem.writeInt(u32, buf[legacy_min_payload_size..][0..4], self.max_scrollback, .little);
-        buf[v1_min_payload_size] = self.compression_enabled;
-        std.mem.writeInt(u16, buf[v1_min_payload_size + 1 ..][0..2], self.frame_interval_ms, .little);
+        const scrollback_off = 1 + uuid_size * 2 + 8;
+        std.mem.writeInt(u32, buf[scrollback_off..][0..4], self.max_scrollback, .little);
+        buf[scrollback_off + 4] = self.compression_enabled;
+        std.mem.writeInt(u16, buf[scrollback_off + 5 ..][0..2], self.frame_interval_ms, .little);
         @memcpy(buf[min_payload_size..], self.label);
         return buf;
     }
 
     pub fn parse(payload: []const u8) !Open {
-        if (payload.len < legacy_min_payload_size) return error.InvalidOpenPayload;
+        if (payload.len < min_payload_size) return error.InvalidOpenPayload;
+        const scrollback_off = 1 + uuid_size * 2 + 8;
         return .{
             .open_type = std.meta.intToEnum(OpenType, payload[0]) catch return error.InvalidOpenPayload,
             .group_id = payload[1..][0..uuid_size].*,
             .surface_id = payload[1 + uuid_size ..][0..uuid_size].*,
             .resize = try Resize.parse(payload[1 + uuid_size * 2 ..][0..8]),
-            .max_scrollback = if (payload.len >= v1_min_payload_size)
-                std.mem.readInt(u32, payload[legacy_min_payload_size..][0..4], .little)
-            else
-                0,
-            .compression_enabled = if (payload.len >= min_payload_size)
-                payload[v1_min_payload_size]
-            else
-                0,
-            .frame_interval_ms = if (payload.len >= min_payload_size)
-                std.mem.readInt(u16, payload[v1_min_payload_size + 1 ..][0..2], .little)
-            else
-                16,
-            .label = if (payload.len >= min_payload_size)
-                payload[min_payload_size..]
-            else if (payload.len >= v1_min_payload_size)
-                payload[v1_min_payload_size..]
-            else
-                payload[legacy_min_payload_size..],
+            .max_scrollback = std.mem.readInt(u32, payload[scrollback_off..][0..4], .little),
+            .compression_enabled = payload[scrollback_off + 4],
+            .frame_interval_ms = std.mem.readInt(u16, payload[scrollback_off + 5 ..][0..2], .little),
+            .label = payload[min_payload_size..],
         };
     }
 };
@@ -972,24 +958,7 @@ test "open encode/parse" {
     try testing.expectEqualStrings("test-session", parsed.label);
 }
 
-test "open backward compat (short payload without max_scrollback)" {
-    const testing = std.testing;
-    const shared = @import("shared.zig");
-    const gid = shared.generateUuid();
-    // Simulate an old-format payload with a short label (< 4 bytes so total < min_payload_size)
-    var buf: [Open.legacy_min_payload_size + 2]u8 = undefined;
-    buf[0] = @intFromEnum(OpenType.session_new);
-    @memcpy(buf[1..][0..uuid_size], &gid);
-    @memcpy(buf[1 + uuid_size ..][0..uuid_size], &shared.zero_uuid);
-    const resize_bytes = (Resize{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 }).bytes();
-    @memcpy(buf[1 + uuid_size * 2 ..][0..8], &resize_bytes);
-    @memcpy(buf[Open.legacy_min_payload_size..][0..2], "ab");
-
-    const parsed = try Open.parse(buf[0..Open.legacy_min_payload_size + 2]);
-    try testing.expectEqual(OpenType.session_new, parsed.open_type);
-    try testing.expectEqual(@as(u32, 0), parsed.max_scrollback); // default when missing
-    try testing.expectEqualStrings("ab", parsed.label); // label at legacy offset
-}
+// Legacy backward-compat test removed — only current format is supported.
 
 test "open attach mode" {
     const testing = std.testing;

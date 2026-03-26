@@ -33,7 +33,6 @@ const session_layout = session.layout;
 const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
 const SshConnectionOverlay = @import("ssh_connection_overlay.zig").SshConnectionOverlay;
 const SshSessionPicker = @import("ssh_session_picker.zig").SshSessionPicker;
-const SshViewerPanel = @import("ssh_viewer_panel.zig").SshViewerPanel;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);

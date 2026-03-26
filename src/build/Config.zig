@@ -56,7 +56,7 @@ emit_terminfo: bool = false,
 emit_termcap: bool = false,
 emit_test_exe: bool = false,
 emit_themes: bool = false,
-emit_headless: bool = false,
+emit_daemon: bool = false,
 emit_xcframework: bool = false,
 emit_webdata: bool = false,
 emit_unicode_table_gen: bool = false,
@@ -398,10 +398,10 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
         "Build the website data for the website.",
     ) orelse false;
 
-    config.emit_headless = b.option(
+    config.emit_daemon = b.option(
         bool,
-        "emit-headless",
-        "Build and install the headless exe (app-runtime=none). " ++
+        "emit-daemon",
+        "Build and install the daemon exe (app-runtime=none). " ++
             "Used to produce cross-platform binaries for SSH remote sessions.",
     ) orelse false;
 

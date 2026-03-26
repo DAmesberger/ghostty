@@ -285,13 +285,13 @@ pub const ProvisionResult = struct {
 ///
 /// Resolution order (check existing):
 ///   1. `ghostty` in PATH with matching protocol version → use it
-///   2. Deployed `ghostty-headless` at install path → protocol version match → use it
+///   2. Deployed `ghostty-daemon` at install path → protocol version match → use it
 ///   3. Deployed `ghostty` (full) at install path → protocol version match → use it
 ///
-/// Provisioning (always installs as `ghostty-headless`):
-///   4a. Local headless binary exists → upload it
-///   4b. Same platform, no local headless → upload full local ghostty as ghostty-headless
-///   4c. Different platform → download headless from CI
+/// Provisioning (always installs as `ghostty-daemon`):
+///   4a. Local daemon binary exists → upload it
+///   4b. Same platform, no local daemon → upload full local ghostty as ghostty-daemon
+///   4c. Different platform → download daemon from CI
 pub fn ensureRemoteGhostty(
     alloc: Allocator,
     ctx: *SshContext,
@@ -323,12 +323,12 @@ pub fn ensureRemoteGhostty(
         }
     }
 
-    // 2. Probe deployed ghostty-headless (works regardless of platform).
-    const headless_path = try shared.remoteHeadlessInstallPath(alloc, remote_home, remote_os);
-    defer alloc.free(headless_path);
+    // 2. Probe deployed ghostty-daemon (works regardless of platform).
+    const daemon_path = try shared.remoteDaemonInstallPath(alloc, remote_home, remote_os);
+    defer alloc.free(daemon_path);
 
-    if (try probeDeployedBinary(alloc, sess, headless_path)) {
-        return .{ .path = try alloc.dupe(u8, headless_path), .provisioned = false };
+    if (try probeDeployedBinary(alloc, sess, daemon_path)) {
+        return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
     }
 
     // 3. Probe deployed full ghostty (legacy/manual install).
@@ -339,22 +339,22 @@ pub fn ensureRemoteGhostty(
         return .{ .path = try alloc.dupe(u8, full_path), .provisioned = false };
     }
 
-    // 4. Need to provision — always installs as ghostty-headless.
-    const dest = try alloc.dupe(u8, headless_path);
+    // 4. Need to provision — always installs as ghostty-daemon.
+    const dest = try alloc.dupe(u8, daemon_path);
     errdefer alloc.free(dest);
 
-    // 4a. Prefer uploading a local headless binary if available.
-    if (try findLocalHeadless(alloc)) |local_headless| {
-        defer alloc.free(local_headless);
+    // 4a. Prefer uploading a local daemon binary if available.
+    if (try findLocalDaemon(alloc)) |local_daemon| {
+        defer alloc.free(local_daemon);
 
-        try stderr.writeAll("Uploading ghostty-headless to remote...\n");
+        try stderr.writeAll("Uploading ghostty-daemon to remote...\n");
         try stderr.flush();
 
-        try uploadGhostty(alloc, sess, dest, local_headless, remote_home, remote_os, stderr, mailbox, .local_headless);
+        try uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon);
         return .{ .path = dest, .provisioned = true };
     }
 
-    // 4b/c. No local headless — check platform compatibility.
+    // 4b/c. No local daemon — check platform compatibility.
     const remote_arch = try resolveRemoteArch(alloc, sess);
     defer alloc.free(remote_arch);
 
@@ -363,48 +363,48 @@ pub fn ensureRemoteGhostty(
         std.ascii.eqlIgnoreCase(local.arch, remote_arch);
 
     if (platforms_match) {
-        // 4b. Same platform — upload full local ghostty, installed as ghostty-headless.
+        // 4b. Same platform — upload full local ghostty, installed as ghostty-daemon.
         const exe_path = try std.fs.selfExePathAlloc(alloc);
         defer alloc.free(exe_path);
 
-        try stderr.writeAll("Uploading ghostty to remote (as ghostty-headless)...\n");
+        try stderr.writeAll("Uploading ghostty to remote (as ghostty-daemon)...\n");
         try stderr.flush();
 
         try uploadGhostty(alloc, sess, dest, exe_path, remote_home, remote_os, stderr, mailbox, .local_self);
         return .{ .path = dest, .provisioned = true };
     }
 
-    // 4c. Cross-platform — download headless from CI.
+    // 4c. Cross-platform — download daemon from CI.
     const norm_os = shared.normalizeOs(remote_os);
     const norm_arch = shared.normalizeArch(remote_arch);
 
     try stderr.print(
-        "Cross-platform detected (local={s}/{s}, remote={s}/{s}). Downloading headless binary...\n",
+        "Cross-platform detected (local={s}/{s}, remote={s}/{s}). Downloading daemon binary...\n",
         .{ local.os, local.arch, norm_os, norm_arch },
     );
     try stderr.flush();
 
-    try downloadAndInstallHeadless(alloc, sess, dest, remote_home, remote_os, norm_os, norm_arch, stderr, mailbox);
+    try downloadAndInstallDaemon(alloc, sess, dest, remote_home, remote_os, norm_os, norm_arch, stderr, mailbox);
     return .{ .path = dest, .provisioned = true };
 }
 
-/// Find a locally-built headless binary adjacent to the current exe.
+/// Find a locally-built daemon binary adjacent to the current exe.
 /// Returns the path if found, null otherwise. Caller owns returned memory.
-fn findLocalHeadless(alloc: Allocator) !?[]const u8 {
+fn findLocalDaemon(alloc: Allocator) !?[]const u8 {
     const exe_path = std.fs.selfExePathAlloc(alloc) catch return null;
     defer alloc.free(exe_path);
 
     const dir = std.fs.path.dirname(exe_path) orelse return null;
-    const headless_path = try std.fs.path.join(alloc, &.{ dir, "ghostty-headless" });
+    const daemon_path = try std.fs.path.join(alloc, &.{ dir, "ghostty-daemon" });
 
     // Verify it exists by opening it
-    const f = std.fs.openFileAbsolute(headless_path, .{}) catch {
-        alloc.free(headless_path);
+    const f = std.fs.openFileAbsolute(daemon_path, .{}) catch {
+        alloc.free(daemon_path);
         return null;
     };
     f.close();
 
-    return headless_path;
+    return daemon_path;
 }
 
 /// Check if a deployed binary at the given path has a compatible protocol version.
@@ -438,10 +438,10 @@ fn probeDeployedBinary(
     return true;
 }
 
-/// Download a pre-built headless binary from GitHub releases and install
+/// Download a pre-built daemon binary from GitHub releases and install
 /// it on the remote host. Tries downloading directly on the remote first
 /// (most efficient), then falls back to local download + SCP upload.
-fn downloadAndInstallHeadless(
+fn downloadAndInstallDaemon(
     alloc: Allocator,
     sess: *ssh.SshSession,
     remote_dest_path: []const u8,
@@ -452,7 +452,7 @@ fn downloadAndInstallHeadless(
     stderr: *std.Io.Writer,
     mailbox: ?*Mailbox,
 ) !void {
-    const url = try shared.headlessDownloadUrl(alloc, protocol.protocol_version, norm_os, norm_arch);
+    const url = try shared.daemonDownloadUrl(alloc, protocol.protocol_version, norm_os, norm_arch);
     defer alloc.free(url);
 
     const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
@@ -502,7 +502,7 @@ fn downloadAndInstallHeadless(
     defer alloc.free(verify_cmd);
 
     const verify = sess.exec(verify_cmd) catch {
-        try stderr.writeAll("Failed to verify downloaded headless binary.\n");
+        try stderr.writeAll("Failed to verify downloaded daemon binary.\n");
         try stderr.flush();
         return error.RemoteDownloadFailed;
     };
@@ -510,13 +510,13 @@ fn downloadAndInstallHeadless(
     defer alloc.free(verify.stderr);
 
     if (verify.exit_code != 0) {
-        try stderr.print("Headless binary failed to execute (exit={d}).\n", .{verify.exit_code});
+        try stderr.print("Daemon binary failed to execute (exit={d}).\n", .{verify.exit_code});
         try stderr.flush();
         return error.RemoteDownloadFailed;
     }
 
     const ver = parseProtocolVersion(verify.stdout) orelse {
-        try stderr.writeAll("Headless binary did not report protocol version.\n");
+        try stderr.writeAll("Daemon binary did not report protocol version.\n");
         try stderr.flush();
         return error.RemoteDownloadFailed;
     };
@@ -531,7 +531,7 @@ fn downloadAndInstallHeadless(
         return error.RemoteDownloadFailed;
     }
 
-    try stderr.writeAll("Headless binary installed successfully.\n");
+    try stderr.writeAll("Daemon binary installed successfully.\n");
     try stderr.flush();
 }
 
@@ -546,7 +546,7 @@ fn downloadAndUploadLocal(
     mailbox: ?*Mailbox,
 ) !void {
     // Create a temporary local file
-    const local_tmp = "/tmp/ghostty-headless-download";
+    const local_tmp = "/tmp/ghostty-daemon-download";
 
     // Try curl first, then wget
     const curl_argv = [_][]const u8{ "curl", "-fsSL", "-o", local_tmp, url };
@@ -563,7 +563,7 @@ fn downloadAndUploadLocal(
     }
 
     if (!local_dl_ok) {
-        try stderr.writeAll("Failed to download headless binary: neither curl nor wget available locally.\n");
+        try stderr.writeAll("Failed to download daemon binary: neither curl nor wget available locally.\n");
         try stderr.flush();
         return error.RemoteDownloadFailed;
     }
@@ -586,7 +586,7 @@ fn downloadAndUploadLocal(
     };
 
     const total_bytes: u64 = stat.size;
-    try stderr.print("Uploading headless binary ({d} KB)... ", .{total_bytes / 1024});
+    try stderr.print("Uploading daemon binary ({d} KB)... ", .{total_bytes / 1024});
     try stderr.flush();
 
     pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes, .source = .github } });
@@ -620,7 +620,7 @@ fn downloadAndUploadLocal(
     defer alloc.free(mv_result.stderr);
 
     if (std.mem.indexOf(u8, mv_result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
-        try stderr.writeAll("Failed to install headless binary on remote host.\n");
+        try stderr.writeAll("Failed to install daemon binary on remote host.\n");
         try stderr.flush();
         return error.RemoteUploadFailed;
     }

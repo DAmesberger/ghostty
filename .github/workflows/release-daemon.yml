@@ -1,4 +1,4 @@
-name: Build Ghostty Headless
+name: Build Ghostty Daemon
 
 on:
   push:
@@ -16,16 +16,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - artifact: ghostty-headless-linux-x86_64
+          - artifact: ghostty-daemon-linux-x86_64
             runner: ubuntu-latest
             target: x86_64-linux-gnu
-          - artifact: ghostty-headless-linux-aarch64
+          - artifact: ghostty-daemon-linux-aarch64
             runner: ubuntu-latest
             target: aarch64-linux-gnu
-          - artifact: ghostty-headless-macos-x86_64
+          - artifact: ghostty-daemon-macos-x86_64
             runner: macos-latest
             target: x86_64-macos
-          - artifact: ghostty-headless-macos-aarch64
+          - artifact: ghostty-daemon-macos-aarch64
             runner: macos-latest
             target: aarch64-macos
 
@@ -50,14 +50,14 @@ jobs:
         run: |
           zig build \
             -Dapp-runtime=none \
-            -Demit-headless=true \
+            -Demit-daemon=true \
             -Demit-xcframework=false \
             -Demit-docs=false \
             -Dtarget=${{ matrix.target }} \
             -Doptimize=ReleaseSafe
 
       - name: Rename artifact
-        run: mv zig-out/bin/ghostty-headless ${{ matrix.artifact }}
+        run: mv zig-out/bin/ghostty-daemon ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,7 +88,7 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          for dir in artifacts/ghostty-headless-*; do
+          for dir in artifacts/ghostty-daemon-*; do
             name=$(basename "$dir")
             cp "$dir/$name" "release/$name"
             chmod +x "release/$name"
@@ -106,13 +106,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="ghostty-headless-v${{ steps.proto.outputs.version }}"
+          tag="ghostty-daemon-v${{ steps.proto.outputs.version }}"
 
           # Delete existing release if it exists (to update assets)
           gh release delete "$tag" --yes 2>/dev/null || true
 
           gh release create "$tag" \
-            --title "Ghostty Headless v${{ steps.proto.outputs.version }}" \
+            --title "Ghostty Daemon v${{ steps.proto.outputs.version }}" \
             --notes "Pre-built headless binaries for SSH remote sessions.
 
           Protocol version: ${{ steps.proto.outputs.version }}
