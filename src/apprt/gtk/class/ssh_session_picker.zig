@@ -72,6 +72,9 @@ pub const SshSessionPicker = extern struct {
         /// Back-reference to the window that opened us.
         window: ?*Window = null,
 
+        /// Whether the picker is in manager mode (show action bar).
+        manager_mode: bool = false,
+
         pub var offset: c_int = 0;
     };
 
@@ -302,9 +305,26 @@ pub const SshSessionPicker = extern struct {
     // Public API
 
     /// Show the picker as a dialog over the given window.
+    /// If `manager_mode` is true, single-click selects (shows action bar)
+    /// instead of auto-attaching. Double-click or Attach button still works.
     pub fn present(self: *SshSessionPicker, window: *Window) void {
+        self.presentWithMode(window, false);
+    }
+
+    pub fn presentAsManager(self: *SshSessionPicker, window: *Window) void {
+        self.presentWithMode(window, true);
+    }
+
+    fn presentWithMode(self: *SshSessionPicker, window: *Window, manager_mode: bool) void {
         const priv = self.private();
         priv.window = window;
+
+        // In manager mode, disable single-click-activate so clicking
+        // selects the row and reveals the action bar instead.
+        priv.view.setSingleClickActivate(if (manager_mode) 0 else 1);
+
+        // In manager mode, action bar will be shown when sessions load.
+        priv.manager_mode = manager_mode;
 
         // Show the dialog
         priv.dialog.present(window.as(gtk.Widget));
@@ -340,6 +360,10 @@ pub const SshSessionPicker = extern struct {
     pub fn setLoaded(self: *SshSessionPicker) void {
         const priv = self.private();
         priv.stack.setVisibleChildName("list");
+        // In manager mode, always show the action bar.
+        if (priv.manager_mode) {
+            priv.action_bar.setRevealed(1);
+        }
     }
 
     /// Show an error message.
