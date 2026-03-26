@@ -647,12 +647,14 @@ pub const RemoteSession = struct {
                         shiftBuf(frame_buf, total);
                         continue;
                     };
-                    // Diagnostic: log every rename frame arrival.
+                    // Diagnostic: log rename frame with raw scope byte.
                     {
                         var dbuf: [256]u8 = undefined;
-                        const dmsg = std.fmt.bufPrint(&dbuf, "processClientFrames: .rename scope={s} label='{s}'\n", .{
+                        const dmsg = std.fmt.bufPrint(&dbuf, "rename: raw_scope_byte={d} scope={s} label='{s}' payload_len={d}\n", .{
+                            payload[0],
                             @tagName(rename_data.scope),
                             rename_data.label,
+                            payload.len,
                         }) catch "";
                         _ = posix.write(2, dmsg) catch {};
                     }
