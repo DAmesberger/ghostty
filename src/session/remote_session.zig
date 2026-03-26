@@ -244,11 +244,12 @@ pub const RemoteSession = struct {
             }
         }
 
-        log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d}", .{
+        log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d} has_override={any}", .{
             @tagName(reason),
             group_label,
             group_label.len,
             group_color,
+            label_override != null,
         });
 
         const state = session.protocol.ViewerState{
