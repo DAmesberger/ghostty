@@ -2698,7 +2698,9 @@ pub const Window = extern struct {
         // the broadcast — no local hack needed.
     }
 
-    /// React to a GTK action opening the session manager dialog.
+    /// React to a GTK action opening the session manager.
+    /// Reuses the session picker in manager mode — shows all sessions
+    /// with action buttons (attach, rename, kill).
     fn actionSshManageSession(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
@@ -2708,10 +2710,23 @@ pub const Window = extern struct {
         const core = surface.core() orelse return;
         if (core.io.backend != .remote) return;
 
-        const SshSessionManager = @import("ssh_session_manager.zig").SshSessionManager;
-        const manager = SshSessionManager.new() orelse return;
-        manager.populate(self);
-        manager.present(self);
+        const remote = &core.io.backend.remote;
+        const target = remote.ssh_ctx.target;
+
+        const alloc = Application.default().allocator();
+        const picker = SshSessionPicker.new() orelse return;
+        const target_z = alloc.dupeZ(u8, target) catch return;
+        defer alloc.free(target_z);
+        picker.setSshTarget(target_z);
+        _ = SshSessionPicker.signals.@"session-selected".connect(
+            picker,
+            *Window,
+            signalSessionSelected,
+            self,
+            .{},
+        );
+        picker.present(self);
+        @import("ssh_session_picker.zig").queryAndPopulate(picker, target_z);
     }
 
     /// React to a GTK action requesting SSH session deletion.

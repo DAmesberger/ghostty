@@ -3,9 +3,9 @@ using Gio 2.0;
 using Adw 1;
 
 Adw.Dialog dialog {
-  title: "Attach SSH Session";
-  content-width: 450;
-  content-height: 500;
+  title: "Sessions";
+  content-width: 500;
+  content-height: 550;
   closed => $closed();
 
   Adw.ToolbarView {
@@ -15,11 +15,18 @@ Adw.Dialog dialog {
     Adw.HeaderBar {
       [title]
       Gtk.Label header_label {
-        label: "Select a session to attach";
+        label: "Sessions";
 
         styles [
           "heading",
         ]
+      }
+
+      [end]
+      Gtk.Button refresh_button {
+        icon-name: "view-refresh-symbolic";
+        tooltip-text: "Refresh session list";
+        clicked => $refresh_clicked();
       }
     }
 
@@ -41,7 +48,7 @@ Adw.Dialog dialog {
           }
 
           Gtk.Label {
-            label: "Connecting and querying sessions…";
+            label: "Querying sessions…";
 
             styles [
               "dim-label",
@@ -52,78 +59,132 @@ Adw.Dialog dialog {
 
       Gtk.StackPage {
         name: "list";
-        child: Gtk.ScrolledWindow {
-          min-content-height: 300;
+        child: Gtk.Box {
+          orientation: vertical;
 
-          Gtk.ListView view {
-            single-click-activate: true;
-            activate => $row_activated();
+          Gtk.ScrolledWindow {
+            vexpand: true;
+            min-content-height: 300;
 
-            model: Gtk.SingleSelection model {
-              model: Gio.ListStore source {
-                item-type: typeof<$GhosttySshSessionEntry>;
+            Gtk.ListView view {
+              activate => $row_activated();
+
+              model: Gtk.SingleSelection model {
+                model: Gio.ListStore source {
+                  item-type: typeof<$GhosttySshSessionEntry>;
+                };
               };
-            };
 
-            styles [
-              "navigation-sidebar",
-            ]
+              styles [
+                "navigation-sidebar",
+              ]
 
-            factory: Gtk.BuilderListItemFactory {
-              template Gtk.ListItem {
-                child: Gtk.Box {
-                  orientation: horizontal;
-                  spacing: 12;
-                  margin-start: 12;
-                  margin-end: 12;
-                  margin-top: 8;
-                  margin-bottom: 8;
+              factory: Gtk.BuilderListItemFactory {
+                template Gtk.ListItem {
+                  child: Gtk.Box {
+                    orientation: horizontal;
+                    spacing: 12;
+                    margin-start: 12;
+                    margin-end: 12;
+                    margin-top: 8;
+                    margin-bottom: 8;
 
-                  Gtk.Box {
-                    orientation: vertical;
-                    valign: center;
-                    spacing: 2;
-                    hexpand: true;
+                    Gtk.Box {
+                      orientation: vertical;
+                      valign: center;
+                      spacing: 2;
+                      hexpand: true;
 
-                    Gtk.Label {
-                      halign: start;
-                      ellipsize: end;
-                      single-line-mode: true;
+                      Gtk.Label {
+                        halign: start;
+                        ellipsize: end;
+                        single-line-mode: true;
 
-                      styles [
-                        "heading",
-                      ]
+                        styles [
+                          "heading",
+                        ]
 
-                      label: bind template.item as <$GhosttySshSessionEntry>.title;
+                        label: bind template.item as <$GhosttySshSessionEntry>.title;
+                      }
+
+                      Gtk.Label {
+                        halign: start;
+                        ellipsize: end;
+                        single-line-mode: true;
+
+                        styles [
+                          "dim-label",
+                          "caption",
+                        ]
+
+                        label: bind template.item as <$GhosttySshSessionEntry>.subtitle;
+                      }
                     }
 
                     Gtk.Label {
-                      halign: start;
-                      ellipsize: end;
-                      single-line-mode: true;
+                      valign: center;
 
                       styles [
                         "dim-label",
                         "caption",
                       ]
 
-                      label: bind template.item as <$GhosttySshSessionEntry>.subtitle;
+                      label: bind template.item as <$GhosttySshSessionEntry>.status;
                     }
-                  }
+                  };
+                }
+              };
+            }
+          }
 
-                  Gtk.Label {
-                    valign: center;
+          // Action bar at bottom — acts on the selected session
+          Gtk.ActionBar action_bar {
+            revealed: false;
 
-                    styles [
-                      "dim-label",
-                      "caption",
-                    ]
+            [center]
+            Gtk.Box {
+              orientation: horizontal;
+              spacing: 8;
 
-                    label: bind template.item as <$GhosttySshSessionEntry>.status;
-                  }
-                };
+              Gtk.Button attach_button {
+                label: "Attach";
+                clicked => $attach_clicked();
+
+                styles [
+                  "suggested-action",
+                ]
               }
-            };
+
+              Gtk.Button rename_button {
+                label: "Rename";
+                clicked => $rename_clicked();
+              }
+
+              Gtk.Button kill_button {
+                label: "Kill Session";
+                clicked => $kill_clicked();
+
+                styles [
+                  "destructive-action",
+                ]
+              }
+            }
+          }
+        };
+      }
+
+      Gtk.StackPage {
+        name: "empty";
+        child: Gtk.Box {
+          orientation: vertical;
+          valign: center;
+          halign: center;
+          spacing: 12;
+
+          Adw.StatusPage {
+            icon-name: "network-server-symbolic";
+            title: "No Sessions";
+            description: "No active sessions on this host. Connect to create one.";
           }
         };
       }

@@ -57,7 +57,6 @@ pub const blueprints: []const Blueprint = &.{
     .{ .major = 1, .minor = 5, .name = "command-palette" },
     .{ .major = 1, .minor = 5, .name = "ssh-connection-overlay" },
     .{ .major = 1, .minor = 5, .name = "ssh-session-picker" },
-    .{ .major = 1, .minor = 5, .name = "ssh-session-manager" },
     .{ .major = 1, .minor = 5, .name = "ssh-viewer-panel" },
 };
 
