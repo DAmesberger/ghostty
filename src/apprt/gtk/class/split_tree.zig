@@ -789,7 +789,7 @@ pub const SplitTree = extern struct {
         const ssh_ctx: ?session.shared.SshConnectionContext = if (active) |s| blk: {
             const core = s.core() orelse break :blk null;
             const ctx = core.remoteContext() orelse break :blk null;
-            break :blk .{ .target = ctx.target };
+            break :blk ctx.forNewSurface();
         } else null;
 
         self.newSplit(

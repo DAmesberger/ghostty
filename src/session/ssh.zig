@@ -58,6 +58,7 @@ pub const SshSession = struct {
     };
 
     /// Connect to a host via TCP and perform SSH handshake.
+    /// Times out after 30 seconds to avoid hanging indefinitely.
     pub fn connect(alloc: Allocator, host: []const u8, port: u16) !SshSession {
         const sock = try tcpConnect(host, port);
         errdefer posix.close(sock);
@@ -65,9 +66,23 @@ pub const SshSession = struct {
         const session = sessionInit() orelse return error.SshInitFailed;
         errdefer _ = ssh2.libssh2_session_free(session);
 
-        if (ssh2.libssh2_session_handshake(session, sock) != 0) {
+        // Handshake in non-blocking mode with a 30s timeout,
+        // matching the tunnel handshake timeout.
+        ssh2.libssh2_session_set_blocking(session, 0);
+        const handshake_deadline = std.time.nanoTimestamp() + 30 * std.time.ns_per_s;
+        while (true) {
+            if (std.time.nanoTimestamp() > handshake_deadline) {
+                return error.SshHandshakeFailed;
+            }
+            const rc = ssh2.libssh2_session_handshake(session, sock);
+            if (rc == 0) break;
+            if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
+                waitsocketTimeout(session, sock, 100);
+                continue;
+            }
             return error.SshHandshakeFailed;
         }
+        ssh2.libssh2_session_set_blocking(session, 1);
 
         try verifyHostKey(alloc, session, host, port);
 
@@ -866,6 +881,9 @@ fn verifyHostKey(
     }
 }
 
+/// TCP connect timeout in milliseconds.
+const tcp_connect_timeout_ms = 30_000;
+
 fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
     const host_z = try std.heap.page_allocator.allocSentinel(u8, host.len, 0);
     defer std.heap.page_allocator.free(host_z);
@@ -892,10 +910,41 @@ fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
         const sock = c.socket(a.ai_family, a.ai_socktype, a.ai_protocol);
         if (sock < 0) continue;
 
-        if (c.connect(sock, a.ai_addr, a.ai_addrlen) == 0) {
+        // Set non-blocking for connect with timeout.
+        const flags = c.fcntl(sock, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(sock, c.F_SETFL, flags | c.O_NONBLOCK);
+
+        const rc = c.connect(sock, a.ai_addr, a.ai_addrlen);
+        if (rc == 0) {
+            // Connected immediately — restore blocking mode.
+            _ = c.fcntl(sock, c.F_SETFL, flags);
             return sock;
         }
-        _ = c.close(sock);
+
+        if (std.c._errno().* != @as(c_int, @intFromEnum(posix.E.INPROGRESS))) {
+            _ = c.close(sock);
+            continue;
+        }
+
+        // Wait for connect to complete with timeout.
+        var fds = [1]c.struct_pollfd{.{ .fd = sock, .events = c.POLLOUT, .revents = 0 }};
+        const poll_rc = c.poll(&fds, 1, tcp_connect_timeout_ms);
+        if (poll_rc <= 0) {
+            _ = c.close(sock);
+            continue;
+        }
+
+        // Check if connect actually succeeded.
+        var so_err: c_int = 0;
+        var so_len: c.socklen_t = @sizeOf(c_int);
+        if (c.getsockopt(sock, c.SOL_SOCKET, c.SO_ERROR, @ptrCast(&so_err), &so_len) != 0 or so_err != 0) {
+            _ = c.close(sock);
+            continue;
+        }
+
+        // Restore blocking mode.
+        _ = c.fcntl(sock, c.F_SETFL, flags);
+        return sock;
     }
 
     return error.SshConnectFailed;

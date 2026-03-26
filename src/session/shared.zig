@@ -501,6 +501,19 @@ pub const SshConnectionContext = struct {
         };
     }
 
+    /// Returns a context for spawning a new surface (tab/split) that inherits
+    /// connection parameters and group from this context but gets fresh IDs.
+    pub fn forNewSurface(self: SshConnectionContext) SshConnectionContext {
+        return .{
+            .target = self.target,
+            .jump = self.jump,
+            .group_id = self.group_id,
+            .reconnect_attempts = self.reconnect_attempts,
+            .reconnect_backoff = self.reconnect_backoff,
+            .reconnect_interval_ms = self.reconnect_interval_ms,
+        };
+    }
+
     /// Free owned string copies.
     pub fn deinit(self: *SshConnectionContext, alloc: Allocator) void {
         alloc.free(self.target);

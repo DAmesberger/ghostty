@@ -98,6 +98,7 @@ pub const SshSessionPicker = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         self.clearRows();
+        priv.row_data.deinit(Application.default().allocator());
 
         if (priv.ssh_target) |t| {
             Application.default().allocator().free(t);

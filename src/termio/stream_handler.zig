@@ -145,7 +145,14 @@ pub const StreamHandler = struct {
         // When processing remote data_out, suppress all write-back responses.
         // The daemon already handled queries (DA, DSR, OSC colors, etc.) and
         // wrote responses back to the PTY. The client only needs to render.
-        if (self.suppress_responses) return;
+        if (self.suppress_responses) {
+            // Free any allocated write data to avoid leaks.
+            switch (msg) {
+                .write_alloc => |v| v.alloc.free(v.data),
+                else => {},
+            }
+            return;
+        }
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }

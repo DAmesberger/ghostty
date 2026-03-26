@@ -418,7 +418,7 @@ pub const Window = extern struct {
         // If the parent surface is remote, inherit its SSH context so new tabs
         // stay on the same connection instead of opening a local terminal.
         const ssh_ctx: ?session.shared.SshConnectionContext = if (parent_) |p|
-            (if (p.remoteContext()) |ctx| .{ .target = ctx.target } else null)
+            (if (p.remoteContext()) |ctx| ctx.forNewSurface() else null)
         else
             null;
         _ = self.newTabPage(parent_, .tab, .{ .ssh_ctx = ssh_ctx });
