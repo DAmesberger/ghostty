@@ -982,12 +982,18 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
             // without racing this (SSH) thread. All GTK-thread readers see
             // the update before any subsequent messages (data_out,
             // layout_restore) because the mailbox is FIFO.
-            _ = s.surface_mailbox.push(.{
+            var opened_msg: apprt.surface.Message = .{
                 .remote_opened = .{
                     .group_id = parsed.group_id,
                     .surface_id = parsed.surface_id,
                 },
-            }, .{ .forever = {} });
+            };
+            // Copy daemon-authoritative session label.
+            const ol = parsed.label;
+            const ol_len = @min(ol.len, 64);
+            @memcpy(opened_msg.remote_opened.label[0..ol_len], ol[0..ol_len]);
+            opened_msg.remote_opened.label_len = @intCast(ol_len);
+            _ = s.surface_mailbox.push(opened_msg, .{ .forever = {} });
 
             // Pre-allocate blank history pages for scrollback restore.
             // Guard with history_prepended to prevent duplicate prepends on reconnect.

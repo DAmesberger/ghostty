@@ -217,22 +217,20 @@ pub fn threadEnter(
             // Update the registered slot so detach/reconnect can find us by group.
             SshConnectionManager.updateSurfaceGroupId(entry, self.target_id, self.ssh_ctx.group_id);
 
-            // Generate a readable session name if no explicit label was provided.
-            if (self.ssh_ctx.label == null) {
-                self.ssh_ctx.label = session.shared.generateReadableName(self.alloc, self.ssh_ctx.group_id) catch null;
-            }
-
-            const label = self.ssh_ctx.label orelse self.ssh_ctx.target;
+            // Send label if user explicitly set one; otherwise empty (daemon generates).
+            const label = self.ssh_ctx.label orelse
+                if (open_type == .session_attach and self.ssh_ctx.session_id != null)
+                self.ssh_ctx.session_id.?
+            else
+                "";
 
             const open_payload = (session.protocol.Open{
                 .open_type = open_type,
                 .resize = open_resize,
-                // For attach mode, send zero surface_id so the daemon picks
-                // the first alive surface rather than looking up a specific one.
                 .surface_id = if (open_type == .session_attach) session.shared.zero_uuid else self.ssh_ctx.surface_id,
                 .group_id = self.ssh_ctx.group_id,
                 .max_scrollback = self.scrollback_limit,
-                .label = if (open_type == .session_attach) (self.ssh_ctx.session_id orelse label) else label,
+                .label = label,
             }).encode(alloc) catch return error.OutOfMemory;
             defer alloc.free(open_payload);
             SshConnectionManager.enqueueWrite(entry, .open, self.target_id, open_payload);

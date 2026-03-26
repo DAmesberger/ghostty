@@ -614,6 +614,9 @@ pub const ListResponse = struct {
 ///   [16] group_id
 ///   [16] surface_id (which daemon surface was attached; zero for new sessions)
 ///   [4]  caps (u32 LE capability bitmask — bit 0: compression)
+///   [4]  history_rows (u32 LE)
+///   [2]  label_len (u16 LE)
+///   [label_len] session label (daemon-authoritative)
 ///   [4]  layout_len (u32 LE, 0 = no layout)
 ///   [layout_len] layout blob
 ///   [2]  state_count (u16 LE, number of surface state snapshots)
@@ -623,16 +626,12 @@ pub const ListResponse = struct {
 ///     [state_len] full page snapshot (diff_type=1 data_out format)
 pub const Opened = struct {
     group_id: Uuid,
-    /// The daemon-side surface_id that was attached. For session_attach
-    /// this is the surface the daemon picked. For new sessions, this is
-    /// the created surface's id. The client must update its local
-    /// surface_id to match so layout restore can identify it.
+    /// The daemon-side surface_id that was attached.
     surface_id: Uuid = zero_uuid,
     caps: u32 = 0,
-    /// Number of scrollback history rows available for the attached surface.
-    /// The client uses this to pre-allocate blank history pages before
-    /// receiving scrollback_response chunks.
     history_rows: u32 = 0,
+    /// Daemon-authoritative session label. Set on first open, updated by rename.
+    label: []const u8 = "",
     layout_blob: ?[]const u8 = null,
     states: []const SurfaceState = &.{},
 
@@ -646,8 +645,8 @@ pub const Opened = struct {
 
     pub fn encode(self: Opened, alloc: Allocator) ![]u8 {
         const layout_len: u32 = if (self.layout_blob) |b| @intCast(b.len) else 0;
-        // uuid*2 + caps(4) + history_rows(4) + layout_len(4) + layout + state_count(2)
-        var total: usize = uuid_size * 2 + 4 + 4 + 4 + layout_len + 2;
+        // uuid*2 + caps(4) + history_rows(4) + label_len(2) + label + layout_len(4) + layout + state_count(2)
+        var total: usize = uuid_size * 2 + 4 + 4 + 2 + self.label.len + 4 + layout_len + 2;
         for (self.states) |s| {
             total += uuid_size + 4 + s.data.len;
         }
@@ -662,6 +661,11 @@ pub const Opened = struct {
         offset += 4;
         std.mem.writeInt(u32, buf[offset..][0..4], self.history_rows, .little);
         offset += 4;
+        // Label
+        std.mem.writeInt(u16, buf[offset..][0..2], @intCast(self.label.len), .little);
+        offset += 2;
+        @memcpy(buf[offset..][0..self.label.len], self.label);
+        offset += self.label.len;
         std.mem.writeInt(u32, buf[offset..][0..4], layout_len, .little);
         offset += 4;
         if (self.layout_blob) |b| {
@@ -686,12 +690,13 @@ pub const Opened = struct {
         surface_id: Uuid,
         caps: u32,
         history_rows: u32,
+        label: []const u8,
         layout_blob: ?[]const u8,
         state_count: u16,
         remaining: []const u8,
     } {
-        // uuid*2 + caps(4) + history_rows(4) + layout_len(4) + state_count(2)
-        const min_size = uuid_size * 2 + 4 + 4 + 4 + 2;
+        // uuid*2 + caps(4) + history_rows(4) + label_len(2) + layout_len(4) + state_count(2)
+        const min_size = uuid_size * 2 + 4 + 4 + 2 + 4 + 2;
         if (payload.len < min_size) return error.InvalidOpenedPayload;
         var offset: usize = 0;
         const group_id = payload[0..uuid_size].*;
@@ -702,6 +707,12 @@ pub const Opened = struct {
         offset += 4;
         const history_rows = std.mem.readInt(u32, payload[offset..][0..4], .little);
         offset += 4;
+        // Label
+        const label_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+        offset += 2;
+        if (offset + label_len > payload.len) return error.InvalidOpenedPayload;
+        const label = payload[offset..][0..label_len];
+        offset += label_len;
         const layout_len = std.mem.readInt(u32, payload[offset..][0..4], .little);
         offset += 4;
         if (offset + layout_len > payload.len) return error.InvalidOpenedPayload;
@@ -718,6 +729,7 @@ pub const Opened = struct {
             .surface_id = surface_id,
             .caps = caps,
             .history_rows = history_rows,
+            .label = label,
             .layout_blob = layout_blob,
             .state_count = state_count,
             .remaining = payload[offset..],

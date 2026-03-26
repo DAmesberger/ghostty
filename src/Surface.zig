@@ -1280,6 +1280,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 if (!session.shared.isZeroUuid(ro.surface_id)) {
                     self.io.backend.remote.ssh_ctx.surface_id = ro.surface_id;
                 }
+                // Set the daemon-authoritative session label.
+                if (ro.label_len > 0) {
+                    const label = ro.label[0..ro.label_len];
+                    self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
+                    // Trigger tab title refresh.
+                    if (@hasDecl(apprt.runtime.Surface, "setTitle")) {
+                        self.rt_surface.setTitle(self.rt_surface.getTitle());
+                    }
+                }
             }
         },
 
@@ -1308,8 +1317,10 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             self.size_mode_current = vs.size_mode;
             self.session_color = vs.session_color;
 
-            // Update authoritative session label from daemon broadcast.
-            if (vs.session_label_len > 0) {
+            // Only update label on explicit name_change (rename broadcast).
+            // The initial label is set from the `opened` response — don't
+            // overwrite it on every viewer_state broadcast.
+            if (vs.reason == .name_change and vs.session_label_len > 0) {
                 const label = vs.session_label[0..vs.session_label_len];
                 if (self.io.backend == .remote) {
                     self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;

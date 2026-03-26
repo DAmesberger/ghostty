@@ -131,6 +131,9 @@ pub const Message = union(enum) {
     pub const RemoteOpened = struct {
         group_id: session.shared.Uuid,
         surface_id: session.shared.Uuid,
+        /// Daemon-authoritative session label. Fixed buffer for mailbox safety.
+        label: [64]u8 = .{0} ** 64,
+        label_len: u8 = 0,
     };
 
     pub const LayoutRestore = struct {

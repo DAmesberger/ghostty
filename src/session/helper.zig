@@ -411,12 +411,20 @@ const Daemon = struct {
         switch (open_data.open_type) {
             .session_new => {
                 // Create group with client-provided group_id + first surface
-                const raw_label = if (open_data.label.len > 0) open_data.label else "session";
-                log.info("session_new: raw_label='{s}' (len={d}) open_data.label.len={d}", .{ raw_label, raw_label.len, open_data.label.len });
                 const group_id = if (!session.shared.isZeroUuid(open_data.group_id))
                     open_data.group_id
                 else
                     session.shared.generateUuid();
+
+                // Daemon generates session name if client didn't provide one.
+                const generated_label: ?[]u8 = if (open_data.label.len == 0)
+                    session.shared.generateReadableName(self.alloc, group_id) catch null
+                else
+                    null;
+                defer if (generated_label) |gl| self.alloc.free(gl);
+                const raw_label = generated_label orelse
+                    if (open_data.label.len > 0) open_data.label else "session";
+                log.info("session_new: label='{s}' (generated={any})", .{ raw_label, generated_label != null });
                 const group = try self.createGroup(raw_label, group_id);
 
                 const surface_id = if (!session.shared.isZeroUuid(open_data.surface_id))
@@ -427,7 +435,7 @@ const Daemon = struct {
                 const sess = try self.createSurface(group, surface_id, open_data.resize, open_data.max_scrollback);
 
                 // Send opened response with no layout (new session)
-                const opened = session.protocol.Opened{
+                const opened = session.protocol.Opened{ .label = group.label,
                     .group_id = group.id,
                     .surface_id = surface_id,
                 };
@@ -546,7 +554,7 @@ const Daemon = struct {
                     break :blk s.computeHistoryRows();
                 } else 0;
 
-                const opened = session.protocol.Opened{
+                const opened = session.protocol.Opened{ .label = group.label,
                     .group_id = group.id,
                     .surface_id = attached_sid,
                     .history_rows = history_rows,
@@ -637,7 +645,7 @@ const Daemon = struct {
         switch (open_data.open_type) {
             .surface_new => {
                 const sess = try self.createSurface(group, open_data.surface_id, open_data.resize, open_data.max_scrollback);
-                const opened = session.protocol.Opened{
+                const opened = session.protocol.Opened{ .label = group.label,
                     .group_id = group.id,
                     .surface_id = open_data.surface_id,
                 };
@@ -669,7 +677,7 @@ const Daemon = struct {
                     const surf_history = s.computeHistoryRows();
                     s.mutex.unlock();
 
-                    const opened = session.protocol.Opened{
+                    const opened = session.protocol.Opened{ .label = group.label,
                         .group_id = group.id,
                         .surface_id = open_data.surface_id,
                         .history_rows = surf_history,
