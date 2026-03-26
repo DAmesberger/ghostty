@@ -215,8 +215,23 @@ pub const RemoteSession = struct {
         const eff_cols = self.terminal_instance.cols;
 
         // Get authoritative session label and color from the owning group.
-        const group_label: []const u8 = if (self.group) |g| g.label else "";
-        const group_color: i8 = if (self.group) |g| g.color else -1;
+        // MUST hold group.mutex while reading label — it can be freed/reallocated
+        // by handleRename/session_meta on another thread.
+        var group_label: []const u8 = "";
+        var group_color: i8 = -1;
+        const group_locked = if (self.group) |g| blk: {
+            g.mutex.lock();
+            group_label = g.label;
+            group_color = g.color;
+            break :blk g;
+        } else null;
+
+        log.info("broadcastViewerState: reason={s} label='{s}' (len={d}) color={d}", .{
+            @tagName(reason),
+            group_label,
+            group_label.len,
+            group_color,
+        });
 
         const state = session.protocol.ViewerState{
             .reason = reason,
@@ -229,8 +244,14 @@ pub const RemoteSession = struct {
             .viewers = entries_buf[0..count],
         };
 
-        const payload = state.encode(self.alloc) catch return;
+        const payload = state.encode(self.alloc) catch {
+            if (group_locked) |g| g.mutex.unlock();
+            return;
+        };
         defer self.alloc.free(payload);
+
+        // Release group mutex — payload is now an owned copy of the label.
+        if (group_locked) |g| g.mutex.unlock();
 
         for (self.viewers.items) |viewer| {
             sendFrameFd(viewer.fd, .viewer_state, viewer.target, payload) catch {};

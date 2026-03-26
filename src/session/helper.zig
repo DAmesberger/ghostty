@@ -199,6 +199,18 @@ fn daemonMain(alloc: Allocator) !void {
     defer alloc.free(state_dir);
     try std.fs.cwd().makePath(state_dir);
 
+    // Open a daemon log file for debugging (daemon stderr is /dev/null).
+    const log_path = try std.fs.path.join(alloc, &.{ state_dir, "daemon.log" });
+    defer alloc.free(log_path);
+    const log_file = std.fs.cwd().createFile(log_path, .{ .truncate = true }) catch null;
+    defer if (log_file) |f| f.close();
+    if (log_file) |f| {
+        // Redirect stderr to the log file so std.log output is captured.
+        const stderr_fd: c_int = 2;
+        _ = c.dup2(f.handle, stderr_fd);
+        log.info("daemon started, log file: {s}", .{log_path});
+    }
+
     // Secure the state directory permissions
     {
         var dir = try std.fs.cwd().openDir(state_dir, .{});
@@ -400,7 +412,7 @@ const Daemon = struct {
             .session_new => {
                 // Create group with client-provided group_id + first surface
                 const raw_label = if (open_data.label.len > 0) open_data.label else "session";
-                log.info("session_new: label='{s}' (len={d})", .{ raw_label, raw_label.len });
+                log.info("session_new: raw_label='{s}' (len={d}) open_data.label.len={d}", .{ raw_label, raw_label.len, open_data.label.len });
                 const group_id = if (!session.shared.isZeroUuid(open_data.group_id))
                     open_data.group_id
                 else
