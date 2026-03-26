@@ -67,6 +67,7 @@ Adw.Dialog dialog {
             min-content-height: 300;
 
             Gtk.ListView view {
+              single-click-activate: true;
               activate => $row_activated();
 
               model: Gtk.SingleSelection model {
