@@ -242,16 +242,12 @@ pub const ProvisionResult = struct {
     provisioned: bool,
 };
 
-/// Ensure a compatible ghostty binary exists on the remote host.
+/// Ensure a compatible ghostty-daemon exists on the remote host.
 ///
-/// Resolution order (check existing):
-///   1. `ghostty` in PATH with matching protocol version → use it
-///   2. Deployed `ghostty-daemon` at install path → protocol version match → use it
-///   3. Deployed `ghostty` (full) at install path → protocol version match → use it
-///
-/// Provisioning (always installs as `ghostty-daemon`):
-///   4a. Local daemon binary exists → upload it
-///   4b. Download daemon from GitHub CI release
+/// Resolution order:
+///   1. `ghostty` in remote PATH with matching protocol version → use it
+///   2. Same arch → upload local ghostty-daemon (from same dir as this binary) if available
+///   3. Download ghostty-daemon from GitHub CI release for target OS/arch
 pub fn ensureRemoteGhostty(
     alloc: Allocator,
     ctx: *SshContext,
@@ -269,7 +265,10 @@ pub fn ensureRemoteGhostty(
     const remote_os = try resolveRemoteOs(alloc, sess);
     defer alloc.free(remote_os);
 
-    // 1. Check if ghostty is in PATH on the remote and has the right version.
+    const remote_arch = try resolveRemoteArch(alloc, sess);
+    defer alloc.free(remote_arch);
+
+    // 1. Check if ghostty in PATH on the remote has the right protocol version.
     const path_check = sess.exec("ghostty " ++ shared.remote_subcommand ++ " --protocol-version") catch null;
     if (path_check) |pc| {
         defer alloc.free(pc.stdout);
@@ -283,7 +282,7 @@ pub fn ensureRemoteGhostty(
         }
     }
 
-    // 2. Probe deployed ghostty-daemon (works regardless of platform).
+    // Also check if a previously deployed ghostty-daemon exists with matching version.
     const daemon_path = try shared.remoteDaemonInstallPath(alloc, remote_home, remote_os);
     defer alloc.free(daemon_path);
 
@@ -291,33 +290,28 @@ pub fn ensureRemoteGhostty(
         return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
     }
 
-    // 3. Probe deployed full ghostty (legacy/manual install).
-    const full_path = try shared.remoteInstallPath(alloc, remote_home, remote_os);
-    defer alloc.free(full_path);
-
-    if (try probeDeployedBinary(alloc, sess, full_path)) {
-        return .{ .path = try alloc.dupe(u8, full_path), .provisioned = false };
-    }
-
-    // 4. Need to provision — always installs as ghostty-daemon.
+    // Need to provision — install as ghostty-daemon.
     const dest = try alloc.dupe(u8, daemon_path);
     errdefer alloc.free(dest);
 
-    // 4a. Prefer uploading a local daemon binary if available.
-    if (try findLocalDaemon(alloc)) |local_daemon| {
-        defer alloc.free(local_daemon);
+    // 2. Same architecture → try uploading local ghostty-daemon binary.
+    const local = shared.localPlatform();
+    const arch_matches = platformMatches(local.os, remote_os) and
+        std.ascii.eqlIgnoreCase(local.arch, remote_arch);
 
-        try stderr.writeAll("Uploading ghostty-daemon to remote...\n");
-        try stderr.flush();
+    if (arch_matches) {
+        if (try findLocalDaemon(alloc)) |local_daemon| {
+            defer alloc.free(local_daemon);
 
-        try uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon);
-        return .{ .path = dest, .provisioned = true };
+            try stderr.writeAll("Uploading ghostty-daemon to remote...\n");
+            try stderr.flush();
+
+            try uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon);
+            return .{ .path = dest, .provisioned = true };
+        }
     }
 
-    // 4b. No local daemon — download from CI release.
-    const remote_arch = try resolveRemoteArch(alloc, sess);
-    defer alloc.free(remote_arch);
-
+    // 3. Download ghostty-daemon from GitHub CI release.
     const norm_os = shared.normalizeOs(remote_os);
     const norm_arch = shared.normalizeArch(remote_arch);
 
