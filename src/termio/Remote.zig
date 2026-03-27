@@ -436,11 +436,12 @@ pub fn resize(
     self.screen_size = screen_size;
 
     if (self.conn_entry) |entry| {
-        var payload: [8]u8 = undefined;
-        std.mem.writeInt(u16, payload[0..2], @intCast(grid_size.rows), .little);
-        std.mem.writeInt(u16, payload[2..4], @intCast(grid_size.columns), .little);
-        std.mem.writeInt(u16, payload[4..6], @intCast(screen_size.width), .little);
-        std.mem.writeInt(u16, payload[6..8], @intCast(screen_size.height), .little);
+        const payload = (session.protocol.Resize{
+            .rows = @intCast(grid_size.rows),
+            .cols = @intCast(grid_size.columns),
+            .width_px = @intCast(screen_size.width),
+            .height_px = @intCast(screen_size.height),
+        }).bytes();
         SshConnectionManager.enqueueWrite(entry, .resize, self.target_id, &payload);
     }
 }
@@ -458,15 +459,29 @@ pub fn queueWrite(
     const entry = self.conn_entry orelse return;
 
     if (linefeed) {
-        var i: usize = 0;
-        while (i < data.len) {
-            const byte = data[i];
-            i += 1;
+        // Pre-process into a single buffer to avoid per-byte enqueue overhead.
+        var buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+        for (data) |byte| {
             if (byte == '\r') {
-                SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, "\r\n");
+                if (pos + 2 > buf.len) {
+                    SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, buf[0..pos]);
+                    pos = 0;
+                }
+                buf[pos] = '\r';
+                buf[pos + 1] = '\n';
+                pos += 2;
             } else {
-                SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, data[i - 1 .. i]);
+                if (pos + 1 > buf.len) {
+                    SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, buf[0..pos]);
+                    pos = 0;
+                }
+                buf[pos] = byte;
+                pos += 1;
             }
+        }
+        if (pos > 0) {
+            SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, buf[0..pos]);
         }
     } else {
         SshConnectionManager.enqueueWrite(entry, .data_in, self.target_id, data);

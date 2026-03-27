@@ -13,12 +13,7 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
 
 const log = std.log.scoped(.session_client);
 
-/// Zero-fill a buffer before freeing it, preventing sensitive data
-/// (passwords, keys) from lingering in deallocated memory.
-fn secureZeroAndFree(alloc: Allocator, buf: []u8) void {
-    @memset(buf, 0);
-    alloc.free(buf);
-}
+const secureZeroAndFree = shared.secureZeroAndFree;
 
 pub const Error = error{
     RemoteCommandFailed,
@@ -258,15 +253,14 @@ pub fn ensureRemoteGhostty(
     try ctx.connect(stderr);
     var sess = &ctx.session.?;
 
-    // Resolve remote HOME and OS for platform-aware path construction
-    const remote_home = try resolveRemoteHome(alloc, sess);
-    defer alloc.free(remote_home);
-
-    const remote_os = try resolveRemoteOs(alloc, sess);
-    defer alloc.free(remote_os);
-
-    const remote_arch = try resolveRemoteArch(alloc, sess);
-    defer alloc.free(remote_arch);
+    // Resolve remote HOME, OS, and arch in a single SSH round trip
+    const remote_info = try resolveRemoteInfo(alloc, sess);
+    defer alloc.free(remote_info.home);
+    defer alloc.free(remote_info.os);
+    defer alloc.free(remote_info.arch);
+    const remote_home = remote_info.home;
+    const remote_os = remote_info.os;
+    const remote_arch = remote_info.arch;
 
     // 1. Check if ghostty in PATH on the remote has the right protocol version.
     const path_check = sess.exec("ghostty " ++ shared.remote_subcommand ++ " --protocol-version") catch null;
@@ -303,11 +297,11 @@ pub fn ensureRemoteGhostty(
         if (try findLocalDaemon(alloc)) |local_daemon| {
             defer alloc.free(local_daemon);
 
-            try stderr.writeAll("Uploading ghostty-daemon to remote...\n");
-            try stderr.flush();
-
-            try uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon);
-            return .{ .path = dest, .provisioned = true };
+            if (uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon)) {
+                return .{ .path = dest, .provisioned = true };
+            } else |_| {
+                // Local daemon upload failed (e.g., file not found) — fall through to download.
+            }
         }
     }
 
@@ -332,16 +326,7 @@ fn findLocalDaemon(alloc: Allocator) !?[]const u8 {
     defer alloc.free(exe_path);
 
     const dir = std.fs.path.dirname(exe_path) orelse return null;
-    const daemon_path = try std.fs.path.join(alloc, &.{ dir, "ghostty-daemon" });
-
-    // Verify it exists by opening it
-    const f = std.fs.openFileAbsolute(daemon_path, .{}) catch {
-        alloc.free(daemon_path);
-        return null;
-    };
-    f.close();
-
-    return daemon_path;
+    return try std.fs.path.join(alloc, &.{ dir, "ghostty-daemon" });
 }
 
 /// Check if a deployed binary at the given path has a compatible protocol version.
@@ -395,12 +380,7 @@ fn downloadAndInstallDaemon(
     const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(install_dir);
 
-    // Ensure install directory exists
-    const mkdir_cmd = try std.fmt.allocPrint(alloc, "mkdir -p '{s}' && chmod 700 '{s}'", .{ install_dir, install_dir });
-    defer alloc.free(mkdir_cmd);
-    const mkdir_result = try sess.exec(mkdir_cmd);
-    alloc.free(mkdir_result.stdout);
-    alloc.free(mkdir_result.stderr);
+    try ensureRemoteDir(alloc, sess, install_dir);
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{remote_dest_path});
     defer alloc.free(tmp_path);
@@ -527,40 +507,12 @@ fn downloadAndUploadLocal(
     try stderr.flush();
 
     pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes, .source = .github } });
-
-    const ProgressCtx = struct {
-        mbox: ?*Mailbox,
-        total: u64,
-
-        pub fn onProgress(ctx: @This(), bytes_sent: u64) void {
-            pushConnectionState(ctx.mbox, .{ .uploading = .{
-                .bytes_sent = bytes_sent,
-                .total_bytes = ctx.total,
-                .source = .github,
-            } });
-        }
-    };
-    try sess.upload(local_tmp, remote_tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes });
+    try sess.upload(local_tmp, remote_tmp_path, 0o700, UploadProgressCtx{ .mbox = mailbox, .total = total_bytes, .src = .github });
 
     try stderr.writeAll("Done.\n");
     try stderr.flush();
 
-    // Move into final location
-    const mv_cmd = try std.fmt.allocPrint(
-        alloc,
-        "mv -f '{s}' '{s}' && test -x '{s}' && echo GHOSTTY_SETUP_SUCCESS",
-        .{ remote_tmp_path, remote_dest_path, remote_dest_path },
-    );
-    defer alloc.free(mv_cmd);
-    const mv_result = try sess.exec(mv_cmd);
-    defer alloc.free(mv_result.stdout);
-    defer alloc.free(mv_result.stderr);
-
-    if (std.mem.indexOf(u8, mv_result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
-        try stderr.writeAll("Failed to install daemon binary on remote host.\n");
-        try stderr.flush();
-        return error.RemoteUploadFailed;
-    }
+    try moveAndVerifyRemoteBinary(alloc, sess, remote_tmp_path, remote_dest_path);
 }
 
 fn parseProtocolVersion(stdout: []const u8) ?u16 {
@@ -570,31 +522,38 @@ fn parseProtocolVersion(stdout: []const u8) ?u16 {
     return std.fmt.parseInt(u16, trimmed[prefix.len..], 10) catch null;
 }
 
-fn resolveRemoteOs(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
-    const result = try sess.exec("uname -s");
-    defer alloc.free(result.stderr);
-    if (result.exit_code != 0) {
-        alloc.free(result.stdout);
-        return try alloc.dupe(u8, "Linux");
-    }
-    // result.stdout is already allocated by sess.exec, return owned
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    const os = try alloc.dupe(u8, trimmed);
-    alloc.free(result.stdout);
-    return os;
-}
+const RemoteInfo = struct {
+    home: []const u8,
+    os: []const u8,
+    arch: []const u8,
+};
 
-fn resolveRemoteArch(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
-    const result = try sess.exec("uname -m");
+/// Resolve HOME, OS, and arch in a single SSH round trip.
+fn resolveRemoteInfo(alloc: Allocator, sess: *ssh.SshSession) !RemoteInfo {
+    const result = try sess.exec("printf '%s\\n' \"$HOME\" \"$(uname -s)\" \"$(uname -m)\"");
     defer alloc.free(result.stderr);
-    if (result.exit_code != 0) {
-        alloc.free(result.stdout);
-        return try alloc.dupe(u8, "x86_64");
+    defer alloc.free(result.stdout);
+
+    if (result.exit_code != 0 or result.stdout.len == 0) {
+        return error.RemoteCommandFailed;
     }
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    const arch = try alloc.dupe(u8, trimmed);
-    alloc.free(result.stdout);
-    return arch;
+
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, result.stdout, " \t\r\n"), '\n');
+
+    const home_raw = lines.next() orelse return error.RemoteCommandFailed;
+    const home = std.mem.trim(u8, home_raw, " \t\r");
+    if (home.len == 0) return error.RemoteCommandFailed;
+
+    const os_raw = lines.next() orelse "Linux";
+    const arch_raw = lines.next() orelse "x86_64";
+
+    const home_owned = try alloc.dupe(u8, home);
+    errdefer alloc.free(home_owned);
+    const os_owned = try alloc.dupe(u8, std.mem.trim(u8, os_raw, " \t\r"));
+    errdefer alloc.free(os_owned);
+    const arch_owned = try alloc.dupe(u8, std.mem.trim(u8, arch_raw, " \t\r"));
+
+    return .{ .home = home_owned, .os = os_owned, .arch = arch_owned };
 }
 
 /// Launch the remote session daemon via ghostty's --daemonize flag.
@@ -714,6 +673,32 @@ fn shellEscape(alloc: Allocator, s: []const u8) ![]u8 {
     return out[0 .. i + 1];
 }
 
+/// Create a directory on the remote host with restrictive permissions.
+fn ensureRemoteDir(alloc: Allocator, sess: *ssh.SshSession, dir: []const u8) !void {
+    const cmd = try std.fmt.allocPrint(alloc, "mkdir -p '{s}' && chmod 700 '{s}'", .{ dir, dir });
+    defer alloc.free(cmd);
+    const result = try sess.exec(cmd);
+    alloc.free(result.stdout);
+    alloc.free(result.stderr);
+}
+
+/// Move a temp file to its final location and verify it's executable.
+fn moveAndVerifyRemoteBinary(alloc: Allocator, sess: *ssh.SshSession, tmp_path: []const u8, dest_path: []const u8) !void {
+    const cmd = try std.fmt.allocPrint(
+        alloc,
+        "mv -f '{s}' '{s}' && test -x '{s}' && echo GHOSTTY_SETUP_SUCCESS",
+        .{ tmp_path, dest_path, dest_path },
+    );
+    defer alloc.free(cmd);
+    const result = try sess.exec(cmd);
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    if (std.mem.indexOf(u8, result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
+        return error.RemoteUploadFailed;
+    }
+}
+
 /// Open a multiplexed channel to the remote ghostty's stdio-attach mode.
 /// Returns a Channel shared by all sessions to this host. Session creation
 /// happens via open frames, not CLI args.
@@ -752,12 +737,7 @@ fn uploadGhostty(
     const install_dir = try shared.remoteInstallDir(alloc, remote_home, remote_os);
     defer alloc.free(install_dir);
 
-    // Create the install directory and set restrictive permissions
-    const mkdir_cmd = try std.fmt.allocPrint(alloc, "mkdir -p '{s}' && chmod 700 '{s}'", .{ install_dir, install_dir });
-    defer alloc.free(mkdir_cmd);
-    const mkdir_result = try sess.exec(mkdir_cmd);
-    defer alloc.free(mkdir_result.stdout);
-    defer alloc.free(mkdir_result.stderr);
+    try ensureRemoteDir(alloc, sess, install_dir);
 
     // Upload via SCP to a temp file, then move into place to avoid
     // "Text file busy" when replacing a running binary.
@@ -775,77 +755,35 @@ fn uploadGhostty(
     // Notify via mailbox of upload start
     pushConnectionState(mailbox, .{ .uploading = .{ .bytes_sent = 0, .total_bytes = total_bytes, .source = source } });
 
-    const ProgressCtx = struct {
-        mbox: ?*Mailbox,
-        total: u64,
-        src: protocol.ConnectionState.ProvisionSource,
-
-        pub fn onProgress(ctx: @This(), bytes_sent: u64) void {
-            pushConnectionState(ctx.mbox, .{ .uploading = .{
-                .bytes_sent = bytes_sent,
-                .total_bytes = ctx.total,
-                .source = ctx.src,
-            } });
-        }
-    };
-    try sess.upload(local_binary_path, tmp_path, 0o700, ProgressCtx{ .mbox = mailbox, .total = total_bytes, .src = source });
+    try sess.upload(local_binary_path, tmp_path, 0o700, UploadProgressCtx{ .mbox = mailbox, .total = total_bytes, .src = source });
 
     try stderr.writeAll("Done.\n");
     try stderr.flush();
 
-    // Move into final location
-    const mv_cmd = try std.fmt.allocPrint(
-        alloc,
-        "mv -f '{s}' '{s}' && test -x '{s}' && echo GHOSTTY_SETUP_SUCCESS",
-        .{ tmp_path, remote_dest_path, remote_dest_path },
-    );
-    defer alloc.free(mv_cmd);
-    const mv_result = try sess.exec(mv_cmd);
-    defer alloc.free(mv_result.stdout);
-    defer alloc.free(mv_result.stderr);
-
-    if (std.mem.indexOf(u8, mv_result.stdout, "GHOSTTY_SETUP_SUCCESS") == null) {
-        try stderr.writeAll("Setup failed: could not install Ghostty on remote host.\n");
-        try stderr.flush();
-        return error.RemoteUploadFailed;
-    }
+    try moveAndVerifyRemoteBinary(alloc, sess, tmp_path, remote_dest_path);
 
     try stderr.writeAll("Ghostty installed successfully.\n");
     try stderr.flush();
 }
 
+const UploadProgressCtx = struct {
+    mbox: ?*Mailbox,
+    total: u64,
+    src: protocol.ConnectionState.ProvisionSource,
+
+    pub fn onProgress(ctx: @This(), bytes_sent: u64) void {
+        pushConnectionState(ctx.mbox, .{ .uploading = .{
+            .bytes_sent = bytes_sent,
+            .total_bytes = ctx.total,
+            .source = ctx.src,
+        } });
+    }
+};
+
 fn pushConnectionState(mailbox: ?*Mailbox, state: protocol.ConnectionState) void {
     if (mailbox) |m| {
         _ = m.push(.{ .connection_state = state }, .{ .forever = {} });
     }
-}
-
-/// Resolve the remote user's HOME directory by executing a command on the
-/// remote host. This is needed to construct secure per-user install paths
-/// for SCP uploads (shell variable expansion doesn't work in SCP paths).
-fn resolveRemoteHome(alloc: Allocator, sess: *ssh.SshSession) ![]const u8 {
-    const result = try sess.exec("printf '%s' \"$HOME\"");
-    defer alloc.free(result.stderr);
-
-    if (result.exit_code != 0 or result.stdout.len == 0) {
-        alloc.free(result.stdout);
-        return error.RemoteCommandFailed;
-    }
-
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) {
-        alloc.free(result.stdout);
-        return error.RemoteCommandFailed;
-    }
-
-    // If the trimmed result is the same slice as stdout, return it directly.
-    // Otherwise, dupe the trimmed portion and free the original.
-    if (trimmed.ptr == result.stdout.ptr and trimmed.len == result.stdout.len) {
-        return result.stdout;
-    }
-    const home = try alloc.dupe(u8, trimmed);
-    alloc.free(result.stdout);
-    return home;
 }
 
 fn platformMatches(local_os: []const u8, remote_os: []const u8) bool {

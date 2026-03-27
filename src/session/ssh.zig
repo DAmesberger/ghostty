@@ -16,6 +16,8 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("unistd.h");
 });
 
+const shared = @import("shared.zig");
+
 const log = std.log.scoped(.session_ssh);
 
 /// POSIX EAGAIN as a negative value — this is what libssh2's transport layer
@@ -86,7 +88,7 @@ pub const SshSession = struct {
         target_host: []const u8,
         target_port: u16,
     ) !SshSession {
-        const target_host_z = try allocSentinel(self.alloc, target_host);
+        const target_host_z = try self.alloc.dupeZ(u8, target_host);
         defer self.alloc.free(target_host_z);
 
         const tunnel_ch = channelDirectTcpip(
@@ -142,7 +144,7 @@ pub const SshSession = struct {
 
     /// Authenticate using the SSH agent.
     pub fn authAgent(self: *SshSession, username: []const u8) !void {
-        const user_z = try allocSentinel(self.alloc, username);
+        const user_z = try self.alloc.dupeZ(u8, username);
         defer self.alloc.free(user_z);
 
         const agent = ssh2.libssh2_agent_init(self.session) orelse return error.SshAgentFailed;
@@ -170,13 +172,10 @@ pub const SshSession = struct {
 
     /// Authenticate with a password.
     pub fn authPassword(self: *SshSession, username: []const u8, password: []const u8) !void {
-        const user_z = try allocSentinel(self.alloc, username);
+        const user_z = try self.alloc.dupeZ(u8, username);
         defer self.alloc.free(user_z);
-        const pass_z = try allocSentinel(self.alloc, password);
-        defer {
-            @memset(@constCast(pass_z), 0);
-            self.alloc.free(pass_z);
-        }
+        const pass_z = try self.alloc.dupeZ(u8, password);
+        defer shared.secureZeroAndFree(self.alloc, pass_z);
 
         if (userauthPassword(
             self.session,
@@ -197,21 +196,18 @@ pub const SshSession = struct {
         privkey_path: []const u8,
         passphrase: ?[]const u8,
     ) !void {
-        const user_z = try allocSentinel(self.alloc, username);
+        const user_z = try self.alloc.dupeZ(u8, username);
         defer self.alloc.free(user_z);
-        const priv_z = try allocSentinel(self.alloc, privkey_path);
+        const priv_z = try self.alloc.dupeZ(u8, privkey_path);
         defer self.alloc.free(priv_z);
 
         var pub_z: ?[:0]const u8 = null;
         defer if (pub_z) |p| self.alloc.free(p);
-        if (pubkey_path) |p| pub_z = try allocSentinel(self.alloc, p);
+        if (pubkey_path) |p| pub_z = try self.alloc.dupeZ(u8, p);
 
         var pass_z: ?[:0]const u8 = null;
-        defer if (pass_z) |p| {
-            @memset(@constCast(p), 0);
-            self.alloc.free(p);
-        };
-        if (passphrase) |p| pass_z = try allocSentinel(self.alloc, p);
+        defer if (pass_z) |p| shared.secureZeroAndFree(self.alloc, p);
+        if (passphrase) |p| pass_z = try self.alloc.dupeZ(u8, p);
 
         const rc = ssh2.libssh2_userauth_publickey_fromfile(
             self.session,
@@ -356,7 +352,7 @@ pub const SshSession = struct {
         const stat = try file.stat();
         const file_size: usize = @intCast(stat.size);
 
-        const remote_z = try allocSentinel(self.alloc, remote_path);
+        const remote_z = try self.alloc.dupeZ(u8, remote_path);
         defer self.alloc.free(remote_z);
 
         const was_blocking = ssh2.libssh2_session_get_blocking(self.session);
@@ -537,7 +533,7 @@ pub const Channel = struct {
     /// Execute a command on this channel. Uses non-blocking polling
     /// internally so it works through tunneled connections.
     pub fn exec(self: *Channel, command: []const u8) !void {
-        const cmd_z = try allocSentinel(self.alloc, command);
+        const cmd_z = try self.alloc.dupeZ(u8, command);
         defer self.alloc.free(cmd_z);
 
         const was_blocking = ssh2.libssh2_session_get_blocking(self.ssh_session);
@@ -557,7 +553,7 @@ pub const Channel = struct {
 
     /// Request a PTY on this channel.
     pub fn requestPty(self: *Channel, term: []const u8, width: u32, height: u32) !void {
-        const term_z = try allocSentinel(self.alloc, term);
+        const term_z = try self.alloc.dupeZ(u8, term);
         defer self.alloc.free(term_z);
 
         if (ssh2.libssh2_channel_request_pty_ex(
@@ -721,7 +717,7 @@ fn verifyHostKey(
         return;
     };
     defer alloc.free(known_hosts_path);
-    const kh_path_z = allocSentinel(alloc, known_hosts_path) catch {
+    const kh_path_z = alloc.dupeZ(u8, known_hosts_path) catch {
         log.warn("failed to allocate known_hosts path", .{});
         return;
     };
@@ -746,7 +742,7 @@ fn verifyHostKey(
         kh_key_type;
 
     // Null-terminate host for C API
-    const host_z = allocSentinel(alloc, host) catch {
+    const host_z = alloc.dupeZ(u8, host) catch {
         log.warn("failed to allocate host string for verification", .{});
         return;
     };
@@ -853,15 +849,13 @@ fn logSshError(session: *ssh2.LIBSSH2_SESSION, prefix: []const u8) void {
 const tcp_connect_timeout_ms = 30_000;
 
 fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
-    const host_z = try std.heap.page_allocator.allocSentinel(u8, host.len, 0);
+    const host_z = try std.heap.page_allocator.dupeZ(u8, host);
     defer std.heap.page_allocator.free(host_z);
-    @memcpy(host_z, host);
 
     var port_buf: [6]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
-    const port_z = try std.heap.page_allocator.allocSentinel(u8, port_str.len, 0);
+    const port_z = try std.heap.page_allocator.dupeZ(u8, port_str);
     defer std.heap.page_allocator.free(port_z);
-    @memcpy(port_z, port_str);
 
     var hints: c.struct_addrinfo = std.mem.zeroes(c.struct_addrinfo);
     hints.ai_family = c.AF_UNSPEC;
@@ -937,12 +931,6 @@ fn waitsocketTimeout(sess: *ssh2.LIBSSH2_SESSION, sock: posix.fd_t, timeout_ms: 
     if (events == 0) events = c.POLLIN | c.POLLOUT;
     var fds = [1]c.struct_pollfd{.{ .fd = sock, .events = events, .revents = 0 }};
     _ = c.poll(&fds, 1, timeout_ms);
-}
-
-fn allocSentinel(alloc: Allocator, data: []const u8) ![:0]const u8 {
-    const buf = try alloc.allocSentinel(u8, data.len, 0);
-    @memcpy(buf, data);
-    return buf;
 }
 
 // -- Wrappers for libssh2 macros that Zig's @cImport can't translate --

@@ -99,6 +99,13 @@ pub fn allViewersSupportsCompression(viewers: []const @import("remote_session.zi
     return viewers.len > 0;
 }
 
+/// Zero-fill a buffer before freeing it, preventing sensitive data
+/// (passwords, keys) from lingering in deallocated memory.
+pub fn secureZeroAndFree(alloc: Allocator, buf: []const u8) void {
+    @memset(@constCast(buf), 0);
+    alloc.free(@constCast(buf));
+}
+
 pub const ControlCommand = enum {
     detach,
     reconnect,

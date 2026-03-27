@@ -513,24 +513,26 @@ const Daemon = struct {
                 // first leaf from the serialized layout (preserves tab
                 // order) and fall back to firstAliveSurface() if layout
                 // parsing fails or the surface isn't found.
+                // Dupe the layout blob once under mutex — used for both
+                // first-leaf lookup and the opened response payload.
+                const layout_blob: ?[]u8 = lbl: {
+                    group.mutex.lock();
+                    defer group.mutex.unlock();
+                    break :lbl if (group.layout_blob) |blob|
+                        (self.alloc.dupe(u8, blob) catch null)
+                    else
+                        null;
+                };
+                defer if (layout_blob) |d| self.alloc.free(d);
+
                 const sess = if (!session.shared.isZeroUuid(open_data.surface_id)) blk: {
                     group.mutex.lock();
                     defer group.mutex.unlock();
                     break :blk group.surfaces.get(open_data.surface_id);
                 } else blk: {
-                    // Try layout-aware lookup first.
-                    // Dupe the blob under mutex to avoid use-after-free
-                    // (another thread could free group.layout_blob).
-                    const layout_blob_dupe = lbl: {
-                        group.mutex.lock();
-                        defer group.mutex.unlock();
-                        break :lbl if (group.layout_blob) |blob|
-                            (self.alloc.dupe(u8, blob) catch null)
-                        else
-                            null;
-                    };
-                    defer if (layout_blob_dupe) |d| self.alloc.free(d);
-                    if (layout_blob_dupe) |blob| {
+                    // Try layout-aware lookup: prefer the first leaf from
+                    // serialized layout to preserve tab order.
+                    if (layout_blob) |blob| {
                         if (session.layout.findFirstLeafId(blob)) |first_id| {
                             group.mutex.lock();
                             const candidate = group.surfaces.get(first_id);
@@ -546,19 +548,6 @@ const Daemon = struct {
                     // Fall back to arbitrary alive surface
                     break :blk group.firstAliveSurface();
                 };
-
-                // Send opened response with layout and attached surface_id.
-                // Dupe the blob under mutex to avoid use-after-free.
-                const layout_blob_owned = lbl: {
-                    group.mutex.lock();
-                    defer group.mutex.unlock();
-                    break :lbl if (group.layout_blob) |blob|
-                        (self.alloc.dupe(u8, blob) catch null)
-                    else
-                        null;
-                };
-                defer if (layout_blob_owned) |d| self.alloc.free(d);
-                const layout_blob = layout_blob_owned;
 
                 const attached_sid = if (sess) |s| s.surface_id else session.shared.zero_uuid;
 

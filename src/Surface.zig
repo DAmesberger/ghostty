@@ -153,10 +153,6 @@ pending_layout_restore: ?[]const u8 = null,
 pending_layout_group_id: session.shared.Uuid = session.shared.zero_uuid,
 pending_layout_surface_id: session.shared.Uuid = session.shared.zero_uuid,
 
-/// Scrollback restore progress for remote sessions (updated by SSH thread).
-scrollback_progress_received: u32 = 0,
-scrollback_progress_total: u32 = 0,
-
 /// Multi-viewer state (updated from viewer_state frames).
 viewer_id: session.shared.Uuid = session.shared.zero_uuid,
 viewer_count: u16 = 0,
@@ -1328,8 +1324,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .scrollback_progress => |sp| {
-            self.scrollback_progress_received = sp.received;
-            self.scrollback_progress_total = sp.total;
             const loading = sp.total > 0 and sp.received < sp.total;
             if (@hasDecl(apprt.runtime.Surface, "setScrollbackLoading")) {
                 self.rt_surface.setScrollbackLoading(loading);

@@ -86,12 +86,9 @@ pub const RemoteSession = struct {
     /// Must be called with mutex held.
     pub fn computeHistoryRows(self: *RemoteSession) u32 {
         const s: *Screen = self.terminal_instance.screens.active;
-        var total: u32 = 0;
-        var row_it = s.pages.rowIterator(.right_down, .{ .history = .{} }, null);
-        while (row_it.next()) |_| {
-            total += 1;
-        }
-        return total;
+        const total = s.pages.total_rows;
+        const viewport = s.pages.rows;
+        return @intCast(if (total > viewport) total - viewport else 0);
     }
 
     /// Find a viewer by fd. Must be called with mutex held.
@@ -118,47 +115,34 @@ pub const RemoteSession = struct {
     /// Must be called with mutex held.
     fn recalculateSize(self: *RemoteSession) void {
         if (self.viewers.items.len == 0) return;
+        var rows: u16 = undefined;
+        var cols: u16 = undefined;
         switch (self.size_mode) {
             .smallest_wins => {
-                var rows: u16 = std.math.maxInt(u16);
-                var cols: u16 = std.math.maxInt(u16);
+                rows = std.math.maxInt(u16);
+                cols = std.math.maxInt(u16);
                 for (self.viewers.items) |v| {
                     rows = @min(rows, v.rows);
                     cols = @min(cols, v.cols);
                 }
-                self.pty.setSize(.{
-                    .ws_row = rows,
-                    .ws_col = cols,
-                    .ws_xpixel = 0,
-                    .ws_ypixel = 0,
-                }) catch {};
             },
             .leader_wins => {
                 // Leader is whoever has control (controller_id).
-                for (self.viewers.items) |v| {
-                    if (std.mem.eql(u8, &v.viewer_id, &self.controller_id)) {
-                        self.pty.setSize(.{
-                            .ws_row = v.rows,
-                            .ws_col = v.cols,
-                            .ws_xpixel = 0,
-                            .ws_ypixel = 0,
-                        }) catch {};
-                        return;
-                    }
-                }
-                // No controller found — use first viewer's size.
-                self.pty.setSize(.{
-                    .ws_row = self.viewers.items[0].rows,
-                    .ws_col = self.viewers.items[0].cols,
-                    .ws_xpixel = 0,
-                    .ws_ypixel = 0,
-                }) catch {};
+                const leader = for (self.viewers.items) |v| {
+                    if (std.mem.eql(u8, &v.viewer_id, &self.controller_id)) break v;
+                } else self.viewers.items[0];
+                rows = leader.rows;
+                cols = leader.cols;
             },
         }
+        self.pty.setSize(.{
+            .ws_row = rows,
+            .ws_col = cols,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        }) catch {};
     }
 
-    /// Broadcast a viewer_state frame to all connected viewers.
-    /// Must be called with mutex held.
     /// Force-disconnect a viewer by UUID. Must be called with mutex held.
     /// If viewer_id is zero_uuid, kick all viewers EXCEPT the one on `sender_fd`.
     pub fn kickViewer(self: *RemoteSession, viewer_id: Uuid, sender_fd: posix.fd_t) void {
@@ -244,18 +228,6 @@ pub const RemoteSession = struct {
             }
         }
 
-        // Direct write to stderr (daemon.log) — std.log.info is no-op in release.
-        {
-            var dbuf: [512]u8 = undefined;
-            const dmsg = std.fmt.bufPrint(&dbuf, "broadcast: reason={s} label='{s}' len={d} override={any}\n", .{
-                @tagName(reason),
-                group_label,
-                group_label.len,
-                label_override != null,
-            }) catch "";
-            _ = posix.write(2, dmsg) catch {};
-        }
-
         const state = session.protocol.ViewerState{
             .reason = reason,
             .size_mode = self.size_mode,
@@ -275,11 +247,34 @@ pub const RemoteSession = struct {
         }
     }
 
+    /// Update group label and/or color, then broadcast to all viewers.
+    /// Returns false if the label allocation failed (caller should skip frame).
+    fn updateGroupMeta(self: *RemoteSession, label: ?[]const u8, color: ?i8) bool {
+        const group = self.group orelse return true;
+        group.mutex.lock();
+        if (label) |l| {
+            const new_label = session.shared.sanitizeLabelAlloc(self.alloc, l) catch {
+                group.mutex.unlock();
+                return false;
+            };
+            self.alloc.free(group.label);
+            group.label = new_label;
+        }
+        if (color) |c| group.color = c;
+        for (group.surfaces.values()) |surf| {
+            surf.mutex.lock();
+            surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
+            surf.mutex.unlock();
+        }
+        group.mutex.unlock();
+        return true;
+    }
+
     pub fn deinit(self: *RemoteSession) void {
         self.viewers.deinit(self.alloc);
         self.stream.handler.deinit();
         self.terminal_instance.deinit(self.alloc);
-        closeFd(self.pty.master);
+        posix.close(self.pty.master);
         self.alloc.free(self.command.path);
         self.alloc.free(self.command.args);
         self.alloc.free(self.id);
@@ -367,8 +362,19 @@ pub const RemoteSession = struct {
         // Flush remaining.
         if (accum.items.len > 0) {
             self.mutex.lock();
+            const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
             for (self.viewers.items) |viewer| {
-                sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                if (use_compression) {
+                    session.shared.sendFrameFdCompressed(
+                        viewer.fd,
+                        .data_out,
+                        viewer.target,
+                        accum.items,
+                        self.alloc,
+                    ) catch {};
+                } else {
+                    sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
+                }
             }
             self.mutex.unlock();
         }
@@ -514,18 +520,8 @@ pub const RemoteSession = struct {
         defer self.alloc.free(chunk.data);
 
         if (chunk.rows_serialized == 0) {
-            // Send done marker
             history_sent.* = total_history;
-            const done_resp = session.protocol.ScrollbackResponse{
-                .total_history_rows = total_history,
-                .chunk_start_row = history_sent.*,
-                .row_count = 0,
-                .cols = cols,
-                .chunk_data = "",
-            };
-            const done_payload = done_resp.encode(self.alloc) catch return;
-            defer self.alloc.free(done_payload);
-            sendFrameFd(fd, .scrollback_response, target, done_payload) catch {};
+            self.sendScrollbackDone(fd, target, total_history, history_sent.*, cols);
             return;
         }
 
@@ -542,22 +538,25 @@ pub const RemoteSession = struct {
 
         history_sent.* += chunk.rows_serialized;
 
-        // If we just finished, send done marker
         if (history_sent.* >= total_history) {
-            const done_resp = session.protocol.ScrollbackResponse{
-                .total_history_rows = total_history,
-                .chunk_start_row = history_sent.*,
-                .row_count = 0,
-                .cols = cols,
-                .chunk_data = "",
-            };
-            const done_payload = done_resp.encode(self.alloc) catch return;
-            defer self.alloc.free(done_payload);
-            sendFrameFd(fd, .scrollback_response, target, done_payload) catch {};
+            self.sendScrollbackDone(fd, target, total_history, history_sent.*, cols);
         }
     }
 
     /// Process complete frames from a viewer's input buffer.
+    fn sendScrollbackDone(self: *RemoteSession, fd: posix.fd_t, target: u16, total_history: u32, chunk_start: u32, cols: u16) void {
+        const done_resp = session.protocol.ScrollbackResponse{
+            .total_history_rows = total_history,
+            .chunk_start_row = chunk_start,
+            .row_count = 0,
+            .cols = cols,
+            .chunk_data = "",
+        };
+        const done_payload = done_resp.encode(self.alloc) catch return;
+        defer self.alloc.free(done_payload);
+        sendFrameFd(fd, .scrollback_response, target, done_payload) catch {};
+    }
+
     /// Returns true if the connection should be closed.
     fn processClientFrames(
         self: *RemoteSession,
@@ -647,35 +646,11 @@ pub const RemoteSession = struct {
                         shiftBuf(frame_buf, total);
                         continue;
                     };
-                    // Diagnostic: log rename frame with raw scope byte.
-                    {
-                        var dbuf: [256]u8 = undefined;
-                        const dmsg = std.fmt.bufPrint(&dbuf, "rename: raw_scope_byte={d} scope={s} label='{s}' payload_len={d}\n", .{
-                            payload[0],
-                            @tagName(rename_data.scope),
-                            rename_data.label,
-                            payload.len,
-                        }) catch "";
-                        _ = posix.write(2, dmsg) catch {};
-                    }
-                    if (self.group) |group| {
-                        group.mutex.lock();
-                        if (rename_data.scope == .group) {
-                            const new_label = session.shared.sanitizeLabelAlloc(self.alloc, rename_data.label) catch {
-                                group.mutex.unlock();
-                                shiftBuf(frame_buf, total);
-                                continue;
-                            };
-                            self.alloc.free(group.label);
-                            group.label = new_label;
-                            // Pass label/color explicitly — group.mutex is held.
-                            for (group.surfaces.values()) |surf| {
-                                surf.mutex.lock();
-                                surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
-                                surf.mutex.unlock();
-                            }
+                    if (rename_data.scope == .group) {
+                        if (!self.updateGroupMeta(rename_data.label, null)) {
+                            shiftBuf(frame_buf, total);
+                            continue;
                         }
-                        group.mutex.unlock();
                     }
                 },
                 .session_meta => {
@@ -683,28 +658,10 @@ pub const RemoteSession = struct {
                         shiftBuf(frame_buf, total);
                         continue;
                     };
-                    if (self.group) |group| {
-                        group.mutex.lock();
-                        // Update label
-                        if (meta.label.len > 0) {
-                            const new_label = session.shared.sanitizeLabelAlloc(self.alloc, meta.label) catch {
-                                group.mutex.unlock();
-                                shiftBuf(frame_buf, total);
-                                continue;
-                            };
-                            self.alloc.free(group.label);
-                            group.label = new_label;
-                        }
-                        // Update color
-                        group.color = meta.color;
-                        // Broadcast to all surfaces — pass label/color explicitly
-                        // since group.mutex is held.
-                        for (group.surfaces.values()) |surf| {
-                            surf.mutex.lock();
-                            surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
-                            surf.mutex.unlock();
-                        }
-                        group.mutex.unlock();
+                    const label = if (meta.label.len > 0) meta.label else null;
+                    if (!self.updateGroupMeta(label, meta.color)) {
+                        shiftBuf(frame_buf, total);
+                        continue;
                     }
                 },
                 .layout => {
@@ -888,6 +845,3 @@ fn emitColorSGR(w: anytype, color: terminal.Style.Color, base: u8) !void {
 
 const sendFrameFd = session.shared.sendFrameFd;
 
-fn closeFd(fd: posix.fd_t) void {
-    posix.close(fd);
-}
