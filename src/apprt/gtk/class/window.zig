@@ -2513,6 +2513,10 @@ pub const Window = extern struct {
         }
 
         const parsed = session.shared.parseSshTarget(raw);
+
+        // Record in recent connections history.
+        @import("ssh_connection_overlay.zig").saveRecentConnection(Application.default().allocator(), raw);
+
         const mode = self.private().ssh_mode;
         switch (mode) {
             .new_window => Application.default().newSshWindow(parsed.target, null, parsed.jump),
