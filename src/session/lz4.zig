@@ -110,7 +110,7 @@ pub fn decompress(alloc: Allocator, src: []const u8, orig_len: usize) ![]u8 {
         }
 
         // Copy literals.
-        if (sp + lit_len > src.len or dp + lit_len > orig_len)
+        if (lit_len > src.len - sp or lit_len > orig_len - dp)
             return error.InvalidLz4Data;
         @memcpy(dst[dp..][0..lit_len], src[sp..][0..lit_len]);
         sp += lit_len;
@@ -120,7 +120,7 @@ pub fn decompress(alloc: Allocator, src: []const u8, orig_len: usize) ![]u8 {
         if (sp >= src.len) break;
 
         // Match offset (2 bytes LE).
-        if (sp + 2 > src.len) return error.InvalidLz4Data;
+        if (src.len - sp < 2) return error.InvalidLz4Data;
         const offset: usize = @as(u16, src[sp]) | (@as(u16, src[sp + 1]) << 8);
         sp += 2;
         if (offset == 0 or offset > dp) return error.InvalidLz4Data;
@@ -137,7 +137,7 @@ pub fn decompress(alloc: Allocator, src: []const u8, orig_len: usize) ![]u8 {
         }
 
         // Copy match (may overlap — byte-by-byte for correctness).
-        if (dp + match_len > orig_len) return error.InvalidLz4Data;
+        if (match_len > orig_len - dp) return error.InvalidLz4Data;
         const match_src = dp - offset;
         for (0..match_len) |i| {
             dst[dp + i] = dst[match_src + i];

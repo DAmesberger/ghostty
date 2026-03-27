@@ -434,6 +434,9 @@ pub const ViewerState = struct {
         const viewer_count = std.mem.readInt(u16, payload[25..27], .little);
         const label_end = fixed_size + label_len;
         if (payload.len < label_end) return error.InvalidViewerStatePayload;
+        // Each viewer needs at least viewer_fixed_size bytes (label is variable on top).
+        if (payload.len - label_end < @as(usize, viewer_count) * viewer_fixed_size)
+            return error.InvalidViewerStatePayload;
         return .{
             .reason = std.meta.intToEnum(ViewerStateReason, payload[0]) catch return error.InvalidViewerStatePayload,
             .size_mode = std.meta.intToEnum(SizeMode, payload[1]) catch return error.InvalidViewerStatePayload,
@@ -577,7 +580,7 @@ pub const ListResponse = struct {
             offset += 8;
             const label_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
             offset += 2;
-            if (offset + label_len > payload.len) return error.InvalidListPayload;
+            if (label_len > payload.len - offset) return error.InvalidListPayload;
             entries[i] = .{
                 .group_id = group_id,
                 .status = status,
@@ -702,22 +705,22 @@ pub const Opened = struct {
         // Label
         const label_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
         offset += 2;
-        if (offset + label_len > payload.len) return error.InvalidOpenedPayload;
+        if (label_len > payload.len - offset) return error.InvalidOpenedPayload;
         const label = payload[offset..][0..label_len];
         offset += label_len;
-        // Color
-        if (offset >= payload.len) return error.InvalidOpenedPayload;
+        // Remaining fixed fields: color(1) + layout_len(4) + state_count(2) = 7
+        if (payload.len - offset < 7) return error.InvalidOpenedPayload;
         const color: i8 = @bitCast(payload[offset]);
         offset += 1;
         const layout_len = std.mem.readInt(u32, payload[offset..][0..4], .little);
         offset += 4;
-        if (offset + layout_len > payload.len) return error.InvalidOpenedPayload;
+        if (payload.len - offset < layout_len) return error.InvalidOpenedPayload;
         const layout_blob: ?[]const u8 = if (layout_len > 0)
             payload[offset..][0..layout_len]
         else
             null;
         offset += layout_len;
-        if (offset + 2 > payload.len) return error.InvalidOpenedPayload;
+        // state_count already covered by the 7-byte check above
         const state_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
         offset += 2;
         return .{

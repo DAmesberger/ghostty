@@ -1283,10 +1283,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             self.pending_layout_group_id = lr.group_id;
             self.pending_layout_surface_id = lr.surface_id;
             defer {
-                lr.deinit();
+                // Null pointers before freeing to avoid dangling references.
                 self.pending_layout_restore = null;
                 self.pending_layout_group_id = session.shared.zero_uuid;
                 self.pending_layout_surface_id = session.shared.zero_uuid;
+                lr.deinit();
             }
             _ = try self.rt_app.performAction(
                 .{ .surface = self },

@@ -147,12 +147,10 @@ pub fn threadEnter(
             if (state == .failed) return error.SshConnectionFailed;
             std.Thread.sleep(1_000_000); // 1ms
         }
-        // Hold mutex when verifying channel after state transition
-        // to prevent race with reconnect nulling channel
-        self.connection_manager.mutex.lock();
-        const has_channel = entry.channel != null;
-        self.connection_manager.mutex.unlock();
-        if (!has_channel) return error.SshConnectionFailed;
+        // Verify the connection is still ready — conn_state is atomic,
+        // so no mutex needed. This avoids a TOCTOU with the reconnect
+        // thread that may null entry.channel between our check and use.
+        if (entry.conn_state.load(.acquire) != .ready) return error.SshConnectionFailed;
     }
 
     // Connection is fully established — now safe to expose the entry

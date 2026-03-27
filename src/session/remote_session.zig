@@ -104,11 +104,17 @@ pub const RemoteSession = struct {
         var i: usize = 0;
         while (i < self.viewers.items.len) {
             if (self.viewers.items[i].fd == fd) {
-                _ = self.viewers.swapRemove(i);
+                const removed = self.viewers.swapRemove(i);
+                freeViewerLabel(self.alloc, removed.label);
                 return;
             }
             i += 1;
         }
+    }
+
+    /// Free a heap-allocated viewer label.
+    fn freeViewerLabel(alloc: Allocator, label: []const u8) void {
+        if (label.len > 0) alloc.free(@constCast(label));
     }
 
     /// Recalculate and apply PTY size based on all viewers and current mode.
@@ -253,6 +259,7 @@ pub const RemoteSession = struct {
     }
 
     pub fn deinit(self: *RemoteSession) void {
+        for (self.viewers.items) |v| freeViewerLabel(self.alloc, v.label);
         self.viewers.deinit(self.alloc);
         self.stream.handler.deinit();
         self.terminal_instance.deinit(self.alloc);
@@ -374,7 +381,10 @@ pub const RemoteSession = struct {
         // Add viewer to list — multi-viewer: no rejection.
         // Copy the label string — open_data.label is a slice into the
         // caller's payload buffer which may be freed after this returns.
-        const viewer_label = self.alloc.dupe(u8, open_data.label) catch "";
+        const viewer_label = self.alloc.dupe(u8, open_data.label) catch {
+            self.mutex.unlock();
+            return error.OutOfMemory;
+        };
         self.viewers.append(self.alloc, .{
             .fd = fd,
             .target = target,
@@ -384,6 +394,7 @@ pub const RemoteSession = struct {
             .cols = open_data.resize.cols,
             .compression_enabled = open_data.compression_enabled != 0,
         }) catch {
+            self.alloc.free(viewer_label);
             self.mutex.unlock();
             return error.OutOfMemory;
         };

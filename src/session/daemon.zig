@@ -370,7 +370,10 @@ pub const SessionGroup = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.layout_blob) |old| alloc.free(old);
-        self.layout_blob = alloc.dupe(u8, blob) catch null;
+        self.layout_blob = alloc.dupe(u8, blob) catch |err| blk: {
+            log.warn("failed to store layout blob: {}", .{err});
+            break :blk null;
+        };
     }
 
     /// Update the group label and/or color, then broadcast to all surface viewers.
@@ -489,15 +492,17 @@ const Daemon = struct {
                     if (open_data.label.len > 0) {
                         if (self.findGroup(open_data.label)) |g| break :blk g;
                     }
-                    self.mutex.unlock();
 
                     // If a label was provided, create a new group with that
                     // name (named session create-or-attach semantics).
+                    // Hold the lock through lookup-or-create to prevent
+                    // duplicate groups from concurrent attach requests.
                     if (open_data.label.len > 0) {
-                        const new_group = self.createGroup(
+                        const new_group = self.createGroupLocked(
                             open_data.label,
                             session.shared.generateUuid(),
                         ) catch {
+                            self.mutex.unlock();
                             sendFrameFd(fd, .err, target, "failed to create session") catch {};
                             return;
                         };
@@ -505,10 +510,11 @@ const Daemon = struct {
                         break :blk new_group;
                     }
 
+                    self.mutex.unlock();
                     sendFrameFd(fd, .err, target, "session not found") catch {};
                     return;
                 };
-                if (!created_new) self.mutex.unlock();
+                self.mutex.unlock();
 
                 // Find the surface to attach to BEFORE sending opened,
                 // so we can include the attached surface_id.
@@ -743,7 +749,9 @@ const Daemon = struct {
         switch (rename_data.scope) {
             .group => {
                 const group = self.groups.get(rename_data.id) orelse return;
-                _ = group.updateLabel(self.alloc, rename_data.label, null);
+                if (!group.updateLabel(self.alloc, rename_data.label, null)) {
+                    log.warn("failed to update group label (OOM)", .{});
+                }
             },
             .surface => {
                 // Find the surface across all groups.
@@ -807,12 +815,32 @@ const Daemon = struct {
         sendFrameFd(fd, .opened, target, payload) catch {};
     }
 
+    /// Allocate and register a new session group. Acquires self.mutex internally.
     fn createGroup(self: *Daemon, raw_label: []const u8, group_id: Uuid) !*SessionGroup {
+        const group = try self.allocGroup(raw_label, group_id);
+        errdefer self.destroyGroup(group);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.groups.put(group.id, group);
+
+        return group;
+    }
+
+    /// Like createGroup but assumes self.mutex is already held.
+    fn createGroupLocked(self: *Daemon, raw_label: []const u8, group_id: Uuid) !*SessionGroup {
+        const group = try self.allocGroup(raw_label, group_id);
+        errdefer self.destroyGroup(group);
+        try self.groups.put(group.id, group);
+        return group;
+    }
+
+    /// Allocate a SessionGroup without registering it.
+    fn allocGroup(self: *Daemon, raw_label: []const u8, group_id: Uuid) !*SessionGroup {
         const label = try session.shared.sanitizeLabelAlloc(self.alloc, raw_label);
         errdefer self.alloc.free(label);
 
         const group = try self.alloc.create(SessionGroup);
-        errdefer self.alloc.destroy(group);
         group.* = .{
             .alloc = self.alloc,
             .id = group_id,
@@ -821,12 +849,12 @@ const Daemon = struct {
             .surfaces = std.AutoArrayHashMap(Uuid, *RemoteSession).init(self.alloc),
             .created_at = std.time.timestamp(),
         };
-
-        self.mutex.lock();
-        try self.groups.put(group.id, group);
-        self.mutex.unlock();
-
         return group;
+    }
+
+    fn destroyGroup(self: *Daemon, group: *SessionGroup) void {
+        self.alloc.free(group.label);
+        self.alloc.destroy(group);
     }
 
     fn createSurface(
