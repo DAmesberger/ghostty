@@ -62,7 +62,7 @@ keybind = ctrl+shift+r=ssh_session_reconnect
 
 Unified command for managing remote sessions. When `--ssh` is provided, the
 command connects to the remote host first and executes there. Without `--ssh`,
-it runs locally (used by the remote helper).
+it runs locally (used by the remote daemon).
 
 **List sessions:**
 
@@ -97,9 +97,9 @@ Output for `--list` shows session groups:
 a1b2c3d4e5f6...  my-project  2 surfaces  attached
 ```
 
-### `+ssh-session` remote helper modes
+### `+ssh-session` remote daemon modes
 
-The `+ssh-session` subcommand is the remote helper binary invoked on the SSH
+The `+ssh-session` subcommand is the remote daemon binary invoked on the SSH
 target. It is not typically run by the user directly. The client uploads a
 copy of the Ghostty binary to the remote host and invokes it with one of the
 following modes.
@@ -111,13 +111,13 @@ following modes.
 | `--list` | Print all active sessions to stdout (group UUIDs, labels, surface counts). |
 | `--kill=<id>` | Kill a session by group UUID or label. |
 | `--stdio-attach` | Run the multiplexer: connect to the daemon socket and bridge stdin/stdout to the binary protocol. This is the mode used over the SSH channel. |
-| `--protocol-version` | Print `GHOSTTY_SESSION_PROTOCOL <version>` and exit. The client uses this to decide whether the remote helper needs to be re-uploaded. |
+| `--protocol-version` | Print `GHOSTTY_SESSION_PROTOCOL <version>` and exit. The client uses this to decide whether the remote daemon needs to be re-uploaded. |
 | `--session=<id>` | Session ID for attach operations (used with `--stdio-attach`). |
 | `--label=<name>` | Session label for new session creation. |
 | `--new` | Force creation of a new session (used with `--stdio-attach`). |
 | `--kill-daemon` | Connect to the daemon socket and signal graceful shutdown, then remove the socket file. |
 
-Remote helper install paths:
+Remote daemon install paths:
 
 - Linux/FreeBSD: `~/.local/state/ghostty/bin/ghostty`
 - macOS: `~/Library/Application Support/com.ghostty/bin/ghostty`
@@ -202,7 +202,7 @@ shared connection pool keyed by `(ssh_target, jump)`. Multiple surfaces
 
 - One `Entry` in the pool.
 - One SSH connection (libssh2 session).
-- One SSH channel to the remote helper/multiplexer process.
+- One SSH channel to the remote daemon/multiplexer process.
 - One dedicated SSH I/O thread.
 
 The pool key is `"ssh_target"` or `"ssh_target|jump"` if a jump host is
@@ -241,7 +241,7 @@ complete frames from a buffer, and flushes the write queue.
 
 ### Keepalive Mechanism
 
-Both client and remote helper exchange `keepalive` frames at regular
+Both client and remote daemon exchange `keepalive` frames at regular
 intervals. Constants (from `src/session/protocol.zig`):
 
 | Constant | Value | Description |
@@ -251,7 +251,7 @@ intervals. Constants (from `src/session/protocol.zig`):
 | `keepalive_server_timeout_ns` | 60 s | Server (daemon) closes connection if no keepalive received within this window. |
 
 Stale detection only activates after the first keepalive is received from
-the remote, ensuring backward compatibility with older helpers that do not
+the remote, ensuring backward compatibility with older daemons that do not
 support keepalive.
 
 ### Reconnection
@@ -262,7 +262,7 @@ enters a reconnect loop:
 1. Notify all surfaces with `ConnectionState.reconnecting`.
 2. Wait according to the configured backoff strategy.
 3. Re-establish the SSH connection.
-4. Re-upload the helper if the protocol version changed.
+4. Re-upload the daemon if the protocol version changed.
 5. Restart the daemon if the binary was re-uploaded.
 6. Open a new multiplexer channel.
 7. For each registered surface, send `session_open(mode=attach)` or `surface_open(mode=attach)` to reattach.

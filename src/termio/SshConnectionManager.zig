@@ -503,8 +503,7 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
 
         // Zero and free password if one was provided
         if (entry.auth_state.password) |pw| {
-            @memset(@constCast(pw), 0);
-            entry.alloc.free(pw);
+            session.shared.secureZeroAndFree(entry.alloc, pw);
             entry.auth_state.password = null;
         }
 

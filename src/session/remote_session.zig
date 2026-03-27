@@ -67,7 +67,7 @@ pub const RemoteSession = struct {
     closed: bool = false,
     reader_thread: std.Thread = undefined,
 
-    pub const SessionGroup = @import("helper.zig").SessionGroup;
+    pub const SessionGroup = @import("daemon.zig").SessionGroup;
 
     pub const ViewerSlot = struct {
         fd: posix.fd_t,
@@ -247,27 +247,9 @@ pub const RemoteSession = struct {
         }
     }
 
-    /// Update group label and/or color, then broadcast to all viewers.
-    /// Returns false if the label allocation failed (caller should skip frame).
     fn updateGroupMeta(self: *RemoteSession, label: ?[]const u8, color: ?i8) bool {
         const group = self.group orelse return true;
-        group.mutex.lock();
-        if (label) |l| {
-            const new_label = session.shared.sanitizeLabelAlloc(self.alloc, l) catch {
-                group.mutex.unlock();
-                return false;
-            };
-            self.alloc.free(group.label);
-            group.label = new_label;
-        }
-        if (color) |c| group.color = c;
-        for (group.surfaces.values()) |surf| {
-            surf.mutex.lock();
-            surf.broadcastViewerStateWithLabel(.name_change, group.label, group.color);
-            surf.mutex.unlock();
-        }
-        group.mutex.unlock();
-        return true;
+        return group.updateLabel(self.alloc, label, color);
     }
 
     pub fn deinit(self: *RemoteSession) void {
@@ -336,24 +318,8 @@ pub const RemoteSession = struct {
                 break;
             }
 
-            // Flush accumulated data to all viewers.
             if (accum.items.len > 0) {
-                self.mutex.lock();
-                const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
-                for (self.viewers.items) |viewer| {
-                    if (use_compression) {
-                        session.shared.sendFrameFdCompressed(
-                            viewer.fd,
-                            .data_out,
-                            viewer.target,
-                            accum.items,
-                            self.alloc,
-                        ) catch {};
-                    } else {
-                        sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
-                    }
-                }
-                self.mutex.unlock();
+                self.flushToViewers(accum.items);
                 accum.clearRetainingCapacity();
                 last_flush = std.time.nanoTimestamp();
             }
@@ -361,22 +327,7 @@ pub const RemoteSession = struct {
 
         // Flush remaining.
         if (accum.items.len > 0) {
-            self.mutex.lock();
-            const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
-            for (self.viewers.items) |viewer| {
-                if (use_compression) {
-                    session.shared.sendFrameFdCompressed(
-                        viewer.fd,
-                        .data_out,
-                        viewer.target,
-                        accum.items,
-                        self.alloc,
-                    ) catch {};
-                } else {
-                    sendFrameFd(viewer.fd, .data_out, viewer.target, accum.items) catch {};
-                }
-            }
-            self.mutex.unlock();
+            self.flushToViewers(accum.items);
         }
 
         self.mutex.lock();
@@ -386,6 +337,26 @@ pub const RemoteSession = struct {
         }
         self.mutex.unlock();
         _ = self.command.wait(false) catch {};
+    }
+
+    /// Send accumulated data to all viewers, using compression if all support it.
+    fn flushToViewers(self: *RemoteSession, data: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const use_compression = session.shared.allViewersSupportsCompression(self.viewers.items);
+        for (self.viewers.items) |viewer| {
+            if (use_compression) {
+                session.shared.sendFrameFdCompressed(
+                    viewer.fd,
+                    .data_out,
+                    viewer.target,
+                    data,
+                    self.alloc,
+                ) catch {};
+            } else {
+                sendFrameFd(viewer.fd, .data_out, viewer.target, data) catch {};
+            }
+        }
     }
 
     /// Attach a client and begin serving.

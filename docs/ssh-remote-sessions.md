@@ -15,10 +15,9 @@ ghostty --ssh-target=user@host
 ghostty --ssh-target=user@host --ssh-jump=jump@gateway
 ```
 
-On first connect, Ghostty uploads a small helper binary to the remote
-host (`/tmp/ghostty-remote-session/bin/ghostty-session-helper`). A
-daemon process manages sessions on the remote, keeping them alive
-across disconnects.
+On first connect, Ghostty uploads a small daemon binary to the remote
+host. A daemon process manages sessions on the remote, keeping them
+alive across disconnects.
 
 ## Splits
 
@@ -128,7 +127,7 @@ the connection recovers.
 
 ### Keepalive and stale detection
 
-The client and remote helper exchange keepalive frames every 15 seconds.
+The client and remote daemon exchange keepalive frames every 15 seconds.
 If no keepalive is received for 45 seconds, the connection is marked
 stale and automatic reconnection begins.
 
@@ -139,7 +138,7 @@ exponential backoff (1s → 2s → 4s → ... up to 30s). The reconnect
 timeout defaults to 5 minutes. During reconnect:
 
 1. The SSH connection is re-established
-2. The helper daemon is restarted if needed
+2. The daemon is restarted if needed
 3. The session group is reattached (one `session_open` per group)
 4. The daemon sends the layout blob and VT snapshots
 5. The client recreates the split tree with correct surface sizes

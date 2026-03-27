@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const args = @import("args.zig");
 const Action = @import("ghostty.zig").Action;
-const helper = @import("../session/helper.zig");
+const daemon = @import("../session/daemon.zig");
 const session = @import("../session.zig");
 
 pub const Options = struct {
@@ -107,7 +107,7 @@ pub fn run(alloc: Allocator) !u8 {
     var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer_.interface;
 
-    const rc = try helper.run(alloc, .{
+    const rc = try daemon.run(alloc, .{
         .@"protocol-version" = opts.@"protocol-version",
         .daemonize = opts.daemonize,
         .daemon = opts.daemon,
