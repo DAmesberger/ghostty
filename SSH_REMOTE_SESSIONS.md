@@ -220,14 +220,18 @@ Multiple surfaces (tabs/splits) share one SSH channel per `(target, jump)` pair.
 
 ### Provisioning
 
-On first connect, Ghostty provisions `ghostty-daemon` on the remote host:
+On first connect, Ghostty ensures a compatible `ghostty-daemon` exists on the remote host. The resolution order:
 
-1. Check if `ghostty` is in PATH with matching protocol version
-2. Check for previously deployed `ghostty-daemon` in `~/.local/bin/`
-3. If platforms match: upload local binary via SCP
-4. If cross-platform: download matching binary from GitHub releases
+1. **Remote PATH check**: Is `ghostty` in PATH on the remote with a matching protocol version? If yes, use it directly — no provisioning needed.
+2. **Previously deployed daemon**: Does `ghostty-daemon` already exist at the install path with a matching protocol version? If yes, reuse it.
+3. **Upload local daemon** (same OS/arch only): Look for `ghostty-daemon` next to the local `ghostty` binary. If found and the remote has the same OS and architecture, upload it via SCP (with progress bar in the connection overlay).
+4. **Download from GitHub releases**: Download the `ghostty-daemon` binary for the remote's OS/arch from the fork's CI release. The remote runs `curl` directly to avoid double transfer (local download + upload). The connection overlay shows "Downloading..." during this step.
 
-Subsequent connections reuse the existing daemon if the version matches.
+**Install paths:**
+- Linux: `~/.local/state/ghostty/bin/ghostty-daemon`
+- macOS: `~/Library/Application Support/com.ghostty/bin/ghostty-daemon`
+
+Subsequent connections reuse the existing daemon as long as the protocol version matches. When the protocol version changes (e.g. after updating Ghostty), the daemon is automatically re-provisioned.
 
 ### Reconnection
 
