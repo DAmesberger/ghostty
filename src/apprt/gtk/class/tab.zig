@@ -16,6 +16,7 @@ const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
+const SshConnectionManager = @import("../../../termio/SshConnectionManager.zig");
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -307,13 +308,30 @@ pub const Tab = extern struct {
             self.as(gobject.Object).notifyByPspec(properties.@"tab-color".impl.param_spec);
         }
 
-        // Tab titles are now persisted in the window-level layout blob,
-        // so no separate rename needed here. The next layout send
-        // from the Window will include the new title.
+        // Sync color to remote daemon for SSH sessions so all viewers
+        // of the same session receive the update.
+        const surface = self.getActiveSurface() orelse return;
+        const core = surface.core() orelse return;
+        if (core.io.backend != .remote) return;
+        const remote = &core.io.backend.remote;
+        const conn_entry = remote.conn_entry orelse return;
+        const alloc = Application.default().allocator();
+        const meta = session.protocol.SessionMeta{
+            .group_id = remote.ssh_ctx.group_id,
+            .color = new_color,
+            .label = remote.ssh_ctx.label orelse "",
+        };
+        const payload = meta.encode(alloc) catch return;
+        defer alloc.free(payload);
+        SshConnectionManager.enqueueWrite(conn_entry, .session_meta, remote.target_id, payload);
     }
     pub fn promptTabTitle(self: *Self) void {
         const priv = self.private();
-        const dialog = TitleDialog.newWithColor(.tab, priv.title_override orelse priv.title, priv.tab_color);
+        // Use the raw terminal title from the active surface, not the computed
+        // title which includes SSH suffix, connection state, and other decorations.
+        const initial_title = priv.title_override orelse
+            if (self.getActiveSurface()) |surface| surface.getEffectiveTitle() else null;
+        const dialog = TitleDialog.newWithColor(.tab, initial_title, priv.tab_color);
         _ = TitleDialog.signals.set.connect(
             dialog,
             *Self,
