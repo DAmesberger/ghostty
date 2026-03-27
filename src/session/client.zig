@@ -251,8 +251,7 @@ pub const ProvisionResult = struct {
 ///
 /// Provisioning (always installs as `ghostty-daemon`):
 ///   4a. Local daemon binary exists → upload it
-///   4b. Same platform, no local daemon → upload full local ghostty as ghostty-daemon
-///   4c. Different platform → download daemon from CI
+///   4b. Download daemon from GitHub CI release
 pub fn ensureRemoteGhostty(
     alloc: Allocator,
     ctx: *SshContext,
@@ -315,33 +314,16 @@ pub fn ensureRemoteGhostty(
         return .{ .path = dest, .provisioned = true };
     }
 
-    // 4b/c. No local daemon — check platform compatibility.
+    // 4b. No local daemon — download from CI release.
     const remote_arch = try resolveRemoteArch(alloc, sess);
     defer alloc.free(remote_arch);
 
-    const local = shared.localPlatform();
-    const platforms_match = platformMatches(local.os, remote_os) and
-        std.ascii.eqlIgnoreCase(local.arch, remote_arch);
-
-    if (platforms_match) {
-        // 4b. Same platform — upload full local ghostty, installed as ghostty-daemon.
-        const exe_path = try std.fs.selfExePathAlloc(alloc);
-        defer alloc.free(exe_path);
-
-        try stderr.writeAll("Uploading ghostty to remote (as ghostty-daemon)...\n");
-        try stderr.flush();
-
-        try uploadGhostty(alloc, sess, dest, exe_path, remote_home, remote_os, stderr, mailbox, .local_self);
-        return .{ .path = dest, .provisioned = true };
-    }
-
-    // 4c. Cross-platform — download daemon from CI.
     const norm_os = shared.normalizeOs(remote_os);
     const norm_arch = shared.normalizeArch(remote_arch);
 
     try stderr.print(
-        "Cross-platform detected (local={s}/{s}, remote={s}/{s}). Downloading daemon binary...\n",
-        .{ local.os, local.arch, norm_os, norm_arch },
+        "Downloading ghostty-daemon for {s}/{s}...\n",
+        .{ norm_os, norm_arch },
     );
     try stderr.flush();
 
