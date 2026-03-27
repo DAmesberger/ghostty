@@ -1263,6 +1263,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 // Set the daemon-authoritative session label and color.
                 if (ro.label_len > 0) {
                     const label = ro.label[0..ro.label_len];
+                    if (self.io.backend.remote.ssh_ctx.label) |old| self.alloc.free(old);
                     self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
                 }
                 self.session_color = ro.color;
@@ -1309,6 +1310,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             if (vs.reason == .name_change and vs.session_label_len > 0) {
                 const label = vs.session_label[0..vs.session_label_len];
                 if (self.io.backend == .remote) {
+                    if (self.io.backend.remote.ssh_ctx.label) |old| self.alloc.free(old);
                     self.io.backend.remote.ssh_ctx.label = self.alloc.dupe(u8, label) catch null;
                 }
             }
