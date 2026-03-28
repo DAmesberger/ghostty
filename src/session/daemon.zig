@@ -259,6 +259,15 @@ fn daemonMain(alloc: Allocator) !void {
             return error.PollFailed;
         }
 
+        // On timeout, check if our socket file has been replaced by a new daemon.
+        if (rc == 0) {
+            if (!isSocketOurs(daemon.listener, daemon.socket_path)) {
+                daemonLog("socket replaced, shutting down", .{});
+                return;
+            }
+            continue;
+        }
+
         if (pollfds[0].revents & c.POLLIN != 0) {
             const client_fd = try acceptUnixSocket(daemon.listener);
             verifyPeerUid(client_fd) catch {
@@ -1573,10 +1582,24 @@ fn canConnect(path: []const u8) !bool {
     return true;
 }
 
+/// Check whether the socket file on disk still belongs to this daemon.
+/// Returns false if the file is gone or points to a different inode.
+fn isSocketOurs(listener: posix.fd_t, path: []const u8) bool {
+    var listener_st: c.struct_stat = undefined;
+    if (c.fstat(listener, &listener_st) != 0) return false;
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_buf.len) return false;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    var file_st: c.struct_stat = undefined;
+    if (c.stat(&path_buf, &file_st) != 0) return false;
+    return listener_st.st_ino == file_st.st_ino and listener_st.st_dev == file_st.st_dev;
+}
+
 fn bindUnixSocket(path: []const u8) !posix.fd_t {
     std.fs.cwd().deleteFile(path) catch {};
 
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
     if (fd < 0) return error.SocketCreateFailed;
     errdefer closeFd(fd);
 
@@ -1601,6 +1624,8 @@ fn bindUnixSocket(path: []const u8) !posix.fd_t {
 fn acceptUnixSocket(listener: posix.fd_t) !posix.fd_t {
     const fd = c.accept(listener, null, null);
     if (fd < 0) return error.AcceptFailed;
+    // Prevent child processes from inheriting client connection fds.
+    _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
     return fd;
 }
 

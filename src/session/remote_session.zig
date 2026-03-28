@@ -328,8 +328,10 @@ pub const RemoteSession = struct {
             if (accum.items.len > 0) {
                 self.flushToViewers(accum.items);
                 accum.clearRetainingCapacity();
-                last_flush = std.time.nanoTimestamp();
             }
+            // Always reset the frame timer — without this, once the PTY is idle
+            // for >16ms, remaining_ms stays 0 and poll() never blocks.
+            last_flush = std.time.nanoTimestamp();
         }
 
         // Flush remaining.
@@ -496,6 +498,9 @@ pub const RemoteSession = struct {
             scrollback_chunk_rows,
         ) catch {
             self.mutex.unlock();
+            // Terminate scrollback streaming on persistent error to prevent
+            // attachAndServe from spinning in a poll(fd, 0) busy loop.
+            history_sent.* = total_history;
             return;
         };
         self.mutex.unlock();
