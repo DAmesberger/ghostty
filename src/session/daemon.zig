@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const Command = @import("../Command.zig");
@@ -888,6 +889,19 @@ const Daemon = struct {
         // Start shell in user's home directory (daemon cwd is / from daemonization).
         const home_dir = posix.getenv("HOME") orelse "/";
 
+        // Build environment for the shell. Inherit the daemon's env (HOME, SHELL,
+        // USER, PATH, LANG, etc.) and set terminal-related variables that are
+        // missing because the daemon was started via an SSH exec channel (no TTY).
+        var env = try std.process.getEnvMap(self.alloc);
+        defer env.deinit();
+
+        // Prefer xterm-ghostty if its terminfo is installed, else xterm-256color.
+        const term = if (ghosttyTerminfoAvailable(home_dir)) "xterm-ghostty" else "xterm-256color";
+        try env.put("TERM", term);
+        try env.put("COLORTERM", "truecolor");
+        try env.put("TERM_PROGRAM", "ghostty");
+        try env.put("TERM_PROGRAM_VERSION", build_config.version_string);
+
         var command: Command = .{
             .path = command_path,
             .args = command_args,
@@ -895,6 +909,7 @@ const Daemon = struct {
             .stdin = .{ .handle = pty.slave },
             .stdout = .{ .handle = pty.slave },
             .stderr = .{ .handle = pty.slave },
+            .env = &env,
             .os_pre_exec = preExecPty,
             .rt_pre_exec = null,
             .rt_pre_exec_info = std.mem.zeroInit(Command.RtPreExecInfo, .{}),
@@ -948,6 +963,26 @@ const Daemon = struct {
         return sess;
     }
 };
+
+/// Check whether the xterm-ghostty terminfo entry is installed on this system.
+fn ghosttyTerminfoAvailable(home_dir: []const u8) bool {
+    const paths = [_][]const u8{
+        "/usr/share/terminfo/x/xterm-ghostty",
+        "/usr/lib/terminfo/x/xterm-ghostty",
+    };
+
+    // Check user-local terminfo first (~/.terminfo/x/xterm-ghostty).
+    if (home_dir.len > 0 and home_dir[0] == '/') {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const user_path = std.fmt.bufPrint(&buf, "{s}/.terminfo/x/xterm-ghostty", .{home_dir}) catch return false;
+        if (std.fs.accessAbsolute(user_path, .{})) |_| return true else |_| {}
+    }
+
+    for (&paths) |p| {
+        if (std.fs.accessAbsolute(p, .{})) |_| return true else |_| {}
+    }
+    return false;
+}
 
 // ============================================================================
 // Multiplexer — pure passthrough between SSH stdin/stdout and daemon socket
