@@ -1599,9 +1599,18 @@ fn isSocketOurs(listener: posix.fd_t, path: []const u8) bool {
 fn bindUnixSocket(path: []const u8) !posix.fd_t {
     std.fs.cwd().deleteFile(path) catch {};
 
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
+    const sock_flags = if (@hasDecl(c, "SOCK_CLOEXEC"))
+        c.SOCK_STREAM | c.SOCK_CLOEXEC
+    else
+        c.SOCK_STREAM;
+    const fd = c.socket(c.AF_UNIX, sock_flags, 0);
     if (fd < 0) return error.SocketCreateFailed;
     errdefer closeFd(fd);
+
+    // On platforms without SOCK_CLOEXEC (e.g. macOS), set close-on-exec via fcntl.
+    if (!@hasDecl(c, "SOCK_CLOEXEC")) {
+        if (c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.SocketCreateFailed;
+    }
 
     var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
     addr.sun_family = c.AF_UNIX;

@@ -118,10 +118,12 @@ pub fn deinit(self: *App) void {
         // If the apprt hasn't finalized the surface yet (e.g. GTK defers
         // GObject finalization), force-deinit the core surface now so that
         // font grids are properly deref'd before we check the count below.
-        if (surface.gobj().core()) |core| {
-            core.deinit();
-            self.alloc.destroy(core);
-            surface.gobj().clearCore();
+        if (comptime @hasDecl(apprt.Surface, "gobj")) {
+            if (surface.gobj().core()) |core| {
+                core.deinit();
+                self.alloc.destroy(core);
+                surface.gobj().clearCore();
+            }
         }
     }
     self.surfaces.deinit(self.alloc);

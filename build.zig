@@ -153,8 +153,11 @@ pub fn build(b: *std.Build) !void {
     }
 
     // macOS only artifacts. These will error if they're initialized for
-    // other targets.
-    if (config.target.result.os.tag.isDarwin()) {
+    // other targets. Only initialize when needed because the xcframework
+    // requires the iOS SDK (full Xcode), which may not be available.
+    if (config.target.result.os.tag.isDarwin() and
+        (config.emit_xcframework or config.emit_macos_app))
+    {
         // Ghostty xcframework
         const xcframework = try buildpkg.GhosttyXCFramework.init(
             b,
@@ -209,7 +212,10 @@ pub fn build(b: *std.Build) !void {
 
         // On macOS we can run the macOS app. For "run" we always force
         // a native-only build so that we can run as quickly as possible.
-        if (config.target.result.os.tag.isDarwin()) {
+        // This requires the iOS SDK (full Xcode) for the xcframework.
+        if (config.target.result.os.tag.isDarwin() and
+            (config.emit_xcframework or config.emit_macos_app))
+        {
             const xcframework_native = try buildpkg.GhosttyXCFramework.init(
                 b,
                 &deps,

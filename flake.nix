@@ -69,7 +69,18 @@
   in {
     devShells = forAllPlatforms (pkgs: {
       default = pkgs.callPackage ./nix/devShell.nix {
-        zig = zig.packages.${pkgs.stdenv.hostPlatform.system}."0.15.2";
+        # On Darwin, we build Zig from source with a patch for macOS 26
+        # (Xcode 26.4) compatibility. The macOS 26 SDK dropped `arm64` from
+        # TBD stub files, only listing `arm64e`, which breaks Zig's linker.
+        # See: https://codeberg.org/ziglang/zig/issues/31658
+        # This can be removed when Zig 0.16+ is adopted.
+        zig =
+          if pkgs.stdenv.hostPlatform.isDarwin
+          then
+            pkgs.zig_0_15.overrideAttrs (old: {
+              patches = (old.patches or []) ++ [./nix/patches/zig-macos26-arm64e.patch];
+            })
+          else zig.packages.${pkgs.stdenv.hostPlatform.system}."0.15.2";
         wraptest = pkgs.callPackage ./nix/pkgs/wraptest.nix {};
         zon2nix = zon2nix;
 

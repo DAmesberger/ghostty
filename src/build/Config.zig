@@ -253,15 +253,16 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
                     app_version.patch,
                 });
 
-                if (!std.mem.eql(u8, tag, expected)) {
-                    @panic("tagged releases must be in vX.Y.Z format matching build.zig");
+                if (std.mem.eql(u8, tag, expected)) {
+                    break :version .{
+                        .major = app_version.major,
+                        .minor = app_version.minor,
+                        .patch = app_version.patch,
+                    };
                 }
 
-                break :version .{
-                    .major = app_version.major,
-                    .minor = app_version.minor,
-                    .patch = app_version.patch,
-                };
+                // Non-version tags (e.g. "ghostty-daemon-v1") are ignored;
+                // fall through to treat as a dev build.
             }
         }
 
@@ -414,7 +415,10 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
         config.app_runtime == .none and
         (!config.emit_bench and
             !config.emit_test_exe and
-            !config.emit_helpgen);
+            !config.emit_helpgen) and
+        // The xcframework requires the iOS SDK which is only available
+        // with a full Xcode installation, not just CommandLineTools.
+        (std.zig.system.darwin.getSdk(b.allocator, &iosTarget(target.result)) != null);
 
     config.emit_macos_app = b.option(
         bool,
@@ -597,6 +601,15 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
         // we should add a new case here.
         else => null,
     };
+}
+
+/// Returns a std.Target with os.tag set to .ios, used to probe whether
+/// the iOS SDK is available via `xcrun --sdk iphoneos`.
+fn iosTarget(base: std.Target) std.Target {
+    var t = base;
+    t.os.tag = .ios;
+    t.abi = .none;
+    return t;
 }
 
 // Returns a ResolvedTarget for a mac with a `target.result.cpu.model.name` of `generic`.
