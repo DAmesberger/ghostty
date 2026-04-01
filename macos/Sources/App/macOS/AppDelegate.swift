@@ -274,6 +274,31 @@ class AppDelegate: NSObject,
             selector: #selector(ghosttyNewTab(_:)),
             name: Ghostty.Notification.ghosttyNewTab,
             object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttySshCreateSession(_:)),
+            name: Ghostty.Notification.ghosttySshCreateSession,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttySshSessionAttach(_:)),
+            name: Ghostty.Notification.ghosttySshSessionAttach,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttySshRenameSession(_:)),
+            name: Ghostty.Notification.ghosttySshRenameSession,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttySshDeleteSession(_:)),
+            name: Ghostty.Notification.ghosttySshDeleteSession,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttySshManageSession(_:)),
+            name: Ghostty.Notification.ghosttySshManageSession,
+            object: nil)
 
         // Configure user notifications
         let actions = [
@@ -735,6 +760,49 @@ class AppDelegate: NSObject,
         let config = configAny as? Ghostty.SurfaceConfiguration
 
         _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: config)
+    }
+
+    @objc private func ghosttySshCreateSession(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard let mode = notification.userInfo?[Ghostty.Notification.SshSessionModeKey] as? ghostty_action_ssh_session_mode_e else { return }
+        switch mode {
+        case GHOSTTY_ACTION_SSH_SESSION_MODE_NEW_WINDOW:
+            _ = TerminalController.newWindow(ghostty, withBaseConfig: nil)
+        case GHOSTTY_ACTION_SSH_SESSION_MODE_NEW_TAB:
+            guard let window = surfaceView.window else { return }
+            _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: nil)
+        default:
+            break
+        }
+    }
+
+    @objc private func ghosttySshSessionAttach(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard let mode = notification.userInfo?[Ghostty.Notification.SshSessionModeKey] as? ghostty_action_ssh_session_mode_e else { return }
+        switch mode {
+        case GHOSTTY_ACTION_SSH_SESSION_MODE_NEW_WINDOW:
+            _ = TerminalController.newWindow(ghostty, withBaseConfig: nil)
+        case GHOSTTY_ACTION_SSH_SESSION_MODE_NEW_TAB:
+            guard let window = surfaceView.window else { return }
+            _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: nil)
+        default:
+            break
+        }
+    }
+
+    @objc private func ghosttySshRenameSession(_ notification: Notification) {
+        // TODO: Show rename dialog for SSH session
+        Ghostty.logger.info("ssh rename session requested")
+    }
+
+    @objc private func ghosttySshDeleteSession(_ notification: Notification) {
+        // TODO: Show confirmation dialog for SSH session deletion
+        Ghostty.logger.info("ssh delete session requested")
+    }
+
+    @objc private func ghosttySshManageSession(_ notification: Notification) {
+        // TODO: Show SSH session manager UI
+        Ghostty.logger.info("ssh manage session requested")
     }
 
     private func setDockBadge() {

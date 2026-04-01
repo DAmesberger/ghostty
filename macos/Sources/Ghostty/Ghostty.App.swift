@@ -666,6 +666,26 @@ extension Ghostty {
                 return false
             case GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD:
                 return copyTitleToClipboard(app, target: target)
+
+            case GHOSTTY_ACTION_SSH_CREATE_SESSION:
+                sshCreateSession(app, target: target, mode: action.action.ssh_create_session)
+
+            case GHOSTTY_ACTION_SSH_SESSION_ATTACH:
+                sshSessionAttach(app, target: target, mode: action.action.ssh_session_attach)
+
+            case GHOSTTY_ACTION_SSH_RENAME_SESSION:
+                sshRenameSession(app, target: target)
+
+            case GHOSTTY_ACTION_SSH_DELETE_SESSION:
+                sshDeleteSession(app, target: target)
+
+            case GHOSTTY_ACTION_SSH_TOGGLE_SIZE_MODE:
+                // Handled in Surface.zig directly
+                return false
+
+            case GHOSTTY_ACTION_SSH_MANAGE_SESSION:
+                sshManageSession(app, target: target)
+
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue)")
                 return false
@@ -841,6 +861,68 @@ extension Ghostty {
             default:
                 assertionFailure()
             }
+        }
+
+        // MARK: SSH Remote Session Actions
+
+        private static func sshCreateSession(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            mode: ghostty_action_ssh_session_mode_e
+        ) {
+            guard target.tag == GHOSTTY_TARGET_SURFACE else { return }
+            guard let surface = target.target.surface else { return }
+            guard let surfaceView = self.surfaceView(from: surface) else { return }
+            NotificationCenter.default.post(
+                name: Notification.ghosttySshCreateSession,
+                object: surfaceView,
+                userInfo: [Notification.SshSessionModeKey: mode]
+            )
+        }
+
+        private static func sshSessionAttach(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            mode: ghostty_action_ssh_session_mode_e
+        ) {
+            guard target.tag == GHOSTTY_TARGET_SURFACE else { return }
+            guard let surface = target.target.surface else { return }
+            guard let surfaceView = self.surfaceView(from: surface) else { return }
+            NotificationCenter.default.post(
+                name: Notification.ghosttySshSessionAttach,
+                object: surfaceView,
+                userInfo: [Notification.SshSessionModeKey: mode]
+            )
+        }
+
+        private static func sshRenameSession(_ app: ghostty_app_t, target: ghostty_target_s) {
+            guard target.tag == GHOSTTY_TARGET_SURFACE else { return }
+            guard let surface = target.target.surface else { return }
+            guard let surfaceView = self.surfaceView(from: surface) else { return }
+            NotificationCenter.default.post(
+                name: Notification.ghosttySshRenameSession,
+                object: surfaceView
+            )
+        }
+
+        private static func sshDeleteSession(_ app: ghostty_app_t, target: ghostty_target_s) {
+            guard target.tag == GHOSTTY_TARGET_SURFACE else { return }
+            guard let surface = target.target.surface else { return }
+            guard let surfaceView = self.surfaceView(from: surface) else { return }
+            NotificationCenter.default.post(
+                name: Notification.ghosttySshDeleteSession,
+                object: surfaceView
+            )
+        }
+
+        private static func sshManageSession(_ app: ghostty_app_t, target: ghostty_target_s) {
+            guard target.tag == GHOSTTY_TARGET_SURFACE else { return }
+            guard let surface = target.target.surface else { return }
+            guard let surfaceView = self.surfaceView(from: surface) else { return }
+            NotificationCenter.default.post(
+                name: Notification.ghosttySshManageSession,
+                object: surfaceView
+            )
         }
 
         private static func newSplit(

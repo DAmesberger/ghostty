@@ -447,6 +447,14 @@ extension Ghostty.Notification {
     /// Notifications related to key tables
     static let didChangeKeyTable = Notification.Name("com.mitchellh.ghostty.didChangeKeyTable")
     static let KeyTableKey = didChangeKeyTable.rawValue + ".action"
+
+    /// SSH remote session actions
+    static let ghosttySshCreateSession = Notification.Name("com.mitchellh.ghostty.sshCreateSession")
+    static let ghosttySshSessionAttach = Notification.Name("com.mitchellh.ghostty.sshSessionAttach")
+    static let ghosttySshRenameSession = Notification.Name("com.mitchellh.ghostty.sshRenameSession")
+    static let ghosttySshDeleteSession = Notification.Name("com.mitchellh.ghostty.sshDeleteSession")
+    static let ghosttySshManageSession = Notification.Name("com.mitchellh.ghostty.sshManageSession")
+    static let SshSessionModeKey = "com.mitchellh.ghostty.sshSessionMode"
 }
 
 // Make the input enum hashable.
