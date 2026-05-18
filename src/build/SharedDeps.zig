@@ -240,41 +240,51 @@ pub fn add(
         }
     }
 
-    // aws-lc (libcrypto) — vendored crypto backend for libssh2.
-    // Only needed when using the vendored libssh2 build (non-system-integration).
-    if (step.rootModuleTarget().os.tag != .windows) {
-        if (!b.systemIntegrationOption("libssh2", .{})) {
-            if (b.lazyDependency("aws_lc", .{
-                .target = target,
-                .optimize = optimize,
-            })) |awslc_dep| {
-                step.linkLibrary(awslc_dep.artifact("crypto"));
-                try static_libs.append(
-                    b.allocator,
-                    awslc_dep.artifact("crypto").getEmittedBin(),
-                );
+    // aws-lc + libssh2 are only linked when the libssh2 engine is part of
+    // the build (`ssh-engine = libssh2` or `both`). Under `openssh` the
+    // engine spawns the system `ssh` binary, so these vendored deps drop
+    // out entirely.
+    const wants_libssh2 = switch (self.config.ssh_engine) {
+        .libssh2, .both => true,
+        .openssh => false,
+    };
+    if (wants_libssh2) {
+        // aws-lc (libcrypto) — vendored crypto backend for libssh2.
+        // Only needed when using the vendored libssh2 build (non-system-integration).
+        if (step.rootModuleTarget().os.tag != .windows) {
+            if (!b.systemIntegrationOption("libssh2", .{})) {
+                if (b.lazyDependency("aws_lc", .{
+                    .target = target,
+                    .optimize = optimize,
+                })) |awslc_dep| {
+                    step.linkLibrary(awslc_dep.artifact("crypto"));
+                    try static_libs.append(
+                        b.allocator,
+                        awslc_dep.artifact("crypto").getEmittedBin(),
+                    );
+                }
             }
         }
-    }
 
-    // libssh2 with vendored aws-lc crypto backend — used for native SSH
-    // transport in remote sessions via @cImport. Only needed on non-Windows.
-    // The vendored build uses aws-lc (reports as OpenSSL 1.1.1g) for
-    // Ed25519, ECDSA, and other modern key types.
-    if (step.rootModuleTarget().os.tag != .windows) {
-        _ = b.systemIntegrationOption("libssh2", .{}); // Shows it in help
-        if (b.systemIntegrationOption("libssh2", .{})) {
-            step.linkSystemLibrary2("libssh2", dynamic_link_opts);
-        } else {
-            if (b.lazyDependency("libssh2", .{
-                .target = target,
-                .optimize = optimize,
-            })) |libssh2_dep| {
-                step.linkLibrary(libssh2_dep.artifact("ssh2"));
-                try static_libs.append(
-                    b.allocator,
-                    libssh2_dep.artifact("ssh2").getEmittedBin(),
-                );
+        // libssh2 with vendored aws-lc crypto backend — used for native SSH
+        // transport in remote sessions via @cImport. Only needed on non-Windows.
+        // The vendored build uses aws-lc (reports as OpenSSL 1.1.1g) for
+        // Ed25519, ECDSA, and other modern key types.
+        if (step.rootModuleTarget().os.tag != .windows) {
+            _ = b.systemIntegrationOption("libssh2", .{}); // Shows it in help
+            if (b.systemIntegrationOption("libssh2", .{})) {
+                step.linkSystemLibrary2("libssh2", dynamic_link_opts);
+            } else {
+                if (b.lazyDependency("libssh2", .{
+                    .target = target,
+                    .optimize = optimize,
+                })) |libssh2_dep| {
+                    step.linkLibrary(libssh2_dep.artifact("ssh2"));
+                    try static_libs.append(
+                        b.allocator,
+                        libssh2_dep.artifact("ssh2").getEmittedBin(),
+                    );
+                }
             }
         }
     }

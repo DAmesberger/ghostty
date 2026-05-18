@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const ApprtRuntime = @import("../apprt/runtime.zig").Runtime;
 const FontBackend = @import("../font/backend.zig").Backend;
 const RendererBackend = @import("../renderer/backend.zig").Backend;
+const SshEngine = @import("ssh_engine.zig").SshEngine;
 const TerminalBuildOptions = @import("../terminal/build_options.zig").Options;
 const XCFrameworkTarget = @import("xcframework.zig").Target;
 const WasmTarget = @import("../os/wasm/target.zig").Target;
@@ -26,6 +27,7 @@ wasm_target: WasmTarget,
 app_runtime: ApprtRuntime = .none,
 renderer: RendererBackend = .opengl,
 font_backend: FontBackend = .freetype,
+ssh_engine: SshEngine = .libssh2,
 
 /// Feature flags
 x11: bool = false,
@@ -140,6 +142,17 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
         "renderer",
         "The app runtime to use. Not all values supported on all platforms.",
     ) orelse RendererBackend.default(target.result, wasm_target);
+
+    config.ssh_engine = b.option(
+        SshEngine,
+        "ssh-engine",
+        "Which SSH engine(s) to compile in. `libssh2` (default) vendors " ++
+            "libssh2 + aws-lc; libghostty opens SSH itself. `openssh` plans " ++
+            "to spawn the system `ssh` binary as a subprocess (not yet " ++
+            "implemented; selecting this today produces a non-functional " ++
+            "SSH path). `both` compiles both and lets the user pick at " ++
+            "runtime via the `ssh-engine` config option.",
+    ) orelse .libssh2;
 
     //---------------------------------------------------------------
     // Feature Flags
@@ -495,6 +508,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ApprtRuntime, "app_runtime", self.app_runtime);
     step.addOption(FontBackend, "font_backend", self.font_backend);
     step.addOption(RendererBackend, "renderer", self.renderer);
+    step.addOption(SshEngine, "ssh_engine", self.ssh_engine);
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
