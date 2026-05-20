@@ -249,6 +249,10 @@ fn daemonMain(alloc: Allocator) !void {
     };
     defer daemon.deinit();
 
+    // Register channel-mux services. These are the daemon's built-in
+    // services advertised in every Capabilities frame.
+    try session.services.tcp_connect.register(&daemon.channel_registry);
+
     while (true) {
         // Poll with timeout so we can periodically reap empty groups
         var pollfds = [1]c.struct_pollfd{
