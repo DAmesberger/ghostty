@@ -115,7 +115,7 @@ pub const Flags = packed struct(u8) {
 };
 
 /// Frame types. Every kind is a first-class enum variant — no sub-typing.
-/// 15 kinds, values 0-127 used, 128-255 reserved.
+/// Values 0-127 are spec-defined, 128-255 reserved for future extensions.
 pub const Kind = enum(u8) {
     // Data plane (hot path)
     data_in = 1, // stdin: client → daemon (raw bytes to PTY)
@@ -148,6 +148,22 @@ pub const Kind = enum(u8) {
     size_mode_change = 21, // Client → daemon: change size negotiation mode
     kick_viewer = 25, // Client → daemon: force-disconnect a viewer
     session_meta = 26, // Client → daemon: update session label + color
+
+    // Capability negotiation (post-banner handshake, both directions)
+    capabilities = 27,
+
+    // Generic multiplexed channels (Phase 6A — codec scaffold; not wired yet).
+    // Channel-id lives in the payload (u32 LE first 4 bytes), NOT the header's
+    // `target` field. `target` is left at 0 by senders for channel frames so
+    // the existing surface/viewer multiplexing on `target` does not collide
+    // with channel multiplexing.
+    channel_open = 30, // Open a service-typed channel
+    channel_opened = 31, // Ack with status + initial window
+    channel_data = 32, // Raw bytes on a channel (LZ4 via header flag)
+    channel_window = 33, // Credit-based flow-control window update
+    channel_eof = 34, // Half-close: sender done writing
+    channel_close = 35, // Full teardown with reason code
+    channel_control = 36, // Service-specific control op
 };
 
 pub const Header = struct {
@@ -833,6 +849,458 @@ pub const Resize = packed struct {
 };
 
 // =========================================================================
+// Capabilities frame (kind 27)
+// =========================================================================
+//
+// Sent by both daemon and client immediately after the banner exchange, so
+// each side can negotiate which channel services / features the other
+// supports. The effective set is the intersection. Channels whose service
+// id is not advertised in the peer's Capabilities frame are rejected at
+// open time with status=service_not_supported.
+
+/// Identifies a single channel service in a Capabilities frame.
+pub const CapabilityService = struct {
+    /// Service id (matches ChannelOpen.service_id below).
+    id: u8,
+    /// Human-readable service name, e.g. "tcp_connect", "browser_proxy".
+    /// Used for diagnostics and as the lookup key for the `custom` service.
+    name: []const u8,
+};
+
+/// Compression algorithm identifier for per-channel compression negotiation.
+/// 0 = none, 1 = LZ4 (currently the only supported algo). Future algos may
+/// add values without bumping the protocol version, gated by the
+/// Capabilities exchange.
+pub const CompressionAlgo = enum(u8) {
+    none = 0,
+    lz4 = 1,
+    _,
+};
+
+/// Payload for `capabilities` (kind 27):
+///   [2]   protocol_version u16 LE
+///   [4]   feature_bits     u32 LE
+///   [2]   service_count    u16 LE
+///   per service:
+///     [1] service_id       u8
+///     [2] name_len         u16 LE
+///     [N] name bytes (UTF-8)
+///   [2]   default_window   u16 LE (in 4 KiB units; 0 = use protocol default)
+///   [2]   max_window       u16 LE (in 4 KiB units; cap on opener-requested window)
+///   [2]   max_payload      u16 LE (in KiB; e.g. 256 for the current 256 KiB cap)
+///   [1]   compression_algo u8
+pub const Capabilities = struct {
+    protocol_version: u16,
+    feature_bits: u32 = 0,
+    services: []const CapabilityService,
+    default_window: u16 = 0,
+    max_window: u16 = 0,
+    max_payload_kib: u16 = 0,
+    compression_algo: CompressionAlgo = .lz4,
+
+    /// Fixed-size bytes excluding the variable services list:
+    /// protocol_version(2) + feature_bits(4) + service_count(2) +
+    /// default_window(2) + max_window(2) + max_payload(2) + compression_algo(1).
+    pub const fixed_size: usize = 2 + 4 + 2 + 2 + 2 + 2 + 1;
+
+    /// Per-service fixed bytes (excluding name): id(1) + name_len(2).
+    pub const service_fixed_size: usize = 1 + 2;
+
+    pub fn encode(self: Capabilities, alloc: Allocator) ![]u8 {
+        var total: usize = fixed_size;
+        for (self.services) |s| {
+            total += service_fixed_size + s.name.len;
+        }
+        const buf = try alloc.alloc(u8, total);
+        var off: usize = 0;
+        std.mem.writeInt(u16, buf[off..][0..2], self.protocol_version, .little);
+        off += 2;
+        std.mem.writeInt(u32, buf[off..][0..4], self.feature_bits, .little);
+        off += 4;
+        std.mem.writeInt(u16, buf[off..][0..2], @intCast(self.services.len), .little);
+        off += 2;
+        for (self.services) |s| {
+            buf[off] = s.id;
+            off += 1;
+            std.mem.writeInt(u16, buf[off..][0..2], @intCast(s.name.len), .little);
+            off += 2;
+            @memcpy(buf[off..][0..s.name.len], s.name);
+            off += s.name.len;
+        }
+        std.mem.writeInt(u16, buf[off..][0..2], self.default_window, .little);
+        off += 2;
+        std.mem.writeInt(u16, buf[off..][0..2], self.max_window, .little);
+        off += 2;
+        std.mem.writeInt(u16, buf[off..][0..2], self.max_payload_kib, .little);
+        off += 2;
+        buf[off] = @intFromEnum(self.compression_algo);
+        return buf;
+    }
+
+    /// Parses the header + services list into a borrowed view. The returned
+    /// `services` slice points into a freshly-allocated array owned by the
+    /// caller (free via `alloc.free`); each `service.name` borrows from
+    /// `payload`.
+    pub fn parse(alloc: Allocator, payload: []const u8) !Capabilities {
+        // Minimum without any services: fixed_size, with service_count = 0.
+        if (payload.len < fixed_size) return error.InvalidCapabilitiesPayload;
+        var off: usize = 0;
+        const protocol_v = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+        const feature_bits = std.mem.readInt(u32, payload[off..][0..4], .little);
+        off += 4;
+        const service_count = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+
+        const services = try alloc.alloc(CapabilityService, service_count);
+        errdefer alloc.free(services);
+
+        for (0..service_count) |i| {
+            if (off + service_fixed_size > payload.len) return error.InvalidCapabilitiesPayload;
+            const id = payload[off];
+            off += 1;
+            const name_len = std.mem.readInt(u16, payload[off..][0..2], .little);
+            off += 2;
+            if (name_len > payload.len - off) return error.InvalidCapabilitiesPayload;
+            services[i] = .{ .id = id, .name = payload[off..][0..name_len] };
+            off += name_len;
+        }
+
+        // Trailing fixed fields: default_window(2) + max_window(2) +
+        // max_payload(2) + compression_algo(1) = 7 bytes.
+        if (payload.len - off < 7) return error.InvalidCapabilitiesPayload;
+        const default_window = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+        const max_window = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+        const max_payload_kib = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+        const compression_algo: CompressionAlgo = @enumFromInt(payload[off]);
+
+        return .{
+            .protocol_version = protocol_v,
+            .feature_bits = feature_bits,
+            .services = services,
+            .default_window = default_window,
+            .max_window = max_window,
+            .max_payload_kib = max_payload_kib,
+            .compression_algo = compression_algo,
+        };
+    }
+};
+
+// =========================================================================
+// Generic multiplexed channels (kinds 30-36)
+// =========================================================================
+//
+// All channel frames carry their channel_id as the first 4 bytes of the
+// payload. The 8-byte frame header's `target` field is reserved (must be 0)
+// for channel frames so the existing terminal-surface multiplexer on
+// `target` does not collide with channel multiplexing.
+//
+// Direction convention: opener picks the channel_id; daemon-originated
+// channels (e.g. an inbound TCP accept on a port_listener service) set the
+// high bit (`channel_id & 0x8000_0000 != 0`). This avoids a central
+// allocator across both directions and matches SSH channel-direction
+// semantics.
+
+/// Default initial credit window for a new channel, in 4 KiB units.
+/// 1 MiB. Opener may declare smaller for memory-bounded services.
+pub const default_channel_window_units: u16 = 256;
+
+/// Hard upper bound on per-channel window in 4 KiB units (16 MiB).
+/// Used to bound per-channel inbound buffering.
+pub const max_channel_window_units: u16 = 4096;
+
+/// Channel id value used for "no channel" / invalid. Both 0 and the
+/// daemon-direction marker bit are valid; only this sentinel is reserved
+/// for explicit "unset" sentinels in fields that can omit a channel id.
+pub const invalid_channel_id: u32 = std.math.maxInt(u32);
+
+/// Bit on `channel_id` indicating the channel was opened by the daemon
+/// side (as opposed to the client side). See direction convention above.
+pub const channel_id_daemon_bit: u32 = 0x8000_0000;
+
+/// Service identifier for `ChannelOpen`. Matches the registry on the
+/// daemon side. Values 0 and 255 are reserved (invalid sentinel and
+/// `custom` escape hatch respectively).
+pub const ChannelService = enum(u8) {
+    invalid = 0,
+    tcp_connect = 1,
+    port_listener = 2,
+    file_transfer = 3,
+    browser_proxy = 4,
+    process_exec = 5,
+    custom = 255,
+    _,
+};
+
+/// Flags for ChannelOpen / ChannelOpened, packed into the `flags` byte
+/// inside the payload (separate from the header's `Flags` byte).
+pub const ChannelOpenFlags = packed struct(u8) {
+    /// Opener can decompress inbound data (and asks daemon to compress).
+    /// Daemon echoes this bit in `ChannelOpened.flags` to commit. When
+    /// both sides set it, individual `channel_data` frames opt in via
+    /// the header `Flags.compressed` bit on a per-frame basis.
+    compression: bool = false,
+    /// Channel will not carry upstream (opener → peer) data. Hint for
+    /// services like file downloads that pre-allocate buffers.
+    unidirectional_download: bool = false,
+    _reserved: u6 = 0,
+};
+
+/// Status code returned in ChannelOpened. 0 = ok; nonzero = error and
+/// the channel is dead (no further frames will be sent for this id).
+pub const ChannelOpenStatus = enum(u8) {
+    ok = 0,
+    /// Service id was not advertised in the peer's Capabilities.
+    service_not_supported = 1,
+    /// Service-level error (e.g. TCP dial failed, file path denied).
+    service_error = 2,
+    /// Too many concurrent channels; opener should back off.
+    resource_exhausted = 3,
+    /// Malformed open request (bad params, invalid window, etc.).
+    invalid_request = 4,
+    /// Peer policy rejected the open (sandboxing, auth, etc.).
+    policy_denied = 5,
+    _,
+};
+
+/// Reason for ChannelClose. Both sides may close unilaterally; any
+/// further frames carrying the channel id are discarded.
+pub const ChannelCloseReason = enum(u8) {
+    normal = 0,
+    /// The peer violated the protocol (e.g. window overrun).
+    peer_reset = 1,
+    /// Service raised an error (e.g. TCP connection dropped).
+    service_error = 2,
+    /// Policy / sandbox decision.
+    policy_denied = 3,
+    /// No traffic for too long (stall watchdog).
+    idle_timeout = 4,
+    /// Daemon is shutting down; all channels on this connection close.
+    daemon_shutdown = 5,
+    _,
+};
+
+/// Payload for `channel_open` (kind 30):
+///   [4]  channel_id     u32 LE (opener-chosen; high bit set if daemon-origin)
+///   [1]  service_id     u8
+///   [1]  flags          u8 (ChannelOpenFlags bitfield)
+///   [2]  initial_window u16 LE (4 KiB units; 0 = use default_channel_window_units)
+///   [2]  reserved       u16 LE (must be 0)
+///   [N]  service_params bytes (service-defined; may be empty)
+pub const ChannelOpen = struct {
+    channel_id: u32,
+    service: ChannelService,
+    flags: ChannelOpenFlags = .{},
+    initial_window: u16 = 0,
+    service_params: []const u8 = "",
+
+    /// Fixed bytes: channel_id(4) + service_id(1) + flags(1) + initial_window(2) + reserved(2).
+    pub const fixed_size: usize = 4 + 1 + 1 + 2 + 2;
+
+    pub fn encode(self: ChannelOpen, alloc: Allocator) ![]u8 {
+        const buf = try alloc.alloc(u8, fixed_size + self.service_params.len);
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        buf[4] = @intFromEnum(self.service);
+        buf[5] = @bitCast(self.flags);
+        std.mem.writeInt(u16, buf[6..8], self.initial_window, .little);
+        std.mem.writeInt(u16, buf[8..10], 0, .little);
+        @memcpy(buf[fixed_size..], self.service_params);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelOpen {
+        if (payload.len < fixed_size) return error.InvalidChannelOpenPayload;
+        return .{
+            .channel_id = std.mem.readInt(u32, payload[0..4], .little),
+            .service = @enumFromInt(payload[4]),
+            .flags = @bitCast(payload[5]),
+            .initial_window = std.mem.readInt(u16, payload[6..8], .little),
+            .service_params = payload[fixed_size..],
+        };
+    }
+};
+
+/// Payload for `channel_opened` (kind 31):
+///   [4]  channel_id  u32 LE (echoes the opener's id)
+///   [1]  status      u8 (ChannelOpenStatus)
+///   [1]  flags       u8 (negotiated ChannelOpenFlags — bits opener AND daemon set)
+///   [2]  peer_window u16 LE (4 KiB units the daemon grants the opener)
+///   [2]  reserved    u16 LE
+///   [N]  service_ack bytes (service-defined; error message on failure)
+pub const ChannelOpened = struct {
+    channel_id: u32,
+    status: ChannelOpenStatus,
+    flags: ChannelOpenFlags = .{},
+    peer_window: u16 = 0,
+    service_ack: []const u8 = "",
+
+    pub const fixed_size: usize = 4 + 1 + 1 + 2 + 2;
+
+    pub fn encode(self: ChannelOpened, alloc: Allocator) ![]u8 {
+        const buf = try alloc.alloc(u8, fixed_size + self.service_ack.len);
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        buf[4] = @intFromEnum(self.status);
+        buf[5] = @bitCast(self.flags);
+        std.mem.writeInt(u16, buf[6..8], self.peer_window, .little);
+        std.mem.writeInt(u16, buf[8..10], 0, .little);
+        @memcpy(buf[fixed_size..], self.service_ack);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelOpened {
+        if (payload.len < fixed_size) return error.InvalidChannelOpenedPayload;
+        return .{
+            .channel_id = std.mem.readInt(u32, payload[0..4], .little),
+            .status = @enumFromInt(payload[4]),
+            .flags = @bitCast(payload[5]),
+            .peer_window = std.mem.readInt(u16, payload[6..8], .little),
+            .service_ack = payload[fixed_size..],
+        };
+    }
+};
+
+/// Payload for `channel_data` (kind 32):
+///   [4]  channel_id u32 LE
+///   [N]  bytes      (raw data; LZ4 via header `Flags.compressed`)
+pub const ChannelData = struct {
+    channel_id: u32,
+    bytes: []const u8,
+
+    pub const fixed_size: usize = 4;
+
+    pub fn encode(self: ChannelData, alloc: Allocator) ![]u8 {
+        const buf = try alloc.alloc(u8, fixed_size + self.bytes.len);
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        @memcpy(buf[fixed_size..], self.bytes);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelData {
+        if (payload.len < fixed_size) return error.InvalidChannelDataPayload;
+        return .{
+            .channel_id = std.mem.readInt(u32, payload[0..4], .little),
+            .bytes = payload[fixed_size..],
+        };
+    }
+};
+
+/// Payload for `channel_window` (kind 33):
+///   [4]  channel_id   u32 LE
+///   [4]  credit_bytes u32 LE (additional outbound credit, in bytes, cumulative)
+pub const ChannelWindow = struct {
+    channel_id: u32,
+    credit_bytes: u32,
+
+    pub const size: usize = 8;
+
+    pub fn encode(self: ChannelWindow) [size]u8 {
+        var buf: [size]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        std.mem.writeInt(u32, buf[4..8], self.credit_bytes, .little);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelWindow {
+        if (payload.len < size) return error.InvalidChannelWindowPayload;
+        return .{
+            .channel_id = std.mem.readInt(u32, payload[0..4], .little),
+            .credit_bytes = std.mem.readInt(u32, payload[4..8], .little),
+        };
+    }
+};
+
+/// Payload for `channel_eof` (kind 34):
+///   [4]  channel_id u32 LE
+///
+/// "Sender will send no more `channel_data` frames on this channel." The
+/// peer may still send (full-duplex half-close). After both sides EOF,
+/// either side may send Close.
+pub const ChannelEof = struct {
+    channel_id: u32,
+
+    pub const size: usize = 4;
+
+    pub fn encode(self: ChannelEof) [size]u8 {
+        var buf: [size]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelEof {
+        if (payload.len < size) return error.InvalidChannelEofPayload;
+        return .{ .channel_id = std.mem.readInt(u32, payload[0..4], .little) };
+    }
+};
+
+/// Payload for `channel_close` (kind 35):
+///   [4]  channel_id u32 LE
+///   [1]  reason     u8 (ChannelCloseReason)
+///   [N]  message    UTF-8 bytes (may be empty)
+///
+/// Unilateral and final; any further frames carrying this id are
+/// discarded by the receiver.
+pub const ChannelClose = struct {
+    channel_id: u32,
+    reason: ChannelCloseReason,
+    message: []const u8 = "",
+
+    pub const fixed_size: usize = 4 + 1;
+
+    pub fn encode(self: ChannelClose, alloc: Allocator) ![]u8 {
+        const buf = try alloc.alloc(u8, fixed_size + self.message.len);
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        buf[4] = @intFromEnum(self.reason);
+        @memcpy(buf[fixed_size..], self.message);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelClose {
+        if (payload.len < fixed_size) return error.InvalidChannelClosePayload;
+        return .{
+            .channel_id = std.mem.readInt(u32, payload[0..4], .little),
+            .reason = @enumFromInt(payload[4]),
+            .message = payload[fixed_size..],
+        };
+    }
+};
+
+/// Payload for `channel_control` (kind 36):
+///   [4]  channel_id u32 LE
+///   [1]  op         u8 (service-defined opcode)
+///   [N]  op_payload bytes (service-defined; may be empty)
+///
+/// Ordered with `channel_data` on the same channel. Used for service-
+/// specific signals like file-transfer progress, port-listener
+/// pause/resume, TCP RST instead of FIN, etc.
+pub const ChannelControl = struct {
+    channel_id: u32,
+    op: u8,
+    op_payload: []const u8 = "",
+
+    pub const fixed_size: usize = 4 + 1;
+
+    pub fn encode(self: ChannelControl, alloc: Allocator) ![]u8 {
+        const buf = try alloc.alloc(u8, fixed_size + self.op_payload.len);
+        std.mem.writeInt(u32, buf[0..4], self.channel_id, .little);
+        buf[4] = self.op;
+        @memcpy(buf[fixed_size..], self.op_payload);
+        return buf;
+    }
+
+    pub fn parse(payload: []const u8) !ChannelControl {
+        if (payload.len < fixed_size) return error.InvalidChannelControlPayload;
+        return .{
+            .channel_id = std.mem.readInt(u32, payload[0..4], .little),
+            .op = payload[4],
+            .op_payload = payload[fixed_size..],
+        };
+    }
+};
+
+// =========================================================================
 // Frame I/O
 // =========================================================================
 
@@ -1171,4 +1639,306 @@ test "compressed flag in header" {
     const buf = h.encodeToBuf();
     const parsed = try Header.parseFromBuf(&buf);
     try testing.expect(parsed.flags.compressed);
+}
+
+// =========================================================================
+// Channel & Capabilities tests (Phase 6A.1 codec scaffold)
+// =========================================================================
+
+test "capabilities encode/parse — empty services list" {
+    const testing = std.testing;
+    const caps = Capabilities{
+        .protocol_version = protocol_version,
+        .services = &.{},
+        .default_window = default_channel_window_units,
+        .max_window = max_channel_window_units,
+        .max_payload_kib = max_payload / 1024,
+        .compression_algo = .lz4,
+    };
+    const encoded = try caps.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(Capabilities.fixed_size, encoded.len);
+
+    const parsed = try Capabilities.parse(testing.allocator, encoded);
+    defer testing.allocator.free(parsed.services);
+    try testing.expectEqual(@as(u16, protocol_version), parsed.protocol_version);
+    try testing.expectEqual(@as(u32, 0), parsed.feature_bits);
+    try testing.expectEqual(@as(usize, 0), parsed.services.len);
+    try testing.expectEqual(default_channel_window_units, parsed.default_window);
+    try testing.expectEqual(max_channel_window_units, parsed.max_window);
+    try testing.expectEqual(@as(u16, max_payload / 1024), parsed.max_payload_kib);
+    try testing.expectEqual(CompressionAlgo.lz4, parsed.compression_algo);
+}
+
+test "capabilities encode/parse — full service catalog" {
+    const testing = std.testing;
+    const services = [_]CapabilityService{
+        .{ .id = @intFromEnum(ChannelService.tcp_connect), .name = "tcp_connect" },
+        .{ .id = @intFromEnum(ChannelService.port_listener), .name = "port_listener" },
+        .{ .id = @intFromEnum(ChannelService.file_transfer), .name = "file_transfer" },
+        .{ .id = @intFromEnum(ChannelService.browser_proxy), .name = "browser_proxy" },
+        .{ .id = @intFromEnum(ChannelService.process_exec), .name = "process_exec" },
+        .{ .id = @intFromEnum(ChannelService.custom), .name = "custom" },
+    };
+    const caps = Capabilities{
+        .protocol_version = protocol_version,
+        .feature_bits = 0b101,
+        .services = &services,
+        .default_window = default_channel_window_units,
+        .max_window = max_channel_window_units,
+        .max_payload_kib = 256,
+        .compression_algo = .lz4,
+    };
+    const encoded = try caps.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+
+    const parsed = try Capabilities.parse(testing.allocator, encoded);
+    defer testing.allocator.free(parsed.services);
+    try testing.expectEqual(@as(usize, services.len), parsed.services.len);
+    try testing.expectEqual(@as(u32, 0b101), parsed.feature_bits);
+    for (services, parsed.services) |orig, got| {
+        try testing.expectEqual(orig.id, got.id);
+        try testing.expectEqualStrings(orig.name, got.name);
+    }
+}
+
+test "capabilities rejects short payload" {
+    const testing = std.testing;
+    const short: [4]u8 = .{ 0, 0, 0, 0 };
+    try testing.expectError(error.InvalidCapabilitiesPayload, Capabilities.parse(testing.allocator, &short));
+}
+
+test "capabilities rejects truncated service name" {
+    const testing = std.testing;
+    // Manually craft: protocol_version=1, feature_bits=0, service_count=1,
+    // service_id=1, name_len=10 — but supply only 2 bytes of name.
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    try buf.appendSlice(testing.allocator, &.{ 1, 0 }); // protocol_version
+    try buf.appendSlice(testing.allocator, &.{ 0, 0, 0, 0 }); // feature_bits
+    try buf.appendSlice(testing.allocator, &.{ 1, 0 }); // service_count = 1
+    try buf.appendSlice(testing.allocator, &.{1}); // service_id = 1
+    try buf.appendSlice(testing.allocator, &.{ 10, 0 }); // name_len = 10
+    try buf.appendSlice(testing.allocator, "ab"); // only 2 bytes of name
+    try testing.expectError(error.InvalidCapabilitiesPayload, Capabilities.parse(testing.allocator, buf.items));
+}
+
+test "channel_open encode/parse roundtrip" {
+    const testing = std.testing;
+    const params = "host\x00\x50\x00"; // arbitrary opaque service params
+    const open = ChannelOpen{
+        .channel_id = 0x1234_5678,
+        .service = .tcp_connect,
+        .flags = .{ .compression = true },
+        .initial_window = 128,
+        .service_params = params,
+    };
+    const encoded = try open.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(ChannelOpen.fixed_size + params.len, encoded.len);
+
+    const parsed = try ChannelOpen.parse(encoded);
+    try testing.expectEqual(@as(u32, 0x1234_5678), parsed.channel_id);
+    try testing.expectEqual(ChannelService.tcp_connect, parsed.service);
+    try testing.expect(parsed.flags.compression);
+    try testing.expect(!parsed.flags.unidirectional_download);
+    try testing.expectEqual(@as(u16, 128), parsed.initial_window);
+    try testing.expectEqualSlices(u8, params, parsed.service_params);
+}
+
+test "channel_open encodes empty service_params" {
+    const testing = std.testing;
+    const open = ChannelOpen{
+        .channel_id = 1,
+        .service = .browser_proxy,
+        .initial_window = 0,
+    };
+    const encoded = try open.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(ChannelOpen.fixed_size, encoded.len);
+    const parsed = try ChannelOpen.parse(encoded);
+    try testing.expectEqual(@as(usize, 0), parsed.service_params.len);
+    try testing.expectEqual(ChannelService.browser_proxy, parsed.service);
+}
+
+test "channel_open with daemon-direction high bit" {
+    const testing = std.testing;
+    const open = ChannelOpen{
+        .channel_id = channel_id_daemon_bit | 7,
+        .service = .tcp_connect,
+        .initial_window = default_channel_window_units,
+    };
+    const encoded = try open.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    const parsed = try ChannelOpen.parse(encoded);
+    try testing.expect((parsed.channel_id & channel_id_daemon_bit) != 0);
+    try testing.expectEqual(@as(u32, 7), parsed.channel_id & ~channel_id_daemon_bit);
+}
+
+test "channel_open rejects short payload" {
+    const testing = std.testing;
+    const short: [4]u8 = .{ 0, 0, 0, 0 };
+    try testing.expectError(error.InvalidChannelOpenPayload, ChannelOpen.parse(&short));
+}
+
+test "channel_opened encode/parse roundtrip" {
+    const testing = std.testing;
+    const ack = "remote_port=8080";
+    const opened = ChannelOpened{
+        .channel_id = 0xDEAD_BEEF,
+        .status = .ok,
+        .flags = .{ .compression = true },
+        .peer_window = 256,
+        .service_ack = ack,
+    };
+    const encoded = try opened.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+
+    const parsed = try ChannelOpened.parse(encoded);
+    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), parsed.channel_id);
+    try testing.expectEqual(ChannelOpenStatus.ok, parsed.status);
+    try testing.expect(parsed.flags.compression);
+    try testing.expectEqual(@as(u16, 256), parsed.peer_window);
+    try testing.expectEqualStrings(ack, parsed.service_ack);
+}
+
+test "channel_opened carries error message on failure" {
+    const testing = std.testing;
+    const msg = "dial failed: connection refused";
+    const opened = ChannelOpened{
+        .channel_id = 1,
+        .status = .service_error,
+        .service_ack = msg,
+    };
+    const encoded = try opened.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    const parsed = try ChannelOpened.parse(encoded);
+    try testing.expectEqual(ChannelOpenStatus.service_error, parsed.status);
+    try testing.expectEqualStrings(msg, parsed.service_ack);
+}
+
+test "channel_data encode/parse — empty payload" {
+    const testing = std.testing;
+    const data = ChannelData{ .channel_id = 42, .bytes = "" };
+    const encoded = try data.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(ChannelData.fixed_size, encoded.len);
+    const parsed = try ChannelData.parse(encoded);
+    try testing.expectEqual(@as(u32, 42), parsed.channel_id);
+    try testing.expectEqual(@as(usize, 0), parsed.bytes.len);
+}
+
+test "channel_data encode/parse — payload at max_payload boundary" {
+    const testing = std.testing;
+    // ChannelData payload = channel_id(4) + bytes. The header `len` field
+    // caps the total frame payload at `max_payload`, so the data slice
+    // can be up to max_payload - 4 bytes long. Pick a realistic large
+    // size that still fits.
+    const big = try testing.allocator.alloc(u8, max_payload - ChannelData.fixed_size);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i);
+
+    const data = ChannelData{ .channel_id = 1, .bytes = big };
+    const encoded = try data.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(@as(usize, max_payload), encoded.len);
+
+    const parsed = try ChannelData.parse(encoded);
+    try testing.expectEqual(@as(u32, 1), parsed.channel_id);
+    try testing.expectEqualSlices(u8, big, parsed.bytes);
+}
+
+test "channel_window encode/parse roundtrip" {
+    const testing = std.testing;
+    const win = ChannelWindow{ .channel_id = 99, .credit_bytes = 65_536 };
+    const encoded = win.encode();
+    try testing.expectEqual(ChannelWindow.size, encoded.len);
+    const parsed = try ChannelWindow.parse(&encoded);
+    try testing.expectEqual(@as(u32, 99), parsed.channel_id);
+    try testing.expectEqual(@as(u32, 65_536), parsed.credit_bytes);
+}
+
+test "channel_window rejects short payload" {
+    const testing = std.testing;
+    const short: [4]u8 = .{ 0, 0, 0, 0 };
+    try testing.expectError(error.InvalidChannelWindowPayload, ChannelWindow.parse(&short));
+}
+
+test "channel_eof encode/parse roundtrip" {
+    const testing = std.testing;
+    const eof = ChannelEof{ .channel_id = 5 };
+    const encoded = eof.encode();
+    try testing.expectEqual(ChannelEof.size, encoded.len);
+    const parsed = try ChannelEof.parse(&encoded);
+    try testing.expectEqual(@as(u32, 5), parsed.channel_id);
+}
+
+test "channel_close encode/parse — with message" {
+    const testing = std.testing;
+    const msg = "window violation";
+    const close = ChannelClose{
+        .channel_id = 7,
+        .reason = .peer_reset,
+        .message = msg,
+    };
+    const encoded = try close.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+
+    const parsed = try ChannelClose.parse(encoded);
+    try testing.expectEqual(@as(u32, 7), parsed.channel_id);
+    try testing.expectEqual(ChannelCloseReason.peer_reset, parsed.reason);
+    try testing.expectEqualStrings(msg, parsed.message);
+}
+
+test "channel_close encode/parse — empty message" {
+    const testing = std.testing;
+    const close = ChannelClose{ .channel_id = 8, .reason = .normal };
+    const encoded = try close.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqual(ChannelClose.fixed_size, encoded.len);
+    const parsed = try ChannelClose.parse(encoded);
+    try testing.expectEqual(ChannelCloseReason.normal, parsed.reason);
+    try testing.expectEqual(@as(usize, 0), parsed.message.len);
+}
+
+test "channel_control encode/parse roundtrip" {
+    const testing = std.testing;
+    const op_payload = "progress=512";
+    const ctrl = ChannelControl{
+        .channel_id = 11,
+        .op = 1,
+        .op_payload = op_payload,
+    };
+    const encoded = try ctrl.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+
+    const parsed = try ChannelControl.parse(encoded);
+    try testing.expectEqual(@as(u32, 11), parsed.channel_id);
+    try testing.expectEqual(@as(u8, 1), parsed.op);
+    try testing.expectEqualStrings(op_payload, parsed.op_payload);
+}
+
+test "channel frames roundtrip through writeFrame / readHeader" {
+    // Ensures the new kinds work end-to-end with the existing frame I/O
+    // helpers — no behavior change to the frame layer.
+    const testing = std.testing;
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+
+    const win = ChannelWindow{ .channel_id = 17, .credit_bytes = 4096 };
+    const win_bytes = win.encode();
+    try writeFrame(buf.writer(testing.allocator), .channel_window, 0, &win_bytes);
+
+    var stream = std.io.fixedBufferStream(buf.items);
+    const header = try readHeader(stream.reader());
+    try testing.expectEqual(Kind.channel_window, header.kind);
+    try testing.expectEqual(@as(u16, 0), header.target); // channel_id lives in payload
+    try testing.expectEqual(@as(u32, ChannelWindow.size), header.len);
+
+    const payload = try readPayloadAlloc(testing.allocator, stream.reader(), header);
+    defer testing.allocator.free(payload);
+    const parsed = try ChannelWindow.parse(payload);
+    try testing.expectEqual(@as(u32, 17), parsed.channel_id);
+    try testing.expectEqual(@as(u32, 4096), parsed.credit_bytes);
 }
