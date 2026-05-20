@@ -245,6 +245,7 @@ fn daemonMain(alloc: Allocator) !void {
         .socket_path = try alloc.dupe(u8, socket_path),
         .groups = std.AutoArrayHashMap(Uuid, *SessionGroup).init(alloc),
         .listener = try bindUnixSocket(socket_path),
+        .channel_registry = session.channel_mux.Registry.init(alloc),
     };
     defer daemon.deinit();
 
@@ -314,6 +315,11 @@ const ClientThread = struct {
         readAllRaw(self.fd, payload) catch return;
 
         switch (kind) {
+            .capabilities => {
+                // Channel-mux mode: the peer announced its capabilities
+                // first. Handshake, then loop dispatching channel frames.
+                try self.runMuxMode(payload);
+            },
             .open => {
                 const open_data = session.protocol.Open.parse(payload) catch {
                     sendFrameFd(self.fd, .err, target, "invalid open payload") catch {};
@@ -346,6 +352,66 @@ const ClientThread = struct {
                 self.daemon.handleRename(rename_data);
             },
             else => {},
+        }
+    }
+
+    /// Run the channel-mux loop after the peer sent its initial
+    /// `capabilities` frame. Handshakes, then reads frames until EOF
+    /// or a fatal protocol error, dispatching channel kinds to the
+    /// per-connection `Mux` and rejecting legacy session-lifecycle
+    /// kinds with an `err` frame (terminals-as-a-service comes in a
+    /// later phase).
+    fn runMuxMode(self: *ClientThread, first_payload: []const u8) !void {
+        var mux = session.channel_mux.Mux.init(
+            self.daemon.alloc,
+            self.fd,
+            &self.daemon.channel_registry,
+        );
+        defer mux.deinit();
+
+        // Capability exchange. `handshake` parses the already-read
+        // payload and sends our reply.
+        const peer = mux.handshake(first_payload) catch |err| {
+            log.warn("capability handshake failed: {}", .{err});
+            return;
+        };
+        defer self.daemon.alloc.free(peer.services);
+
+        // Frame pump. Each iteration reads one frame and dispatches.
+        while (true) {
+            var hbuf: [session.protocol.header_size]u8 = undefined;
+            readAllRaw(self.fd, &hbuf) catch return;
+            const hdr = session.protocol.Header.parseFromBuf(&hbuf) catch return;
+            if (hdr.len > session.protocol.max_payload) return;
+
+            const buf = try self.daemon.alloc.alloc(u8, hdr.len);
+            defer self.daemon.alloc.free(buf);
+            readAllRaw(self.fd, buf) catch return;
+
+            switch (hdr.kind) {
+                .channel_open,
+                .channel_opened,
+                .channel_data,
+                .channel_window,
+                .channel_eof,
+                .channel_close,
+                .channel_control,
+                .capabilities,
+                => mux.dispatch(hdr.kind, buf) catch |err| {
+                    log.warn("mux dispatch error: {}", .{err});
+                    return;
+                },
+                // Legacy session-lifecycle kinds are not supported on
+                // mux-mode connections in this phase. Reject so the
+                // client knows to use a separate connection (or wait
+                // for the terminal-as-a-service implementation).
+                .open, .close, .list_request, .rename => {
+                    sendFrameFd(self.fd, .err, 0, "legacy frame on mux connection") catch {};
+                },
+                else => {
+                    log.debug("ignoring unexpected kind={} on mux connection", .{hdr.kind});
+                },
+            }
         }
     }
 };
@@ -426,10 +492,15 @@ const Daemon = struct {
     listener: posix.fd_t,
     mutex: std.Thread.Mutex = .{},
     groups: std.AutoArrayHashMap(Uuid, *SessionGroup),
+    /// Registry of channel-mux services. Populated at startup; read-only
+    /// thereafter. Empty in Phase 6A.2 — every channel_open is rejected
+    /// with service_not_supported until services land in 6A.3.
+    channel_registry: session.channel_mux.Registry,
 
     fn deinit(self: *Daemon) void {
         for (self.groups.values()) |group| group.deinit();
         self.groups.deinit();
+        self.channel_registry.deinit();
         closeFd(self.listener);
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         self.alloc.free(self.socket_path);

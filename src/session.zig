@@ -1,5 +1,6 @@
 pub const shared = @import("session/shared.zig");
 pub const protocol = @import("session/protocol.zig");
+pub const channel_mux = @import("session/channel_mux.zig");
 pub const layout = @import("session/layout.zig");
 pub const registry = @import("session/registry.zig");
 pub const client = @import("session/client.zig");
