@@ -2,22 +2,36 @@
 //! surface declared in `include/ghostty.h` (see "SSH connection +
 //! channel multiplexing API" section). Phase 6B.1 lays down the
 //! handle layout, the extern C entry points, and the buffer/callback
-//! plumbing. The actual transport wiring — driving
-//! `SshConnectionManager` for connection lifecycle and a per-Entry
-//! client-side channel mux for the channel ops — is gated on:
+//! plumbing.
 //!
-//!   * A state-listener hook on `SshConnectionManager.Entry` so the
-//!     C API can subscribe to connection-state transitions without
-//!     piggybacking on per-surface mailboxes (the existing fan-out).
-//!     Tracked as TODO(state-listener).
-//!   * A client-side channel mux helper in `src/session/` that owns
-//!     the outbound `channel_open` / inbound `channel_opened`
-//!     state machine the daemon-side `Mux` doesn't provide.
-//!     Tracked as TODO(client-mux).
+//! Currently functional:
 //!
-//! Until both land, the entry points either return a handle that
-//! reports CONNECTING + FAILED(unknown) (so embedders can exercise
-//! their state-machine wrapper) or no-op with a log message.
+//!   * `ghostty_ssh_open` acquires an `SshConnectionManager.Entry`
+//!     via the embedder-provided `ghostty_app_t`, registers a
+//!     `SshListener` on the Entry, and translates each broadcast
+//!     `ConnectionState` into a C `ghostty_ssh_state_t` to fire the
+//!     embedder's `on_state`.
+//!   * `ghostty_ssh_close` / `ghostty_ssh_free` unregister the
+//!     listener, release the Entry, and cascade an
+//!     `on_close(reason=daemon_shutdown)` to every live channel
+//!     handle rooted on the connection.
+//!
+//! Still gated on a follow-up:
+//!
+//!   * Channel transport: write/eof/close currently only manipulate
+//!     the channel handle's local state. Real byte flow needs a
+//!     client-side channel mux (the existing daemon-side
+//!     `channel_mux.Mux` only dispatches inbound `channel_open`, not
+//!     outbound). Tracked as TODO(client-mux).
+//!   * `ghostty_ssh_attach_surface` needs to drive the existing
+//!     `termio.Remote.setupConnection` machinery to actually open a
+//!     terminal session; for now it returns a handle that immediately
+//!     reports `on_close(SERVICE_ERROR)` so embedders can exercise
+//!     that edge. Tracked as TODO(terminal-attach).
+//!   * Password / host-key / list-sessions / rename / kill are
+//!     present-but-no-op exports; they will hop onto the connection's
+//!     existing `auth_state` / `session_list` paths in a follow-up
+//!     once the listener-driven prompt token plumbing is in.
 //!
 //! Threading & ownership rules (mirrors the contract documented in
 //! include/ghostty.h):
@@ -34,6 +48,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const protocol = @import("../../session/protocol.zig");
+const SshConnectionManager = @import("../../termio/SshConnectionManager.zig");
+const apprt_embedded = @import("../embedded.zig");
 
 const log = std.log.scoped(.ssh_capi);
 
@@ -313,6 +329,22 @@ pub const SshHandle = struct {
     /// Guards `callbacks` (so embedders can swap callbacks via a future
     /// API without racing dispatch) and the channel registry.
     mutex: std.Thread.Mutex = .{},
+    /// Connection-pool manager that owns the underlying Entry. Borrowed;
+    /// outlives this handle. NULL only in unit tests that exercise the
+    /// handle plumbing without a real CoreApp.
+    manager: ?*SshConnectionManager = null,
+    /// Pool entry acquired in ghostty_ssh_open and released in
+    /// ghostty_ssh_close. Null when `manager` is null.
+    entry: ?*SshConnectionManager.Entry = null,
+    /// Set to true once the listener is registered on the Entry so
+    /// close knows to unregister it (and so unit tests that bypass the
+    /// manager don't try to).
+    listener_registered: bool = false,
+    /// Stable per-host name used when releasing the Entry. Owned copy
+    /// because `entry.ctx.ssh_target` may be invalidated under us if
+    /// the Entry is freed before our close path runs.
+    release_target: ?[]u8 = null,
+    release_jump: ?[]u8 = null,
     /// Live channels rooted on this connection. Used to validate the
     /// "free channels before ssh" invariant and to broadcast TRANSPORT
     /// closes on reconnect.
@@ -338,6 +370,8 @@ pub const SshHandle = struct {
 
     fn deinit(self: *SshHandle) void {
         std.debug.assert(self.channels.count() == 0);
+        if (self.release_target) |t| self.alloc.free(t);
+        if (self.release_jump) |j| self.alloc.free(j);
         self.config.deinit(self.alloc);
         self.channels.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -364,6 +398,21 @@ pub const SshHandle = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = self.channels.swapRemove(@intFromPtr(ch));
+    }
+
+    /// Bridge from `SshConnectionManager.Entry`'s SshListener to the
+    /// embedder's `on_state`. Translates the rich
+    /// `protocol.ConnectionState` union into a flat
+    /// `ghostty_ssh_state_t` and forwards. Fires on the SSH thread
+    /// per the listener-hook contract.
+    fn onStateListener(ctx: *anyopaque, state: protocol.ConnectionState) void {
+        const self: *SshHandle = @ptrCast(@alignCast(ctx));
+        // Once closed, swallow late events — the listener is
+        // unregistered in close() before we get here in steady state,
+        // but a state already in flight on the SSH thread could race
+        // past the unregister.
+        if (self.closed.load(.acquire)) return;
+        self.emitState(translateState(state));
     }
 };
 
@@ -431,12 +480,81 @@ pub const ChannelHandle = struct {
 };
 
 // =========================================================================
+// Internal helpers — state translation, manager access.
+// =========================================================================
+
+/// Translate `protocol.ConnectionState` into the flat C `ghostty_ssh_state_t`.
+/// PasswordPrompt currently surfaces `auth_token=0` because the
+/// token-allocation plumbing lands with the password follow-up; embedders
+/// can recognize a PASSWORD_REQUIRED transition today but must wait for
+/// the follow-up before driving submit_password against a specific token.
+fn translateState(state: protocol.ConnectionState) State {
+    return switch (state) {
+        .connecting => .{ .kind = .connecting, .payload = .{
+            .password = std.mem.zeroes(StatePassword),
+        } },
+        .uploading => |u| .{ .kind = .uploading, .payload = .{ .upload = .{
+            .bytes_sent = u.bytes_sent,
+            .total_bytes = u.total_bytes,
+            .source = ProvisionSource.fromZig(u.source),
+        } } },
+        .downloading => .{ .kind = .downloading, .payload = .{
+            .password = std.mem.zeroes(StatePassword),
+        } },
+        .setup => .{ .kind = .setup, .payload = .{
+            .password = std.mem.zeroes(StatePassword),
+        } },
+        .connected => .{ .kind = .connected, .payload = .{
+            .password = std.mem.zeroes(StatePassword),
+        } },
+        .reconnecting => |r| .{ .kind = .reconnecting, .payload = .{ .reconnect = .{
+            .attempt = r.attempt,
+            .max_attempts = r.max_attempts,
+            .elapsed_ns = @intCast(r.elapsed_ns),
+            .next_retry_ns = @intCast(r.next_retry_ns),
+        } } },
+        .stale => .{ .kind = .stale, .payload = .{
+            .password = std.mem.zeroes(StatePassword),
+        } },
+        .failed => |f| .{ .kind = .failed, .payload = .{ .fail = .{
+            .reason = FailReason.fromZig(f),
+            .message = null,
+        } } },
+        .disconnected => |d| .{ .kind = .disconnected, .payload = .{ .disconnect = .{
+            .attempts_made = d.attempts_made,
+            .reason = DisconnectReason.fromZig(d.reason),
+        } } },
+        .password_required => |p| blk: {
+            const host_ptr: [*:0]const u8 = if (p.host_len == 0)
+                ""
+            else
+                @ptrCast(&p.host);
+            break :blk .{ .kind = .password_required, .payload = .{ .password = .{
+                .is_jump = p.is_jump,
+                .host = host_ptr,
+                .auth_token = 0,
+            } } };
+        },
+    };
+}
+
+/// Resolve the SshConnectionManager from a ghostty_app_t (cast to
+/// *apprt.embedded.App on import). Returns null in environments where
+/// the embedded app isn't available (e.g. when invoked from a test
+/// harness that doesn't construct a CoreApp).
+fn managerFromAppPtr(app: ?*anyopaque) ?*SshConnectionManager {
+    const app_ptr = app orelse return null;
+    const embedded_app: *apprt_embedded.App = @ptrCast(@alignCast(app_ptr));
+    return &embedded_app.core_app.ssh_connection_manager;
+}
+
+// =========================================================================
 // C-ABI exports. These match the declarations in `include/ghostty.h`.
 // =========================================================================
 
 /// Implements `ghostty_ssh_open`.
 export fn ghostty_ssh_open(
-    _: ?*anyopaque, // ghostty_app_t — reserved for future per-app pooling
+    app: ?*anyopaque, // ghostty_app_t — used to reach the shared SshConnectionManager
     config: ?*const Config,
     callbacks: ?*const SshCallbacks,
 ) ?*SshHandle {
@@ -452,16 +570,90 @@ export fn ghostty_ssh_open(
         log.warn("ghostty_ssh_open: alloc failed: {}", .{err});
         return null;
     };
+    errdefer handle.deinit();
 
-    // Emit the initial CONNECTING state synchronously. The actual
-    // transport wiring (acquiring an Entry from SshConnectionManager,
-    // driving its threads) is gated on the state-listener hook —
-    // tracked as TODO(state-listener). Until that lands, the handle
-    // stays in CONNECTING until the embedder calls ghostty_ssh_close
-    // or a future code path transitions it.
+    // Initial CONNECTING — fired before we touch the manager so the
+    // embedder always sees this transition first, even if Entry
+    // acquisition fails below.
     handle.emitState(.{ .kind = .connecting, .payload = .{
         .password = std.mem.zeroes(StatePassword),
     } });
+
+    // Optional manager — embedders may pass null in test harnesses;
+    // the handle is still usable as a state-machine driver against
+    // the synthetic transitions we generate here.
+    if (managerFromAppPtr(app)) |mgr| {
+        const target_slice = std.mem.span(@as([*:0]const u8, handle.config.target));
+        const jump_slice: ?[]const u8 = if (handle.config.jump) |j| std.mem.span(@as([*:0]const u8, j)) else null;
+
+        const entry = mgr.acquire(target_slice, jump_slice) catch |err| {
+            log.warn("ghostty_ssh_open: acquire failed: {}", .{err});
+            handle.emitState(.{ .kind = .failed, .payload = .{ .fail = .{
+                .reason = .unknown,
+                .message = null,
+            } } });
+            return null;
+        };
+
+        // Cache the (target, jump) pair for the symmetric release in
+        // close — entry.ctx fields are owned by SshContext and we
+        // don't want to assume they survive a failed connect.
+        handle.release_target = global.alloc.dupe(u8, target_slice) catch {
+            mgr.release(target_slice, jump_slice);
+            handle.emitState(.{ .kind = .failed, .payload = .{ .fail = .{
+                .reason = .unknown,
+                .message = null,
+            } } });
+            return null;
+        };
+        if (jump_slice) |j| {
+            handle.release_jump = global.alloc.dupe(u8, j) catch {
+                mgr.release(target_slice, jump_slice);
+                handle.emitState(.{ .kind = .failed, .payload = .{ .fail = .{
+                    .reason = .unknown,
+                    .message = null,
+                } } });
+                return null;
+            };
+        }
+        handle.manager = mgr;
+        handle.entry = entry;
+
+        // Apply reconnect-related config knobs. Surface attach is what
+        // actually drives `setupConnection` today; the C-API doesn't
+        // own that path, but the Entry-level knobs (interval, max
+        // attempts) belong to the connection-pool level and must be
+        // set before the first attach so reconnect respects them.
+        if (cfg.max_reconnect_attempts != std.math.maxInt(u32)) {
+            entry.max_reconnect_attempts = cfg.max_reconnect_attempts;
+        }
+        if (cfg.reconnect_interval_ms != 0) {
+            entry.reconnect_interval_ms = cfg.reconnect_interval_ms;
+        }
+        if (cfg.scrollback_limit_bytes != 0) {
+            entry.scrollback_limit = cfg.scrollback_limit_bytes;
+        }
+
+        // Register the listener AFTER the manager + entry are set up
+        // so the very first replayed state is delivered through the
+        // bridge with all pointers valid.
+        SshConnectionManager.registerStateListener(entry, .{
+            .ctx = handle,
+            .on_state = SshHandle.onStateListener,
+        }) catch |err| {
+            log.warn("ghostty_ssh_open: registerStateListener failed: {}", .{err});
+            mgr.release(target_slice, jump_slice);
+            handle.manager = null;
+            handle.entry = null;
+            handle.emitState(.{ .kind = .failed, .payload = .{ .fail = .{
+                .reason = .unknown,
+                .message = null,
+            } } });
+            return null;
+        };
+        handle.listener_registered = true;
+    }
+
     return handle;
 }
 
@@ -499,16 +691,25 @@ export fn ghostty_ssh_submit_host_key_decision(
     log.debug("ghostty_ssh_submit_host_key_decision: not yet wired", .{});
 }
 
-/// Implements `ghostty_ssh_request_reconnect`.
+/// Implements `ghostty_ssh_request_reconnect`. Routes to the
+/// SshConnectionManager's atomic Retry-Now signal so a backed-off
+/// reconnect loop fires immediately instead of finishing its sleep.
 export fn ghostty_ssh_request_reconnect(ssh: ?*SshHandle) void {
-    _ = ssh;
-    log.debug("ghostty_ssh_request_reconnect: not yet wired", .{});
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse return;
+    SshConnectionManager.requestReconnect(entry);
 }
 
-/// Implements `ghostty_ssh_cancel_reconnect`.
+/// Implements `ghostty_ssh_cancel_reconnect`. Cancels in-flight
+/// reconnect attempts; the manager then broadcasts
+/// `DISCONNECTED(reason=cancelled)` which flows back through the
+/// listener bridge.
 export fn ghostty_ssh_cancel_reconnect(ssh: ?*SshHandle) void {
-    _ = ssh;
-    log.debug("ghostty_ssh_cancel_reconnect: not yet wired", .{});
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse return;
+    SshConnectionManager.cancelReconnect(entry);
 }
 
 /// Implements `ghostty_ssh_close`. After this, channels are
@@ -516,6 +717,16 @@ export fn ghostty_ssh_cancel_reconnect(ssh: ?*SshHandle) void {
 export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
     const h = ssh orelse return;
     if (h.closed.swap(true, .acq_rel)) return;
+
+    // Unregister the listener BEFORE we tear down channels so any
+    // late state broadcasts from the SSH thread (e.g. as the Entry
+    // notices the channel drop) don't race with the close cascade.
+    if (h.listener_registered) {
+        if (h.entry) |entry| {
+            SshConnectionManager.unregisterStateListener(entry, h);
+        }
+        h.listener_registered = false;
+    }
 
     // Snapshot the channel list under the mutex, then close each
     // outside the mutex (emitClose calls back into the embedder).
@@ -528,6 +739,17 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
 
     for (snapshot.items) |ch| {
         ch.emitClose(.daemon_shutdown, null);
+    }
+
+    // Release the pool entry symmetrically with acquire. Use the
+    // cached target/jump from open since entry.ctx may have been
+    // partially torn down by a failed connect.
+    if (h.manager) |mgr| {
+        if (h.release_target) |t| {
+            mgr.release(t, h.release_jump);
+        }
+        h.manager = null;
+        h.entry = null;
     }
 
     h.emitState(.{ .kind = .disconnected, .payload = .{ .disconnect = .{
@@ -865,4 +1087,143 @@ test "OwnedConfig duplicates string fields" {
     buf_jump[0] = 'X';
     try testing.expectEqualStrings("u@h", owned.target);
     try testing.expectEqualStrings("j@k", owned.jump.?);
+}
+
+test "translateState — simple variants map to the right kind" {
+    try testing.expectEqual(StateKind.connecting, translateState(.connecting).kind);
+    try testing.expectEqual(StateKind.downloading, translateState(.downloading).kind);
+    try testing.expectEqual(StateKind.setup, translateState(.setup).kind);
+    try testing.expectEqual(StateKind.connected, translateState(.connected).kind);
+    try testing.expectEqual(StateKind.stale, translateState(.stale).kind);
+}
+
+test "translateState — uploading payload carries progress" {
+    const s = translateState(.{ .uploading = .{
+        .bytes_sent = 1024,
+        .total_bytes = 4096,
+        .source = .github,
+    } });
+    try testing.expectEqual(StateKind.uploading, s.kind);
+    try testing.expectEqual(@as(u64, 1024), s.payload.upload.bytes_sent);
+    try testing.expectEqual(@as(u64, 4096), s.payload.upload.total_bytes);
+    try testing.expectEqual(ProvisionSource.github, s.payload.upload.source);
+}
+
+test "translateState — reconnect payload carries attempt + timing" {
+    const s = translateState(.{ .reconnecting = .{
+        .attempt = 2,
+        .max_attempts = 5,
+        .elapsed_ns = 1_500_000_000,
+        .next_retry_ns = 3_000_000_000,
+    } });
+    try testing.expectEqual(StateKind.reconnecting, s.kind);
+    try testing.expectEqual(@as(u32, 2), s.payload.reconnect.attempt);
+    try testing.expectEqual(@as(u32, 5), s.payload.reconnect.max_attempts);
+    try testing.expectEqual(@as(i64, 1_500_000_000), s.payload.reconnect.elapsed_ns);
+    try testing.expectEqual(@as(i64, 3_000_000_000), s.payload.reconnect.next_retry_ns);
+}
+
+test "translateState — failed payload carries reason" {
+    const s = translateState(.{ .failed = .auth_failed });
+    try testing.expectEqual(StateKind.failed, s.kind);
+    try testing.expectEqual(FailReason.auth_failed, s.payload.fail.reason);
+}
+
+test "translateState — disconnected payload carries reason + attempts" {
+    const s = translateState(.{ .disconnected = .{
+        .attempts_made = 3,
+        .reason = .exhausted,
+    } });
+    try testing.expectEqual(StateKind.disconnected, s.kind);
+    try testing.expectEqual(@as(u32, 3), s.payload.disconnect.attempts_made);
+    try testing.expectEqual(DisconnectReason.exhausted, s.payload.disconnect.reason);
+}
+
+test "translateState — password_required payload carries host" {
+    var prompt: protocol.ConnectionState.PasswordPrompt = .{
+        .is_jump = true,
+        .auth_state = null,
+    };
+    prompt.setHost("user@bastion.example");
+    const s = translateState(.{ .password_required = prompt });
+    try testing.expectEqual(StateKind.password_required, s.kind);
+    try testing.expect(s.payload.password.is_jump);
+    try testing.expectEqualStrings(
+        "user@bastion.example",
+        std.mem.span(s.payload.password.host),
+    );
+}
+
+test "ChannelCloseReason.fromProtocol maps protocol codes" {
+    try testing.expectEqual(ChannelCloseReason.normal, ChannelCloseReason.fromProtocol(.normal));
+    try testing.expectEqual(ChannelCloseReason.peer_reset, ChannelCloseReason.fromProtocol(.peer_reset));
+    try testing.expectEqual(ChannelCloseReason.service_error, ChannelCloseReason.fromProtocol(.service_error));
+    try testing.expectEqual(ChannelCloseReason.policy_denied, ChannelCloseReason.fromProtocol(.policy_denied));
+    try testing.expectEqual(ChannelCloseReason.idle_timeout, ChannelCloseReason.fromProtocol(.idle_timeout));
+    try testing.expectEqual(ChannelCloseReason.daemon_shutdown, ChannelCloseReason.fromProtocol(.daemon_shutdown));
+    // Unknown protocol value maps to .unknown via the `_` arm.
+    try testing.expectEqual(ChannelCloseReason.unknown, ChannelCloseReason.fromProtocol(@enumFromInt(99)));
+}
+
+test "SshHandle.onStateListener forwards through translateState" {
+    // Build a handle in test-mode (no manager). The listener bridge is
+    // a pure function of (handle.closed, callbacks, state) — we drive
+    // it directly to verify the translation arrives at the embedder.
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    // After open, last_state_kind is CONNECTING (the synchronous
+    // initial emit). Drive the listener directly with each rich state
+    // and verify the kind makes it through translation.
+    SshHandle.onStateListener(handle, .setup);
+    try testing.expectEqual(@as(?StateKind, .setup), cap.last_state_kind);
+
+    SshHandle.onStateListener(handle, .{ .reconnecting = .{
+        .attempt = 1,
+        .max_attempts = 5,
+        .elapsed_ns = 0,
+        .next_retry_ns = 0,
+    } });
+    try testing.expectEqual(@as(?StateKind, .reconnecting), cap.last_state_kind);
+
+    SshHandle.onStateListener(handle, .connected);
+    try testing.expectEqual(@as(?StateKind, .connected), cap.last_state_kind);
+}
+
+test "SshHandle.onStateListener swallows events after close" {
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    ghostty_ssh_close(handle);
+    // close() emitted DISCONNECTED — record it.
+    try testing.expectEqual(@as(?StateKind, .disconnected), cap.last_state_kind);
+
+    // Now any late listener event must be ignored.
+    cap.last_state_kind = null;
+    SshHandle.onStateListener(handle, .connected);
+    try testing.expect(cap.last_state_kind == null);
+
+    ghostty_ssh_free(handle);
 }

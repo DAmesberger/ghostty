@@ -1211,8 +1211,9 @@ typedef struct {
   const char* message;
 } ghostty_ssh_state_fail_t;
 
-// Tagged union surfaced via on_state. Read state.payload.<variant>
-// only when state.kind matches.
+// Tagged union surfaced via on_state. Read `kind` first and ONLY
+// access the `payload` variant field matching that kind — other
+// variant fields are uninitialized.
 typedef struct {
   ghostty_ssh_state_kind_e kind;
   union {
