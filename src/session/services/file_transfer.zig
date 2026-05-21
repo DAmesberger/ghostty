@@ -379,7 +379,13 @@ fn onClose(
     state.channel_attached.set();
 
     if (state.pump_thread) |t| {
-        // Best-effort: close the file fd to wake any pending read.
+        // Closing the file fd before joining looks like a race against
+        // the pump's posix.read, but the mux sets ch.close_signal
+        // before calling on_close (see channel_mux.zig:closeChannel /
+        // handleClose), so the pump observes the signal at its next
+        // loop check and exits without touching the fd. Closing the fd
+        // here also unblocks any thread currently parked inside a
+        // read() syscall.
         posix.close(state.file_fd);
         t.join();
         state.pump_thread = null;
@@ -398,7 +404,6 @@ fn onClose(
 fn pumpMain(state: *State) void {
     pumpLoop(state) catch |err| {
         log.warn("file_transfer pump exiting on error: {}", .{err});
-        sendFinal(state, .read_failed);
     };
 }
 
@@ -411,6 +416,14 @@ fn pumpLoop(state: *State) !void {
         const n = posix.read(state.file_fd, &buf) catch |err| switch (err) {
             error.WouldBlock => continue,
             else => {
+                // Send op=2 BEFORE requestClose. requestClose tears the
+                // channel down and removes it from the mux registry; any
+                // control frame queued after that point would race with
+                // the channel_close frame on the wire, and the peer may
+                // discard it as "frame for unknown channel". Order
+                // matters for the granular FinalStatus to actually reach
+                // the opener.
+                sendFinal(state, .read_failed);
                 state.mux.requestClose(ch, .service_error, @errorName(err)) catch {};
                 return;
             },
@@ -999,27 +1012,53 @@ fn readFrameAlloc(alloc: Allocator, fd: posix.fd_t) !struct {
     return .{ .header = header, .payload = payload };
 }
 
-test "file_transfer end-to-end: upload writes file and emits ok final" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var realbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &realbuf);
+/// Pick a guaranteed-unique path under /tmp by retrying with O_EXCL
+/// until create succeeds. Caller frees the returned path and is
+/// responsible for deleting the file. The created file is closed
+/// immediately — its only purpose is to claim the name.
+fn reserveUniqueTmpPath(alloc: Allocator, prefix: []const u8) ![]u8 {
+    const pid = posix.system.getpid();
+    const seed_mix: u64 = @bitCast(@as(i64, @truncate(std.time.nanoTimestamp())));
+    var rng = std.Random.DefaultPrng.init(seed_mix ^ @as(u64, @intCast(pid)));
+    var attempt: usize = 0;
+    while (attempt < 32) : (attempt += 1) {
+        const suffix = rng.next();
+        const path = try std.fmt.allocPrint(
+            alloc,
+            "/tmp/{s}-{d}-{x}",
+            .{ prefix, pid, suffix },
+        );
+        errdefer alloc.free(path);
+        const flags: posix.O = .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+        };
+        if (posix.open(path, flags, 0o600)) |fd| {
+            posix.close(fd);
+            return path;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(path);
+                continue;
+            },
+            else => return err,
+        }
+    }
+    return error.NoUniquePath;
+}
 
+test "file_transfer end-to-end: upload writes file and emits ok final" {
     var pair = try HeapMux.init(testing.allocator);
     defer pair.deinit();
     try register(pair.registry);
 
-    // Allow our tmp root only — install via env override would be
-    // intrusive; instead, place the upload under /tmp which is in the
-    // default allow-list.
-    const upload_name = try std.fmt.allocPrint(testing.allocator, "ghostty-ft-{d}", .{
-        @as(u32, @intCast(std.time.milliTimestamp() & 0xFFFFFFFF)),
-    });
-    defer testing.allocator.free(upload_name);
-    const upload_path = try std.fs.path.join(testing.allocator, &.{ "/tmp", upload_name });
+    // Place the upload under /tmp because it's in the default
+    // allow-list. reserveUniqueTmpPath uses O_EXCL so parallel test
+    // runs can't collide.
+    const upload_path = try reserveUniqueTmpPath(testing.allocator, "ghostty-ft-up");
     defer testing.allocator.free(upload_path);
     defer std.fs.cwd().deleteFile(upload_path) catch {};
-    _ = root;
 
     const payload = "hello-upload";
     var sha: [Sha256.digest_length]u8 = undefined;
@@ -1109,17 +1148,16 @@ test "file_transfer end-to-end: upload writes file and emits ok final" {
 }
 
 test "file_transfer end-to-end: download streams file and emits ok final" {
-    // Stage a fixture under /tmp.
+    // Stage a fixture under /tmp with an O_EXCL-claimed path so
+    // parallel test runs can't collide.
     const payload = "hello-download-payload";
-    const name = try std.fmt.allocPrint(testing.allocator, "ghostty-ft-dl-{d}", .{
-        @as(u32, @intCast(std.time.milliTimestamp() & 0xFFFFFFFF)),
-    });
-    defer testing.allocator.free(name);
-    const path = try std.fs.path.join(testing.allocator, &.{ "/tmp", name });
+    const path = try reserveUniqueTmpPath(testing.allocator, "ghostty-ft-dl");
     defer testing.allocator.free(path);
     defer std.fs.cwd().deleteFile(path) catch {};
     {
-        const f = try std.fs.cwd().createFile(path, .{});
+        // reserveUniqueTmpPath already created the file as empty; open
+        // again with truncate to write the fixture.
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer f.close();
         try f.writeAll(payload);
     }
