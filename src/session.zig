@@ -3,6 +3,7 @@ pub const protocol = @import("session/protocol.zig");
 pub const channel_mux = @import("session/channel_mux.zig");
 pub const services = struct {
     pub const tcp_connect = @import("session/services/tcp_connect.zig");
+    pub const browser_proxy = @import("session/services/browser_proxy.zig");
 };
 pub const layout = @import("session/layout.zig");
 pub const registry = @import("session/registry.zig");
