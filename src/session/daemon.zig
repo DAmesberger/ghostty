@@ -254,6 +254,8 @@ fn daemonMain(alloc: Allocator) !void {
     try session.services.tcp_connect.register(&daemon.channel_registry);
     try session.services.browser_proxy.register(&daemon.channel_registry);
     try session.services.file_transfer.register(&daemon.channel_registry);
+    try session.services.port_listener.register(&daemon.channel_registry);
+    try session.services.tcp_accepted.register(&daemon.channel_registry);
 
     while (true) {
         // Poll with timeout so we can periodically reap empty groups
