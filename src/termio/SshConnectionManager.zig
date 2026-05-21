@@ -140,7 +140,34 @@ pub const Entry = struct {
     // Session list query state (set by requester, collected by SSH thread)
     session_list: SessionListState = .{},
 
+    /// Generic connection-state listeners. Used by the libghostty C API
+    /// to surface ConnectionState transitions to embedders without
+    /// piggybacking on per-surface mailboxes. Guarded by
+    /// `listener_mutex`; the listener callback fires on the SSH thread
+    /// (i.e. whatever thread `broadcastConnectionState` runs on) — the
+    /// embedder is responsible for hopping to its own queue if needed.
+    ///
+    /// `last_state` snapshots the most recent broadcast so newly-
+    /// registered listeners can be replayed the current state under
+    /// the same lock that guards the live list — this prevents a
+    /// listener that registers concurrently with a state change from
+    /// either missing it or seeing it twice.
+    listener_mutex: std.Thread.Mutex = .{},
+    ssh_listeners: std.ArrayListUnmanaged(SshListener) = .empty,
+    last_state: ?session.protocol.ConnectionState = null,
+
     pub const AuthState = session.shared.AuthState;
+
+    /// A connection-state subscriber registered via
+    /// `registerStateListener`. `ctx` is the caller's identity (also
+    /// the key used by `unregisterStateListener`). `on_state` fires
+    /// once at registration time with the most recently broadcast
+    /// state (if any) and then on every subsequent
+    /// `broadcastConnectionState` call.
+    pub const SshListener = struct {
+        ctx: *anyopaque,
+        on_state: *const fn (ctx: *anyopaque, state: session.protocol.ConnectionState) void,
+    };
 
     pub const SessionListState = struct {
         mutex: std.Thread.Mutex = .{},
@@ -173,6 +200,7 @@ pub fn deinit(self: *SshConnectionManager) void {
         }
         entry.write_queue.deinit(entry.alloc);
         deinitSessions(entry);
+        entry.ssh_listeners.deinit(entry.alloc);
         entry.ctx.deinit();
         self.alloc.destroy(entry);
     }
@@ -696,6 +724,61 @@ fn broadcastConnectionState(entry: *Entry, state: session.protocol.ConnectionSta
     while (it.next()) |kv| {
         for (kv.value_ptr.*.surfaces.items) |s| {
             _ = s.surface_mailbox.push(.{ .connection_state = state }, .{ .forever = {} });
+        }
+    }
+    // Generic listeners (e.g. libghostty C API embedders). Cache the
+    // state for late-arriving registrations and fan out synchronously
+    // — listeners must be cheap (no blocking work, no embedder I/O)
+    // because they run on the SSH thread.
+    entry.listener_mutex.lock();
+    defer entry.listener_mutex.unlock();
+    entry.last_state = state;
+    for (entry.ssh_listeners.items) |listener| {
+        listener.on_state(listener.ctx, state);
+    }
+}
+
+/// Subscribe to ConnectionState transitions on this Entry. The
+/// listener's `on_state` callback fires immediately with the most
+/// recent broadcasted state (if any) so registrants never miss the
+/// initial transition, then on every subsequent transition.
+///
+/// Both the initial replay and the regular fan-out run under
+/// `listener_mutex`, so a listener registered concurrent with a
+/// state change observes that change exactly once. Callbacks fire on
+/// the SSH thread — embedders MUST hop to their own queue before
+/// doing any blocking work.
+///
+/// Listeners are keyed by `listener.ctx`. Re-registering the same
+/// ctx replaces the previous entry (so embedders can swap callbacks
+/// without an unregister round-trip).
+pub fn registerStateListener(entry: *Entry, listener: Entry.SshListener) !void {
+    entry.listener_mutex.lock();
+    defer entry.listener_mutex.unlock();
+    for (entry.ssh_listeners.items) |*existing| {
+        if (existing.ctx == listener.ctx) {
+            existing.* = listener;
+            // Replay the cached state under the lock so the new
+            // callback sees the current state before any future
+            // broadcast races past us.
+            if (entry.last_state) |s| listener.on_state(listener.ctx, s);
+            return;
+        }
+    }
+    try entry.ssh_listeners.append(entry.alloc, listener);
+    if (entry.last_state) |s| listener.on_state(listener.ctx, s);
+}
+
+/// Drop a previously-registered listener. Idempotent: unknown ctx is
+/// a no-op. After this returns, the listener's `on_state` is
+/// guaranteed not to fire again from any thread.
+pub fn unregisterStateListener(entry: *Entry, ctx: *anyopaque) void {
+    entry.listener_mutex.lock();
+    defer entry.listener_mutex.unlock();
+    for (entry.ssh_listeners.items, 0..) |existing, i| {
+        if (existing.ctx == ctx) {
+            _ = entry.ssh_listeners.swapRemove(i);
+            return;
         }
     }
 }
