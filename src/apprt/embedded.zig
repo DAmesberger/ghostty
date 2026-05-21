@@ -1391,6 +1391,9 @@ pub const CAPI = struct {
         if (builtin.target.os.tag.isDarwin()) {
             _ = Darwin;
         }
+        // Reference the SSH C-API glue so its `export fn`s land in
+        // the libghostty surface.
+        _ = @import("embedded/ssh_capi.zig");
     }
 
     /// Create a new app.
