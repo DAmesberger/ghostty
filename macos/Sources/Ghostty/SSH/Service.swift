@@ -18,7 +18,14 @@ extension Ghostty {
         var cService: ghostty_channel_service_e { get }
         /// Bytes copied by libghostty during `ghostty_ssh_open_channel`. May
         /// be empty for services with no per-open parameters.
-        func encodeParams() -> Data
+        ///
+        /// Throws `Ghostty.SSHError.openParamsTooLong` when an input field
+        /// exceeds the corresponding Zig parser's hard cap (`max_host_len` /
+        /// `max_path_len` / `max_metadata_len`). Failing here rather than
+        /// silently truncating prevents the worst-case bug — embedder asks
+        /// for `host="really-long-name.example.com"`, gets a "successful"
+        /// channel pointed at the truncated prefix instead of an error.
+        func encodeParams() throws -> Data
     }
 
     /// A remote interactive terminal. Use `SSHConnection.attachSurface` rather
@@ -28,7 +35,7 @@ extension Ghostty {
     struct TerminalService: ChannelService {
         init() {}
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TERMINAL }
-        func encodeParams() -> Data { Data() }
+        func encodeParams() throws -> Data { Data() }
     }
 
     /// Open a raw TCP connection through the remote host.
@@ -53,14 +60,15 @@ extension Ghostty {
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT }
 
-        func encodeParams() -> Data {
+        func encodeParams() throws -> Data {
             let hostBytes = Array(host.utf8)
-            let truncated = hostBytes.count > Self.maxHostLen
-                ? Array(hostBytes.prefix(Self.maxHostLen))
-                : hostBytes
+            guard hostBytes.count <= Self.maxHostLen else {
+                throw Ghostty.SSHError.openParamsTooLong(
+                    field: "host", length: hostBytes.count, limit: Self.maxHostLen)
+            }
             var out = Data()
-            appendLEUInt16(UInt16(truncated.count), to: &out)
-            out.append(contentsOf: truncated)
+            appendLEUInt16(UInt16(hostBytes.count), to: &out)
+            out.append(contentsOf: hostBytes)
             appendLEUInt16(port, to: &out)
             return out
         }
@@ -88,14 +96,15 @@ extension Ghostty {
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER }
 
-        func encodeParams() -> Data {
+        func encodeParams() throws -> Data {
             let hostBytes = Array(bindHost.utf8)
-            let truncated = hostBytes.count > Self.maxBindHostLen
-                ? Array(hostBytes.prefix(Self.maxBindHostLen))
-                : hostBytes
+            guard hostBytes.count <= Self.maxBindHostLen else {
+                throw Ghostty.SSHError.openParamsTooLong(
+                    field: "bindHost", length: hostBytes.count, limit: Self.maxBindHostLen)
+            }
             var out = Data()
-            appendLEUInt16(UInt16(truncated.count), to: &out)
-            out.append(contentsOf: truncated)
+            appendLEUInt16(UInt16(hostBytes.count), to: &out)
+            out.append(contentsOf: hostBytes)
             appendLEUInt16(port, to: &out)
             return out
         }
@@ -139,16 +148,19 @@ extension Ghostty {
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_FILE_TRANSFER }
 
-        func encodeParams() -> Data {
+        func encodeParams() throws -> Data {
             var out = Data()
             switch operation {
             case let .upload(path, mode, expected, totalSize):
-                let pathBytes = truncatedPath(path)
+                let pathBytes = try validatedPath(path)
                 out.append(0)                                     // direction
                 appendLEUInt32(mode, to: &out)                    // mode
                 appendLEUInt16(UInt16(pathBytes.count), to: &out) // path_len
                 out.append(contentsOf: pathBytes)
                 // 32-byte SHA-256: copy what was given, zero-pad/truncate to 32.
+                // `nil`/empty signals "skip verification" per file_transfer.zig:24;
+                // longer-than-32 is silently truncated (matches the SHA-256 digest
+                // length contract — there's no other valid interpretation).
                 var sha = [UInt8](repeating: 0, count: Self.sha256Length)
                 if let e = expected {
                     let take = min(e.count, Self.sha256Length)
@@ -157,7 +169,7 @@ extension Ghostty {
                 out.append(contentsOf: sha)
                 appendLEUInt64(totalSize, to: &out)
             case let .download(path):
-                let pathBytes = truncatedPath(path)
+                let pathBytes = try validatedPath(path)
                 out.append(1)                                     // direction
                 appendLEUInt32(0, to: &out)                       // mode (unused)
                 appendLEUInt16(UInt16(pathBytes.count), to: &out) // path_len
@@ -166,10 +178,11 @@ extension Ghostty {
             return out
         }
 
-        private func truncatedPath(_ s: String) -> [UInt8] {
+        private func validatedPath(_ s: String) throws -> [UInt8] {
             let bytes = Array(s.utf8)
-            if bytes.count > Self.maxPathLen {
-                return Array(bytes.prefix(Self.maxPathLen))
+            guard bytes.count <= Self.maxPathLen else {
+                throw Ghostty.SSHError.openParamsTooLong(
+                    field: "remotePath", length: bytes.count, limit: Self.maxPathLen)
             }
             return bytes
         }
@@ -193,7 +206,9 @@ extension Ghostty {
         static let maxHostLen: Int = 255
         static let maxMetadataLen: Int = 8 * 1024
 
-        /// Mirrors `browser_proxy.zig`'s `UpstreamKind` enum byte values.
+        /// Mirrors `browser_proxy.zig`'s `UpstreamKind` enum byte values
+        /// (browser_proxy.zig:80-85). Raw value IS the wire-byte the daemon
+        /// expects.
         enum UpstreamKind: UInt8, Sendable {
             case direct = 0
             case httpConnectTarget = 1
@@ -219,20 +234,22 @@ extension Ghostty {
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_BROWSER_PROXY }
 
-        func encodeParams() -> Data {
+        func encodeParams() throws -> Data {
             let hostBytes = Array(host.utf8)
-            let truncatedHost = hostBytes.count > Self.maxHostLen
-                ? Array(hostBytes.prefix(Self.maxHostLen))
-                : hostBytes
-            let meta = metadata.count > Self.maxMetadataLen
-                ? metadata.prefix(Self.maxMetadataLen)
-                : metadata
+            guard hostBytes.count <= Self.maxHostLen else {
+                throw Ghostty.SSHError.openParamsTooLong(
+                    field: "host", length: hostBytes.count, limit: Self.maxHostLen)
+            }
+            guard metadata.count <= Self.maxMetadataLen else {
+                throw Ghostty.SSHError.openParamsTooLong(
+                    field: "metadata", length: metadata.count, limit: Self.maxMetadataLen)
+            }
             var out = Data()
             out.append(upstreamKind.rawValue)
-            appendLEUInt16(UInt16(truncatedHost.count), to: &out)
-            out.append(contentsOf: truncatedHost)
+            appendLEUInt16(UInt16(hostBytes.count), to: &out)
+            out.append(contentsOf: hostBytes)
             appendLEUInt16(port, to: &out)
-            out.append(meta)
+            out.append(metadata)
             return out
         }
     }

@@ -168,7 +168,7 @@ extension Ghostty {
         /// flight; subscribe to the channel's `events` stream for the
         /// `opened` event (success) or `closed` event (failure).
         func openChannel<S: ChannelService>(_ service: S) throws -> SSHChannel<S> {
-            let params = service.encodeParams()
+            let params = try service.encodeParams()
 
             // Construct the wrapper + box up front and wire the box to the
             // wrapper's continuations BEFORE the C open call returns — that

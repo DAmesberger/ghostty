@@ -106,9 +106,9 @@ struct SSHTests {
 
     /// `[u16 LE host_len][host][u16 LE port]` — matches tcp_connect.zig:16-18.
     @Test
-    func tcpConnectEncodesLengthPrefixedHostAndLEPort() {
+    func tcpConnectEncodesLengthPrefixedHostAndLEPort() throws {
         let svc = Ghostty.TCPConnectService(host: "example.com", port: 8080)
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
         var expected: [UInt8] = []
         // host_len = 11, LE
         expected += [0x0B, 0x00]
@@ -122,9 +122,9 @@ struct SSHTests {
     /// tcp_connect (house style). Re-verify against port_listener.zig once
     /// Phase 6A.5 lands.
     @Test
-    func portListenerEncodesLengthPrefixedHostAndLEPort() {
+    func portListenerEncodesLengthPrefixedHostAndLEPort() throws {
         let svc = Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22)
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
         var expected: [UInt8] = []
         expected += [0x07, 0x00]                      // host_len = 7
         expected += Array("0.0.0.0".utf8)
@@ -136,7 +136,7 @@ struct SSHTests {
     /// [32-byte expected_sha256][u64 LE total_size]` — matches
     /// file_transfer.zig:18-26.
     @Test
-    func fileTransferUploadEncodesAllFields() {
+    func fileTransferUploadEncodesAllFields() throws {
         var sha = Data(count: 32)
         sha[0] = 0xAB
         sha[31] = 0xCD
@@ -146,7 +146,7 @@ struct SSHTests {
             expectedSHA256: sha,
             totalSize: 0x0102_0304_0506_0708
         ))
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
 
         var expected: [UInt8] = []
         expected += [0x00]                                              // direction = upload
@@ -164,9 +164,9 @@ struct SSHTests {
     /// Download params: `[u8 direction=1][u32 LE mode=0][u16 LE path_len][path]`
     /// — no trailer (file_transfer.zig:733).
     @Test
-    func fileTransferDownloadEncodesNoTrailer() {
+    func fileTransferDownloadEncodesNoTrailer() throws {
         let svc = Ghostty.FileTransferService(operation: .download(remotePath: "/tmp/a"))
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
 
         var expected: [UInt8] = []
         expected += [0x01]                                              // direction = download
@@ -180,14 +180,14 @@ struct SSHTests {
     /// Upload with no expected SHA: 32 zero bytes, signalling
     /// "skip verification" per file_transfer.zig:24.
     @Test
-    func fileTransferUploadWithoutSHAUsesZeroes() {
+    func fileTransferUploadWithoutSHAUsesZeroes() throws {
         let svc = Ghostty.FileTransferService(operation: .upload(
             remotePath: "/tmp/a",
             mode: 0o644,
             expectedSHA256: nil,
             totalSize: 0
         ))
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
         // SHA section starts after: 1 + 4 + 2 + 6 = 13 bytes.
         let sha = Array(bytes[13..<45])
         #expect(sha == [UInt8](repeating: 0, count: 32))
@@ -196,14 +196,14 @@ struct SSHTests {
     /// `[u8 upstream_kind][u16 LE host_len][host][u16 LE port][metadata]`
     /// — matches browser_proxy.zig:17-24.
     @Test
-    func browserProxyEncodesKindHostPortMetadata() {
+    func browserProxyEncodesKindHostPortMetadata() throws {
         let svc = Ghostty.BrowserProxyService(
             upstreamKind: .httpConnectTarget,
             host: "example.com",
             port: 443,
             metadata: Data([0x01, 0x02, 0x03])
         )
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
 
         var expected: [UInt8] = []
         expected += [0x01]                            // upstream_kind = http_connect_target
@@ -216,21 +216,113 @@ struct SSHTests {
     }
 
     @Test
-    func browserProxyEmptyMetadataOk() {
+    func browserProxyEmptyMetadataOk() throws {
         let svc = Ghostty.BrowserProxyService(
             upstreamKind: .direct,
             host: "10.0.0.1",
             port: 1080
         )
-        let bytes = [UInt8](svc.encodeParams())
+        let bytes = [UInt8](try svc.encodeParams())
         // No metadata appended — total = 1 + 2 + 8 + 2 = 13 bytes.
         #expect(bytes.count == 13)
         #expect(bytes[0] == 0)                        // direct = 0
     }
 
     @Test
-    func terminalServiceEncodesEmptyParams() {
-        #expect(Ghostty.TerminalService().encodeParams().isEmpty)
+    func terminalServiceEncodesEmptyParams() throws {
+        #expect(try Ghostty.TerminalService().encodeParams().isEmpty)
+    }
+
+    // MARK: - encodeParams rejects oversized inputs (task #11)
+    //
+    // The Zig parsers reject oversized fields with error.HostTooLong /
+    // .InvalidPathLen / .MetadataTooLong. Swift must surface this BEFORE
+    // calling into libghostty — silently truncating into a different
+    // destination than the embedder asked for is the worst-case bug.
+
+    @Test
+    func tcpConnectThrowsOnHostTooLong() {
+        let huge = String(repeating: "a", count: 256)  // 1 over max_host_len
+        let svc = Ghostty.TCPConnectService(host: huge, port: 80)
+        do {
+            _ = try svc.encodeParams()
+            Issue.record("expected encodeParams to throw")
+        } catch let e as Ghostty.SSHError {
+            #expect(e == .openParamsTooLong(field: "host", length: 256, limit: 255))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test
+    func portListenerThrowsOnBindHostTooLong() {
+        let huge = String(repeating: "b", count: 300)
+        let svc = Ghostty.PortListenerService(bindHost: huge, port: 22)
+        do {
+            _ = try svc.encodeParams()
+            Issue.record("expected throw")
+        } catch let e as Ghostty.SSHError {
+            #expect(e == .openParamsTooLong(field: "bindHost", length: 300, limit: 255))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test
+    func fileTransferThrowsOnPathTooLong() {
+        let huge = String(repeating: "x", count: 4097)
+        let svc = Ghostty.FileTransferService(operation: .download(remotePath: huge))
+        do {
+            _ = try svc.encodeParams()
+            Issue.record("expected throw")
+        } catch let e as Ghostty.SSHError {
+            #expect(e == .openParamsTooLong(field: "remotePath", length: 4097, limit: 4096))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test
+    func browserProxyThrowsOnHostTooLong() {
+        let huge = String(repeating: "h", count: 256)
+        let svc = Ghostty.BrowserProxyService(
+            upstreamKind: .direct, host: huge, port: 1)
+        do {
+            _ = try svc.encodeParams()
+            Issue.record("expected throw")
+        } catch let e as Ghostty.SSHError {
+            #expect(e == .openParamsTooLong(field: "host", length: 256, limit: 255))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test
+    func browserProxyThrowsOnMetadataTooLong() {
+        let bigMeta = Data(repeating: 0, count: 8 * 1024 + 1)
+        let svc = Ghostty.BrowserProxyService(
+            upstreamKind: .direct,
+            host: "ok",
+            port: 80,
+            metadata: bigMeta)
+        do {
+            _ = try svc.encodeParams()
+            Issue.record("expected throw")
+        } catch let e as Ghostty.SSHError {
+            #expect(e == .openParamsTooLong(field: "metadata", length: 8 * 1024 + 1, limit: 8 * 1024))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    /// Boundary case: input at exactly the cap should succeed.
+    @Test
+    func tcpConnectAcceptsHostAtMaxLen() throws {
+        let atMax = String(repeating: "a", count: 255)
+        let svc = Ghostty.TCPConnectService(host: atMax, port: 80)
+        let bytes = try svc.encodeParams()
+        // Total = 2 + 255 + 2 = 259 bytes.
+        #expect(bytes.count == 259)
     }
 
     // MARK: - C-enum to Swift-enum mappings

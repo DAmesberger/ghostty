@@ -156,6 +156,12 @@ extension Ghostty {
         case channelClosed
         /// `ghostty_ssh_list_sessions` returned false (connection not ready).
         case notReady
+        /// `encodeParams()` rejected an oversized input field. Mirrors the
+        /// Zig parser's hard caps (`max_host_len`, `max_path_len`,
+        /// `max_metadata_len`); failing here surfaces the misuse to the
+        /// embedder instead of silently truncating into a different
+        /// destination than they asked for.
+        case openParamsTooLong(field: String, length: Int, limit: Int)
 
         var description: String {
             switch self {
@@ -163,6 +169,8 @@ extension Ghostty {
             case .channelOpenFailed: return "ghostty_ssh_open_channel failed"
             case .channelClosed: return "channel closed"
             case .notReady: return "SSH connection not ready"
+            case let .openParamsTooLong(field, length, limit):
+                return "channel open params field \"\(field)\" is \(length) bytes, exceeds limit of \(limit)"
             }
         }
     }
