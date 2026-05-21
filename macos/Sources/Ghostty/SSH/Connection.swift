@@ -2,6 +2,15 @@ import Foundation
 import Combine
 import GhosttyKit
 
+// TODO(phase-6C): widen these SSH wrapper types to `public` once cmux is
+// ready to consume them via `import Ghostty`. That uplift has to be
+// coordinated module-wide because the `Ghostty` namespace itself is
+// internal and so are the existing Ghostty.App / Surface / Config /
+// SurfaceView types cmux already imports today. The widening is
+// deferred from 6B.2 into 6C precisely so the namespace + adjacent-type
+// public-uplift can land as one atomic change rather than half-public,
+// half-internal partial states.
+
 extension Ghostty {
     /// A single multiplexed SSH connection to one remote host.
     ///
@@ -16,29 +25,29 @@ extension Ghostty {
     /// wrapper hops every callback through `AsyncStream` continuations and
     /// `MainActor`-isolated property updates, so the public API can be
     /// called from any concurrency context.
-    public final class SSHConnection: @unchecked Sendable {
+    final class SSHConnection: @unchecked Sendable {
         // MARK: Configuration
 
-        public struct Config: Sendable {
+        struct Config: Sendable {
             /// "user@host[:port]".
-            public let target: String
+            let target: String
             /// Comma-separated jump-host chain. Empty = direct connect.
-            public let jump: String
+            let jump: String
             /// Path to an identity file. Empty = let libssh2 try the agent +
             /// default identities under ~/.ssh.
-            public let identityFile: String
+            let identityFile: String
             /// SSH keepalive interval; 0 uses libghostty default (15 s).
-            public let keepaliveIntervalMs: UInt32
+            let keepaliveIntervalMs: UInt32
             /// Reconnect attempts after an unexpected drop. 0 disables auto-
             /// reconnect entirely; UINT32_MAX gives the libghostty default.
-            public let maxReconnectAttempts: UInt32
+            let maxReconnectAttempts: UInt32
             /// Initial backoff; doubles per attempt, capped at 60 s. 0 uses
             /// libghostty default (1000 ms).
-            public let reconnectIntervalMs: UInt32
+            let reconnectIntervalMs: UInt32
             /// Soft cap on per-surface scrollback bytes; 0 = daemon default.
-            public let scrollbackLimitBytes: UInt32
+            let scrollbackLimitBytes: UInt32
 
-            public init(
+            init(
                 target: String,
                 jump: String = "",
                 identityFile: String = "",
@@ -60,16 +69,16 @@ extension Ghostty {
         // MARK: Public surface
 
         /// All connection state transitions, including the initial `connecting`.
-        public let state: AsyncStream<ConnectionState>
+        let state: AsyncStream<ConnectionState>
 
         /// The most recent state snapshot. Read this on `MainActor` for a
         /// stable value; off-actor reads are safe but may observe a value
         /// that was just superseded.
-        @MainActor public private(set) var currentState: ConnectionState = .connecting
+        @MainActor private(set) var currentState: ConnectionState = .connecting
 
         /// Combine bridge over `state`. The subject is fed alongside the
         /// `AsyncStream` so consumers always see a value on subscribe.
-        public var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
+        var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
             stateSubject.eraseToAnyPublisher()
         }
 
@@ -93,7 +102,7 @@ extension Ghostty {
         /// to observe transitions — including `passwordRequired`, whose
         /// callbacks need to fire before `connected` is reachable, which
         /// rules out a blocking "await connected" init.
-        public init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t) throws {
+        init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t) throws {
             self.hostKeyHandler = hostKey
             self.stateSubject = CurrentValueSubject(.connecting)
 
@@ -158,7 +167,7 @@ extension Ghostty {
         /// Open a typed channel. Returns once the C-side open call is in-
         /// flight; subscribe to the channel's `events` stream for the
         /// `opened` event (success) or `closed` event (failure).
-        public func openChannel<S: ChannelService>(_ service: S) throws -> SSHChannel<S> {
+        func openChannel<S: ChannelService>(_ service: S) throws -> SSHChannel<S> {
             let params = service.encodeParams()
 
             // Construct the wrapper + box up front and wire the box to the
@@ -200,7 +209,7 @@ extension Ghostty {
 
         /// Attach (or re-attach) a terminal surface over this connection.
         /// Pass `nil` for either UUID to let libghostty generate one.
-        public func attachSurface(
+        func attachSurface(
             groupID: UUID?,
             surfaceID: UUID?,
             size: TerminalSize,
@@ -244,7 +253,7 @@ extension Ghostty {
             return channel
         }
 
-        public func listSessions() async throws -> [SessionListEntry] {
+        func listSessions() async throws -> [SessionListEntry] {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[SessionListEntry], Swift.Error>) in
                 let collector = SessionListCollector(continuation: cont)
                 let ptr = Unmanaged.passRetained(collector).toOpaque()
@@ -257,11 +266,11 @@ extension Ghostty {
             }
         }
 
-        public func requestReconnect() {
+        func requestReconnect() {
             ghostty_ssh_request_reconnect(handle)
         }
 
-        public func cancelReconnect() {
+        func cancelReconnect() {
             ghostty_ssh_cancel_reconnect(handle)
         }
 

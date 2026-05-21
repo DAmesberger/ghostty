@@ -15,15 +15,15 @@ extension Ghostty {
     /// (any libghostty worker thread), and `write(_:)` is internally
     /// serialised through a private actor so the credit accounting stays
     /// consistent.
-    public final class SSHChannel<S: ChannelService>: @unchecked Sendable {
+    final class SSHChannel<S: ChannelService>: @unchecked Sendable {
         // MARK: Public surface
 
-        public let service: S
+        let service: S
 
-        public let output: AsyncStream<Data>
-        public let events: AsyncStream<Event>
+        let output: AsyncStream<Data>
+        let events: AsyncStream<Event>
 
-        public enum Event: Sendable {
+        enum Event: Sendable {
             /// The peer accepted the open. `serviceAck` is service-defined.
             case opened(serviceAck: Data, initialPeerWindow: UInt32)
             /// Outbound credit was granted by the peer.
@@ -36,7 +36,7 @@ extension Ghostty {
             case closed(reason: CloseReason, message: String?, wasTransport: Bool)
         }
 
-        public enum CloseReason: Sendable {
+        enum CloseReason: Sendable {
             case normal
             case peerReset
             case serviceError
@@ -134,7 +134,7 @@ extension Ghostty {
         ///
         /// Throws `Ghostty.SSHError.channelClosed` if the channel is closed or
         /// closes during the write.
-        public func write(_ data: Data) async throws {
+        func write(_ data: Data) async throws {
             guard !data.isEmpty else { return }
             let h = requireHandle()
 
@@ -169,13 +169,13 @@ extension Ghostty {
         }
 
         /// Half-close the local end of the channel.
-        public func sendEOF() {
+        func sendEOF() {
             ghostty_channel_eof(requireHandle())
         }
 
         /// Close the channel with a NORMAL reason. The `closed` event will
         /// arrive on `events` after the close round-trip.
-        public func close() {
+        func close() {
             ghostty_channel_close(requireHandle(), GHOSTTY_CHANNEL_CLOSE_NORMAL)
         }
     }
