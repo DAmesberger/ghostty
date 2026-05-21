@@ -538,6 +538,7 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
         if (entry.remote_bin_path.len > 0) self.alloc.free(entry.remote_bin_path);
         if (entry.channel) |*ch| ch.close();
         deinitSessions(entry);
+        entry.ssh_listeners.deinit(entry.alloc);
         entry.ctx.deinit();
         self.alloc.destroy(entry);
 
@@ -718,23 +719,42 @@ fn notifyAllSurfaces(entry: *Entry) void {
 }
 
 fn broadcastConnectionState(entry: *Entry, state: session.protocol.ConnectionState) void {
-    entry.surfaces_mutex.lock();
-    defer entry.surfaces_mutex.unlock();
-    var it = entry.sessions.iterator();
-    while (it.next()) |kv| {
-        for (kv.value_ptr.*.surfaces.items) |s| {
-            _ = s.surface_mailbox.push(.{ .connection_state = state }, .{ .forever = {} });
+    // Surface fan-out runs under surfaces_mutex. Scope-block so the
+    // defer releases it before we touch listener_mutex — the two
+    // locks intentionally do not nest, so a listener callback that
+    // (e.g. via the libghostty C API) eventually calls back into a
+    // surfaces-mutex-guarded API never deadlocks on this thread.
+    {
+        entry.surfaces_mutex.lock();
+        defer entry.surfaces_mutex.unlock();
+        var it = entry.sessions.iterator();
+        while (it.next()) |kv| {
+            for (kv.value_ptr.*.surfaces.items) |s| {
+                _ = s.surface_mailbox.push(.{ .connection_state = state }, .{ .forever = {} });
+            }
         }
     }
     // Generic listeners (e.g. libghostty C API embedders). Cache the
-    // state for late-arriving registrations and fan out synchronously
-    // — listeners must be cheap (no blocking work, no embedder I/O)
-    // because they run on the SSH thread.
+    // state for late-arriving registrations under listener_mutex,
+    // then dupe the slice and release the lock BEFORE invoking
+    // callbacks — listeners that re-enter the listener API (e.g.
+    // unregister from inside on_state) would otherwise deadlock.
+    // Listeners must still be cheap (no blocking work, no embedder
+    // I/O) because they run on the SSH thread.
     entry.listener_mutex.lock();
-    defer entry.listener_mutex.unlock();
     entry.last_state = state;
-    for (entry.ssh_listeners.items) |listener| {
-        listener.on_state(listener.ctx, state);
+    const dup_snapshot = entry.alloc.dupe(Entry.SshListener, entry.ssh_listeners.items) catch null;
+    if (dup_snapshot) |snapshot| {
+        entry.listener_mutex.unlock();
+        defer entry.alloc.free(snapshot);
+        for (snapshot) |listener| listener.on_state(listener.ctx, state);
+    } else {
+        // Allocation failure: fall back to iterating under the lock.
+        // A listener that re-enters the listener API from on_state
+        // will deadlock here — better than dropping the broadcast,
+        // which is the only other option.
+        defer entry.listener_mutex.unlock();
+        for (entry.ssh_listeners.items) |listener| listener.on_state(listener.ctx, state);
     }
 }
 

@@ -41,12 +41,16 @@
 //!   * Callbacks fire on libghostty-owned worker threads. The handle
 //!     holds the callback set behind a mutex so submit_* calls from
 //!     inside a callback are safe.
-//!   * Exception: ghostty_ssh_open synchronously invokes on_state
-//!     exactly once with kind = CONNECTING before returning, so
-//!     embedders are guaranteed at-least-one state observation as
-//!     part of construction. That single initial callback fires on
-//!     the calling thread. ALL subsequent state, host-key, and
-//!     channel callbacks honor the worker-thread rule.
+//!   * ONE EXCEPTION: ghostty_ssh_open fires on_state SYNCHRONOUSLY
+//!     on the calling thread for the initial CONNECTING transition
+//!     AND for any FAILED transitions emitted before this function
+//!     returns (e.g. when Entry acquisition or jump-spec duplication
+//!     fails). From the moment ghostty_ssh_open returns successfully,
+//!     all subsequent on_state fires on libghostty worker threads.
+//!     Embedders that hop to a serial queue from on_state should be
+//!     prepared to see the very first one (and possibly a FAILED
+//!     transition, depending on the config) happen on the open
+//!     caller's thread.
 //!   * Buffers passed in are copied; buffers handed to callbacks are
 //!     borrowed for the callback duration.
 
@@ -359,6 +363,18 @@ pub const SshHandle = struct {
     /// for embedder polling and for tearing through partial state on
     /// close.
     state_kind: std.atomic.Value(c_int) = .{ .raw = @intFromEnum(StateKind.connecting) },
+    /// Stable storage for the host string surfaced via a PASSWORD_REQUIRED
+    /// `ghostty_ssh_state_t`. ConnectionState.PasswordPrompt carries the
+    /// host inline in a stack-resident `[128]u8`; once the broadcast call
+    /// frame unwinds those bytes are dead, so we copy into this buffer
+    /// under `mutex` before firing the embedder's callback. Buffer is
+    /// valid for the callback duration and remains valid until the NEXT
+    /// PASSWORD_REQUIRED arrives — embedders that incidentally retain
+    /// the pointer past the immediate callback see the same bytes until
+    /// the next prompt rewrites them. +1 reserves space for the NUL
+    /// terminator the C type requires.
+    last_password_host: [129]u8 = [_]u8{0} ** 129,
+    last_password_host_len: u8 = 0,
     /// Set when ghostty_ssh_close has been called; channel ops error
     /// out after this.
     closed: std.atomic.Value(bool) = .{ .raw = false },
@@ -385,11 +401,55 @@ pub const SshHandle = struct {
 
     /// Dispatch a state change to the embedder's `on_state`. Safe to
     /// call from any thread; the callback fires on the calling thread.
+    ///
+    /// Note: this is the low-level path used by code that has already
+    /// constructed a fully-owned `State`. For broadcasts coming from
+    /// the listener bridge (which carry a stack-resident host string in
+    /// the PasswordPrompt case), use `emitStateFromConnectionState`
+    /// instead so the host string gets copied into the handle-owned
+    /// stable buffer.
     fn emitState(self: *SshHandle, state: State) void {
         self.state_kind.store(@intFromEnum(state.kind), .release);
         self.mutex.lock();
         const cb = self.callbacks.on_state;
         const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+        if (cb) |f| f(ud, &state);
+    }
+
+    /// Translate a `protocol.ConnectionState` and emit it to the
+    /// embedder. Stashes the PasswordPrompt host string into the
+    /// handle-owned `last_password_host` buffer under `mutex` (so
+    /// concurrent password broadcasts can't tear the buffer) and
+    /// rewrites `state.payload.password.host` to point at the stable
+    /// storage. The mutex is released BEFORE firing the callback —
+    /// the header contract allows embedders to call entry points
+    /// (which take the same mutex) from inside on_state.
+    ///
+    /// Concurrent two-PASSWORD_REQUIRED-on-the-same-handle is impossible
+    /// today because the manager's listener fan-out is serialized on
+    /// the SSH thread (see broadcastConnectionState); the buffer race
+    /// window is therefore mutex_lock..callback_dispatch, not the
+    /// callback duration itself.
+    fn emitStateFromConnectionState(
+        self: *SshHandle,
+        zig_state: protocol.ConnectionState,
+    ) void {
+        var state = translateState(zig_state);
+        self.mutex.lock();
+        const cb = self.callbacks.on_state;
+        const ud = self.callbacks.userdata;
+        if (state.kind == .password_required) {
+            const prompt = zig_state.password_required;
+            const src = prompt.host[0..prompt.host_len];
+            const max = self.last_password_host.len - 1; // reserve NUL
+            const n = @min(src.len, max);
+            @memcpy(self.last_password_host[0..n], src[0..n]);
+            self.last_password_host[n] = 0;
+            self.last_password_host_len = @intCast(n);
+            state.payload.password.host = @ptrCast(&self.last_password_host[0]);
+        }
+        self.state_kind.store(@intFromEnum(state.kind), .release);
         self.mutex.unlock();
         if (cb) |f| f(ud, &state);
     }
@@ -409,8 +469,10 @@ pub const SshHandle = struct {
     /// Bridge from `SshConnectionManager.Entry`'s SshListener to the
     /// embedder's `on_state`. Translates the rich
     /// `protocol.ConnectionState` union into a flat
-    /// `ghostty_ssh_state_t` and forwards. Fires on the SSH thread
-    /// per the listener-hook contract.
+    /// `ghostty_ssh_state_t` and forwards via the stash-aware path so
+    /// the PasswordPrompt host string survives the broadcaster's
+    /// stack frame. Fires on the SSH thread per the listener-hook
+    /// contract.
     fn onStateListener(ctx: *anyopaque, state: protocol.ConnectionState) void {
         const self: *SshHandle = @ptrCast(@alignCast(ctx));
         // Once closed, swallow late events — the listener is
@@ -418,7 +480,7 @@ pub const SshHandle = struct {
         // but a state already in flight on the SSH thread could race
         // past the unregister.
         if (self.closed.load(.acquire)) return;
-        self.emitState(translateState(state));
+        self.emitStateFromConnectionState(state);
     }
 };
 
@@ -530,17 +592,16 @@ fn translateState(state: protocol.ConnectionState) State {
             .attempts_made = d.attempts_made,
             .reason = DisconnectReason.fromZig(d.reason),
         } } },
-        .password_required => |p| blk: {
-            const host_ptr: [*:0]const u8 = if (p.host_len == 0)
-                ""
-            else
-                @ptrCast(&p.host);
-            break :blk .{ .kind = .password_required, .payload = .{ .password = .{
-                .is_jump = p.is_jump,
-                .host = host_ptr,
-                .auth_token = 0,
-            } } };
-        },
+        .password_required => |p| .{ .kind = .password_required, .payload = .{ .password = .{
+            .is_jump = p.is_jump,
+            // The host pointer is NEVER set here — `&p.host` would dangle
+            // the instant this switch prong's stack frame unwinds. The
+            // caller (typically SshHandle.emitStateFromConnectionState)
+            // stashes the bytes into a stable handle-owned buffer and
+            // overlays the pointer before firing the embedder callback.
+            .host = "",
+            .auth_token = 0,
+        } } },
     };
 }
 
@@ -951,10 +1012,23 @@ const testing = std.testing;
 const Capture = struct {
     last_state_kind: ?StateKind = null,
     last_close_reason: ?ChannelCloseReason = null,
+    /// Inline copy of the most recent state.payload.password.host
+    /// observed at on_state time. Test code can assert that the
+    /// bytes survived the broadcaster's stack frame by reading from
+    /// here AFTER on_state has returned + further stack frames have
+    /// been pushed and popped.
+    last_password_host_copy: [128]u8 = [_]u8{0} ** 128,
+    last_password_host_len: usize = 0,
 
     fn onState(ud: ?*anyopaque, st: *const State) callconv(.c) void {
         const self: *Capture = @ptrCast(@alignCast(ud.?));
         self.last_state_kind = st.kind;
+        if (st.kind == .password_required) {
+            const span = std.mem.span(st.payload.password.host);
+            const n = @min(span.len, self.last_password_host_copy.len);
+            @memcpy(self.last_password_host_copy[0..n], span[0..n]);
+            self.last_password_host_len = n;
+        }
     }
 
     fn onClose(
@@ -1204,7 +1278,12 @@ test "translateState — disconnected payload carries reason + attempts" {
     try testing.expectEqual(DisconnectReason.exhausted, s.payload.disconnect.reason);
 }
 
-test "translateState — password_required payload carries host" {
+test "translateState — password_required carries is_jump and a zero host" {
+    // translateState intentionally returns a state with `host = ""`
+    // for password_required — the host pointer would otherwise dangle
+    // into the input's stack frame the moment translateState returns.
+    // The stable-buffer copy lives in SshHandle.emitStateFromConnectionState;
+    // see the next test for end-to-end coverage.
     var prompt: protocol.ConnectionState.PasswordPrompt = .{
         .is_jump = true,
         .auth_state = null,
@@ -1213,9 +1292,89 @@ test "translateState — password_required payload carries host" {
     const s = translateState(.{ .password_required = prompt });
     try testing.expectEqual(StateKind.password_required, s.kind);
     try testing.expect(s.payload.password.is_jump);
+    // host pointer should reference an empty NUL-terminated string,
+    // NOT &prompt.host (which is dead after translateState returns).
+    try testing.expectEqualStrings("", std.mem.span(s.payload.password.host));
+}
+
+test "emitStateFromConnectionState — host bytes survive stack reuse" {
+    // Regression for the dangling-host-pointer bug: drive a
+    // password_required broadcast through the listener bridge, then
+    // push and pop a noisy stack frame BEFORE asserting on the host
+    // bytes. If the bug ever re-appears (host pointer aliases the
+    // broadcaster's stack), Capture.last_password_host_copy will
+    // contain whatever overwrote the dead frame.
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    // Helper that simulates a broadcast call frame: build a prompt
+    // on its OWN stack frame, fire emitStateFromConnectionState,
+    // then return. By the time the helper returns, prompt.host's
+    // backing storage is reclaimable.
+    const Driver = struct {
+        fn fire(h: *SshHandle) void {
+            var prompt: protocol.ConnectionState.PasswordPrompt = .{
+                .is_jump = true,
+                .auth_state = null,
+            };
+            prompt.setHost("user@bastion.example");
+            h.emitStateFromConnectionState(.{ .password_required = prompt });
+        }
+        fn noise() void {
+            // Push a sizable stack frame and write distinctive
+            // bytes into it. If the embedder's host pointer were
+            // pointing into the prior frame, this would clobber it.
+            var clobber: [8192]u8 = undefined;
+            @memset(&clobber, 0xAB);
+            std.mem.doNotOptimizeAway(&clobber);
+        }
+    };
+
+    Driver.fire(handle);
+    Driver.noise();
+
+    try testing.expectEqual(@as(?StateKind, .password_required), cap.last_state_kind);
     try testing.expectEqualStrings(
         "user@bastion.example",
-        std.mem.span(s.payload.password.host),
+        cap.last_password_host_copy[0..cap.last_password_host_len],
+    );
+
+    // Buffer must remain valid until the next password_required —
+    // emitting an intervening state (e.g. CONNECTED) must NOT clear
+    // the host bytes.
+    handle.emitStateFromConnectionState(.connected);
+    try testing.expectEqualStrings(
+        "user@bastion.example",
+        handle.last_password_host[0..handle.last_password_host_len],
+    );
+
+    // A new password_required overwrites the buffer.
+    const Driver2 = struct {
+        fn fire(h: *SshHandle) void {
+            var prompt: protocol.ConnectionState.PasswordPrompt = .{
+                .is_jump = false,
+                .auth_state = null,
+            };
+            prompt.setHost("deploy@target");
+            h.emitStateFromConnectionState(.{ .password_required = prompt });
+        }
+    };
+    Driver2.fire(handle);
+    try testing.expectEqualStrings(
+        "deploy@target",
+        cap.last_password_host_copy[0..cap.last_password_host_len],
     );
 }
 

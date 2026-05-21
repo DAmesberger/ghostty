@@ -1064,12 +1064,16 @@ typedef enum {
 //     embedder MUST hop to its own UI/serial queue if needed; do not
 //     assume the callback thread is stable across callbacks.
 //
-//     Exception: ghostty_ssh_open synchronously invokes on_state
-//     exactly once with kind = CONNECTING before returning, so
-//     embedders are guaranteed at-least-one state observation as
-//     part of construction. That single initial callback fires on
-//     the calling thread. ALL subsequent state, host-key, and
-//     channel callbacks honor the worker-thread rule.
+//     ONE EXCEPTION: ghostty_ssh_open fires on_state SYNCHRONOUSLY
+//     on the calling thread for the initial CONNECTING transition
+//     AND for any FAILED transitions emitted before this function
+//     returns (e.g. when Entry acquisition or jump-spec duplication
+//     fails). From the moment ghostty_ssh_open returns successfully,
+//     all subsequent on_state fires on libghostty worker threads.
+//     Embedders that hop to a serial queue from on_state should be
+//     prepared to see the very first one (and possibly a FAILED
+//     transition, depending on the config) happen on the open
+//     caller's thread.
 //   * Buffers passed INTO libghostty (passwords, write data, params)
 //     are copied internally — the caller may free or mutate them as
 //     soon as the call returns.
@@ -1505,10 +1509,13 @@ bool ghostty_benchmark_cli(const char*, const char*);
 // returned handle is owned by the caller and MUST be released with
 // ghostty_ssh_free.
 //
-// IMPORTANT: the initial CONNECTING transition fires SYNCHRONOUSLY
-// from this function on the caller's thread — see the "ONE
-// EXCEPTION" note in the threading rules above. All subsequent
-// on_state transitions fire on libghostty worker threads.
+// IMPORTANT: on_state may fire SYNCHRONOUSLY from this function on
+// the caller's thread — always once for the initial CONNECTING
+// transition, and additionally for any FAILED transition emitted
+// before this function returns (e.g. when Entry acquisition or
+// jump-spec duplication fails). See the "ONE EXCEPTION" block in
+// the threading rules above. All on_state transitions emitted after
+// ghostty_ssh_open returns fire on libghostty worker threads.
 ghostty_ssh_t ghostty_ssh_open(ghostty_app_t app,
                                const ghostty_ssh_config_t* config,
                                const ghostty_ssh_callbacks_t* callbacks);
