@@ -761,6 +761,14 @@ pub const AttachConfig = struct {
 /// mailbox during connection setup (before the surface is registered
 /// on the Entry, so the broadcast fan-out wouldn't reach it).
 ///
+/// The pre-setup CONNECTING state is emitted by the CALLER, not by
+/// this helper: the GTK path pushes it onto the mailbox at
+/// `termio/Remote.zig:threadEnter` before invoking `setupConnection`,
+/// and the libghostty C API path emits it synchronously inside
+/// `ghostty_ssh_open` before returning the handle. The helper picks
+/// up from there with UPLOADING / SETUP / PASSWORD_REQUIRED / FAILED
+/// transitions as the underlying SSH flow progresses.
+///
 /// Returns on success; the caller is responsible for the post-setup
 /// steps (allocateTarget / registerSurface / sending the Open frame
 /// / final CONNECTED broadcast). The caller is also responsible for

@@ -1521,20 +1521,30 @@ ghostty_ssh_t ghostty_ssh_open(ghostty_app_t app,
                                const ghostty_ssh_callbacks_t* callbacks);
 
 // Submit a password in response to PASSWORD_REQUIRED. `auth_token`
-// must equal the value from the state payload. `password` is borrowed
+// must equal the value from the most-recent PASSWORD_REQUIRED state
+// payload. Each new PASSWORD_REQUIRED transition invalidates the
+// previous token; submitting a stale token is a silent no-op (the
+// connection stays parked on the new prompt). `password` is borrowed
 // and MUST be NUL-terminated; libghostty copies + zeroes immediately.
 void ghostty_ssh_submit_password(ghostty_ssh_t ssh,
                                  uint64_t auth_token,
                                  const char* password);
 
 // Abort a pending password prompt. The connection transitions to
-// FAILED with reason=AUTH_FAILED.
+// FAILED with reason=AUTH_FAILED. Token validity rules match
+// submit_password.
 void ghostty_ssh_cancel_password(ghostty_ssh_t ssh, uint64_t auth_token);
 
 // Submit a host-key decision in response to on_host_key. If accept is
 // false the connection transitions to FAILED. If accept is true and
 // persist is true, the key is pinned to the known_hosts file for
 // future TOFU matches.
+//
+// Note: the current libghostty build auto-accepts unknown host keys
+// via TOFU and does NOT call `on_host_key`, so this entry point is a
+// no-op today. It exists for forward compatibility — embedders may
+// supply an `on_host_key` callback so they're already wired when the
+// prompt path lands.
 void ghostty_ssh_submit_host_key_decision(ghostty_ssh_t ssh,
                                           uint64_t decision_token,
                                           bool accept,
@@ -1614,6 +1624,16 @@ void ghostty_channel_free(ghostty_channel_t channel);
 // drop. The embedder sees on_close(reason=TRANSPORT) followed by an
 // automatic on_opened once the daemon re-attaches by (group_id,
 // surface_id). Non-terminal channels are NOT auto-reopened.
+//
+// Callback timing while the client-mux + worker-thread spawn are
+// still in flight: today this entry point allocates the channel
+// handle and fires on_close(SERVICE_ERROR) SYNCHRONOUSLY before
+// returning. Once the full transport lands, on_opened / on_data /
+// on_close all fire from libghostty worker threads per the global
+// "callbacks on worker threads" contract; the synchronous-close
+// stub is observed only on the current pre-transport build. The
+// embedder's free path must therefore be safe to reach from inside
+// on_close.
 ghostty_channel_t ghostty_ssh_attach_surface(
     ghostty_ssh_t ssh,
     const uint8_t* group_id,   // 16 bytes or NULL

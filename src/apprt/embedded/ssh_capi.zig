@@ -31,10 +31,12 @@
 //!     channel-mux follow-up. For now it returns a handle that
 //!     immediately reports `on_close(SERVICE_ERROR)` so embedders
 //!     can exercise that edge.
-//!   * Password / host-key / list-sessions / rename / kill are
-//!     present-but-no-op exports; they will hop onto the connection's
-//!     existing `auth_state` / `session_list` paths in a follow-up
-//!     once the listener-driven prompt token plumbing is in.
+//!   * `ghostty_ssh_submit_host_key_decision` is a no-op today —
+//!     the underlying libssh2 host-key check (src/session/ssh.zig
+//!     verifyHostKey) auto-accepts unknown keys via TOFU and never
+//!     fires `on_host_key`. The C entry point is present for
+//!     forward compatibility; wiring lands alongside a redesign of
+//!     verifyHostKey to surface a prompt.
 //!
 //! Threading & ownership rules (mirrors the contract documented in
 //! include/ghostty.h):
@@ -61,6 +63,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const protocol = @import("../../session/protocol.zig");
+const session_shared = @import("../../session/shared.zig");
 const SshConnectionManager = @import("../../termio/SshConnectionManager.zig");
 const apprt_embedded = @import("../embedded.zig");
 
@@ -378,6 +381,25 @@ pub const SshHandle = struct {
     /// terminator the C type requires.
     last_password_host: [129]u8 = [_]u8{0} ** 129,
     last_password_host_len: u8 = 0,
+    /// Per-prompt monotonic auth token allocator. Issued under
+    /// `mutex` whenever a PASSWORD_REQUIRED state is translated for
+    /// the embedder; the previously-issued token is immediately
+    /// invalidated. Skips zero so embedders can use 0 as an
+    /// "uninitialized" sentinel.
+    next_auth_token: u64 = 1,
+    /// The auth_token currently advertised on the latest
+    /// PASSWORD_REQUIRED. Submit/cancel only accept this exact value
+    /// — any other token (including a stale token from a prior
+    /// prompt) is rejected as a silent no-op. Cleared back to null
+    /// once the auth attempt is dispatched (success OR cancel) so a
+    /// double-submit doesn't double-signal the daemon's auth_state
+    /// condition variable.
+    current_auth_token: ?u64 = null,
+    /// In-flight worker threads spawned by ghostty_ssh_list_sessions.
+    /// ghostty_ssh_free refuses to destroy the handle until this
+    /// drops to 0 — the embedder must keep the handle alive at
+    /// least until the on_entry(null) sentinel fires.
+    active_workers: std.atomic.Value(u32) = .{ .raw = 0 },
     /// Set when ghostty_ssh_close has been called; channel ops error
     /// out after this.
     closed: std.atomic.Value(bool) = .{ .raw = false },
@@ -451,6 +473,18 @@ pub const SshHandle = struct {
             self.last_password_host[n] = 0;
             self.last_password_host_len = @intCast(n);
             state.payload.password.host = @ptrCast(&self.last_password_host[0]);
+
+            // Issue a fresh auth_token for this prompt. The previous
+            // token (if any) is immediately invalidated by the
+            // overwrite of `current_auth_token`, so a stale embedder
+            // submitting an old token against the new prompt is
+            // rejected. Skip zero to keep that reserved as an
+            // "uninitialized" sentinel.
+            if (self.next_auth_token == 0) self.next_auth_token = 1;
+            const tok = self.next_auth_token;
+            self.next_auth_token +%= 1;
+            self.current_auth_token = tok;
+            state.payload.password.auth_token = tok;
         }
         self.state_kind.store(@intFromEnum(state.kind), .release);
         self.mutex.unlock();
@@ -727,27 +761,94 @@ export fn ghostty_ssh_open(
     return handle;
 }
 
-/// Implements `ghostty_ssh_submit_password`. No-op until the auth
-/// state-machine bridge lands (TODO(state-listener)).
+/// Implements `ghostty_ssh_submit_password`. Validates the token
+/// against the latest-prompt invariant under SshHandle.mutex, then
+/// hands the password to the underlying `Entry.auth_state` so the
+/// attachRemoteSurface helper's connectWithAuth loop can pick it up
+/// and signal the condition variable. The password is duped + zeroed
+/// using the same secure-zero discipline as the GTK overlay path.
 export fn ghostty_ssh_submit_password(
     ssh: ?*SshHandle,
     auth_token: u64,
     password: ?[*:0]const u8,
 ) void {
-    _ = ssh;
-    _ = auth_token;
-    _ = password;
-    log.debug("ghostty_ssh_submit_password: not yet wired", .{});
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse {
+        log.debug("ghostty_ssh_submit_password: no entry (test handle?)", .{});
+        return;
+    };
+
+    // Validate + consume the token under SshHandle.mutex. Reject
+    // stale tokens silently — the embedder gets no error, but the
+    // daemon's auth_state cond stays untouched, so the connection
+    // remains parked on the new prompt.
+    h.mutex.lock();
+    const current = h.current_auth_token;
+    const matches = current != null and current.? == auth_token;
+    if (matches) h.current_auth_token = null;
+    h.mutex.unlock();
+
+    if (!matches) {
+        log.debug("ghostty_ssh_submit_password: stale or invalid auth_token={d}", .{auth_token});
+        return;
+    }
+
+    // Dup the password into the entry's allocator. The helper's
+    // connectWithAuth loop secure-zeroes + frees it after consumption.
+    const pwd_span = if (password) |p| std.mem.span(p) else "";
+    const owned = entry.alloc.dupe(u8, pwd_span) catch |err| {
+        log.warn("ghostty_ssh_submit_password: dup failed: {}", .{err});
+        return;
+    };
+
+    entry.auth_state.mutex.lock();
+    // If there's a stale leftover password (e.g. an earlier submit
+    // raced past the consumer), secure-zero + free it so we don't
+    // leak a credential.
+    if (entry.auth_state.password) |old| {
+        session_shared.secureZeroAndFree(entry.alloc, @constCast(old));
+    }
+    entry.auth_state.password = owned;
+    entry.auth_state.cancelled = false;
+    entry.auth_state.cond.signal();
+    entry.auth_state.mutex.unlock();
 }
 
-/// Implements `ghostty_ssh_cancel_password`.
+/// Implements `ghostty_ssh_cancel_password`. Same token-validity
+/// contract as submit_password: stale tokens are silently rejected.
+/// On a current-token match this signals the daemon's auth_state so
+/// the connectWithAuth loop wakes up and observes `cancelled = true`,
+/// which transitions the connection to FAILED(AUTH_FAILED).
 export fn ghostty_ssh_cancel_password(ssh: ?*SshHandle, auth_token: u64) void {
-    _ = ssh;
-    _ = auth_token;
-    log.debug("ghostty_ssh_cancel_password: not yet wired", .{});
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse return;
+
+    h.mutex.lock();
+    const current = h.current_auth_token;
+    const matches = current != null and current.? == auth_token;
+    if (matches) h.current_auth_token = null;
+    h.mutex.unlock();
+
+    if (!matches) {
+        log.debug("ghostty_ssh_cancel_password: stale or invalid auth_token={d}", .{auth_token});
+        return;
+    }
+
+    entry.auth_state.mutex.lock();
+    entry.auth_state.cancelled = true;
+    entry.auth_state.cond.signal();
+    entry.auth_state.mutex.unlock();
 }
 
-/// Implements `ghostty_ssh_submit_host_key_decision`.
+/// Implements `ghostty_ssh_submit_host_key_decision`. No-op today:
+/// the underlying `verifyHostKey` in src/session/ssh.zig auto-accepts
+/// unknown keys via TOFU and does not surface an `on_host_key`
+/// callback. When the prompt path lands (a redesign of verifyHostKey
+/// to route through a callback rather than auto-pin), this routes the
+/// embedder's accept/persist decision back to that callback by
+/// `decision_token`.
 export fn ghostty_ssh_submit_host_key_decision(
     ssh: ?*SshHandle,
     decision_token: u64,
@@ -758,7 +859,7 @@ export fn ghostty_ssh_submit_host_key_decision(
     _ = decision_token;
     _ = accept;
     _ = persist;
-    log.debug("ghostty_ssh_submit_host_key_decision: not yet wired", .{});
+    log.debug("ghostty_ssh_submit_host_key_decision: TOFU auto-accept; no-op", .{});
 }
 
 /// Implements `ghostty_ssh_request_reconnect`. Routes to the
@@ -836,6 +937,24 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
 export fn ghostty_ssh_free(ssh: ?*SshHandle) void {
     const h = ssh orelse return;
     if (!h.closed.load(.acquire)) ghostty_ssh_close(h);
+
+    // If background workers (e.g. ghostty_ssh_list_sessions) are
+    // still in flight, refuse to free — they hold a *SshHandle and
+    // would UAF on a hot-released handle. Embedders MUST keep the
+    // handle alive until their on_entry(null) sentinel fires.
+    const workers = h.active_workers.load(.acquire);
+    if (workers != 0) {
+        log.err(
+            "ghostty_ssh_free: {d} in-flight worker(s) — refusing to free",
+            .{workers},
+        );
+        if (builtin.mode == .Debug) std.debug.panic(
+            "ghostty_ssh_free called with {d} in-flight workers",
+            .{workers},
+        );
+        return;
+    }
+
     // If channels are still live, the embedder violated the
     // contract. Refuse to free to avoid a use-after-free in their
     // callback; leak instead.
@@ -987,7 +1106,14 @@ export fn ghostty_ssh_attach_surface(
     return ch;
 }
 
-/// Implements `ghostty_ssh_list_sessions`.
+/// Implements `ghostty_ssh_list_sessions`. Spawns a worker thread
+/// that calls `SshConnectionManager.querySessions` (blocking, with a
+/// 5 s timeout), parses the binary `ListResponse`, and fires the
+/// embedder's `on_entry` once per session followed by a NULL
+/// sentinel. Returns true if the query was kicked off, false if the
+/// handle isn't ready (no entry, closed, etc.). The embedder MUST
+/// keep the handle alive until the sentinel arrives — see
+/// `ghostty_ssh_free`'s active-workers guard.
 export fn ghostty_ssh_list_sessions(
     ssh: ?*SshHandle,
     on_entry: ?*const fn (userdata: ?*anyopaque, entry: ?*const SessionEntry) callconv(.c) void,
@@ -995,29 +1121,140 @@ export fn ghostty_ssh_list_sessions(
 ) bool {
     const h = ssh orelse return false;
     if (h.closed.load(.acquire)) return false;
-    // TODO(state-listener): drive the existing SessionListState
-    // mailbox path. Until then, immediately signal "no entries".
-    if (on_entry) |cb| cb(userdata, null);
+    const entry = h.entry orelse return false;
+
+    // Refuse queries while the connection isn't ready — the
+    // querySessions write would just time out anyway, and we want
+    // an immediate observable "not ready" signal for the embedder.
+    if (entry.conn_state.load(.acquire) != .ready) return false;
+
+    const cb = on_entry orelse return false;
+
+    const Worker = struct {
+        handle: *SshHandle,
+        entry: *SshConnectionManager.Entry,
+        cb: *const fn (userdata: ?*anyopaque, entry: ?*const SessionEntry) callconv(.c) void,
+        userdata: ?*anyopaque,
+
+        fn run(self: *@This()) void {
+            defer {
+                _ = self.handle.active_workers.fetchSub(1, .acq_rel);
+                self.handle.alloc.destroy(self);
+            }
+
+            const alloc = self.handle.alloc;
+            const raw = SshConnectionManager.querySessions(self.entry, alloc, 5000) orelse {
+                // No data → fire the sentinel so the embedder can
+                // distinguish "empty list" from "query rejected".
+                self.cb(self.userdata, null);
+                return;
+            };
+            defer alloc.free(raw);
+
+            const parsed = protocol.ListResponse.parse(alloc, raw) catch {
+                self.cb(self.userdata, null);
+                return;
+            };
+            defer alloc.free(parsed);
+
+            for (parsed) |list_entry| {
+                // SessionEntry.label is a [*:0]const u8 — we need a
+                // local NUL-terminated copy that lives at least
+                // through the callback's duration.
+                var label_buf: [256]u8 = undefined;
+                const lbl_len = @min(list_entry.label.len, label_buf.len - 1);
+                @memcpy(label_buf[0..lbl_len], list_entry.label[0..lbl_len]);
+                label_buf[lbl_len] = 0;
+
+                const se = SessionEntry{
+                    .group_id = &list_entry.group_id,
+                    .label = @ptrCast(&label_buf[0]),
+                    .surface_count = list_entry.surface_count,
+                    .created_at_ns = list_entry.created_at,
+                };
+                self.cb(self.userdata, &se);
+            }
+
+            // Sentinel.
+            self.cb(self.userdata, null);
+        }
+    };
+
+    const worker = h.alloc.create(Worker) catch return false;
+    worker.* = .{
+        .handle = h,
+        .entry = entry,
+        .cb = cb,
+        .userdata = userdata,
+    };
+
+    _ = h.active_workers.fetchAdd(1, .acq_rel);
+    const thread = std.Thread.spawn(.{}, Worker.run, .{worker}) catch {
+        _ = h.active_workers.fetchSub(1, .acq_rel);
+        h.alloc.destroy(worker);
+        return false;
+    };
+    thread.detach();
     return true;
 }
 
-/// Implements `ghostty_ssh_rename_session`.
+/// Implements `ghostty_ssh_rename_session`. Enqueues a `.rename`
+/// frame on the live SSH connection with `RenameScope.group` so the
+/// daemon updates the session-level label. The frame is sent
+/// asynchronously via the existing write queue; embedders that need
+/// confirmation should observe the daemon's subsequent
+/// `viewer_state(name_change)` broadcast.
 export fn ghostty_ssh_rename_session(
     ssh: ?*SshHandle,
     group_id: ?[*]const u8,
     label: ?[*:0]const u8,
 ) void {
-    _ = ssh;
-    _ = group_id;
-    _ = label;
-    log.debug("ghostty_ssh_rename_session: not yet wired", .{});
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse return;
+    const gid_ptr = group_id orelse return;
+    const lbl_span: []const u8 = if (label) |p| std.mem.span(p) else "";
+
+    var gid_buf: protocol.Uuid = undefined;
+    @memcpy(&gid_buf, gid_ptr[0..protocol.uuid_size]);
+
+    const payload = (protocol.Rename{
+        .scope = .group,
+        .id = gid_buf,
+        .label = lbl_span,
+    }).encode(entry.alloc) catch |err| {
+        log.warn("ghostty_ssh_rename_session: encode failed: {}", .{err});
+        return;
+    };
+    defer entry.alloc.free(payload);
+    // enqueueWrite duplicates the payload onto the write queue —
+    // free is safe immediately afterwards.
+    SshConnectionManager.enqueueWrite(entry, .rename, 0, payload);
 }
 
-/// Implements `ghostty_ssh_kill_session`.
+/// Implements `ghostty_ssh_kill_session`. Sends a `.close` frame
+/// with `CloseMode.session` — the daemon kills all surfaces in the
+/// matching group. Embedders observe the dead session via a
+/// subsequent `list_sessions` query (the daemon does not broadcast
+/// session deaths on the live connection).
 export fn ghostty_ssh_kill_session(ssh: ?*SshHandle, group_id: ?[*]const u8) void {
-    _ = ssh;
-    _ = group_id;
-    log.debug("ghostty_ssh_kill_session: not yet wired", .{});
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse return;
+    const gid_ptr = group_id orelse return;
+
+    var gid_buf: protocol.Uuid = undefined;
+    @memcpy(&gid_buf, gid_ptr[0..protocol.uuid_size]);
+
+    const payload = (protocol.Close{
+        .mode = .session,
+        .id = gid_buf,
+    }).encode(entry.alloc) catch |err| {
+        log.warn("ghostty_ssh_kill_session: encode failed: {}", .{err});
+        return;
+    };
+    defer entry.alloc.free(payload);
+    SshConnectionManager.enqueueWrite(entry, .close, 0, payload);
 }
 
 // =========================================================================
@@ -1542,4 +1779,261 @@ test "SshHandle.onStateListener swallows events after close" {
     try testing.expect(cap.last_state_kind == null);
 
     ghostty_ssh_free(handle);
+}
+
+// =========================================================================
+// Part 4 tests — auth-token allocation, submit/cancel validity rules.
+// =========================================================================
+
+/// Capture variant for password tests — records the auth_token value
+/// observed at on_state time so the test can drive
+/// submit/cancel_password back through the C API.
+const PasswordCapture = struct {
+    last_state_kind: ?StateKind = null,
+    last_auth_token: u64 = 0,
+    last_host_copy: [128]u8 = [_]u8{0} ** 128,
+    last_host_len: usize = 0,
+
+    fn onState(ud: ?*anyopaque, st: *const State) callconv(.c) void {
+        const self: *PasswordCapture = @ptrCast(@alignCast(ud.?));
+        self.last_state_kind = st.kind;
+        if (st.kind == .password_required) {
+            self.last_auth_token = st.payload.password.auth_token;
+            const span = std.mem.span(st.payload.password.host);
+            const n = @min(span.len, self.last_host_copy.len);
+            @memcpy(self.last_host_copy[0..n], span[0..n]);
+            self.last_host_len = n;
+        }
+    }
+
+    fn cbs(self: *PasswordCapture) SshCallbacks {
+        return .{
+            .on_state = onState,
+            .on_host_key = null,
+            .userdata = self,
+        };
+    }
+};
+
+/// Build a PasswordPrompt with the given host + jump-bit. Used by
+/// the auth-token tests to drive emitStateFromConnectionState
+/// without a live SSH connection.
+fn buildPrompt(host: []const u8, is_jump: bool) protocol.ConnectionState.PasswordPrompt {
+    var p: protocol.ConnectionState.PasswordPrompt = .{
+        .is_jump = is_jump,
+        .auth_state = null,
+    };
+    p.setHost(host);
+    return p;
+}
+
+test "auth token — issued per PASSWORD_REQUIRED, monotonic, invalidates prior" {
+    var cap: PasswordCapture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    handle.emitStateFromConnectionState(.{ .password_required = buildPrompt("user@target", false) });
+    const t1 = cap.last_auth_token;
+    try testing.expect(t1 != 0);
+    try testing.expectEqual(t1, handle.current_auth_token.?);
+
+    handle.emitStateFromConnectionState(.{ .password_required = buildPrompt("user@bastion", true) });
+    const t2 = cap.last_auth_token;
+    try testing.expect(t2 != 0);
+    try testing.expect(t2 != t1);
+    try testing.expectEqual(t2, handle.current_auth_token.?);
+}
+
+/// Heap-allocate a freshly-defaulted Entry suitable for token-
+/// validation tests that need to reach the entry.auth_state path.
+/// The Entry's ssh_thread / channel / pipes are all left at defaults,
+/// so the helper never crosses into libssh2 land. Caller frees via
+/// `freeEntryFixture`.
+fn newEntryFixture(alloc: Allocator) !*SshConnectionManager.Entry {
+    const entry = try alloc.create(SshConnectionManager.Entry);
+    entry.* = .{
+        .alloc = alloc,
+        .ctx = .{
+            .alloc = alloc,
+            .ssh_target = "",
+            .jump = null,
+        },
+        .remote_bin_path = &.{},
+        .ref_count = 1,
+        .sessions = std.AutoArrayHashMap(SshConnectionManager.Uuid, *SshConnectionManager.Session).init(alloc),
+    };
+    return entry;
+}
+
+fn freeEntryFixture(alloc: Allocator, entry: *SshConnectionManager.Entry) void {
+    // Match the partial-teardown that `release` does for a fixture
+    // that never reached the channel/thread states. ssh_listeners
+    // may be empty; deinit is still required to match
+    // SshConnectionManager.release behavior.
+    entry.ssh_listeners.deinit(entry.alloc);
+    if (entry.auth_state.password) |pw| {
+        session_shared.secureZeroAndFree(entry.alloc, @constCast(pw));
+        entry.auth_state.password = null;
+    }
+    entry.sessions.deinit();
+    alloc.destroy(entry);
+}
+
+test "submit_password — current token reaches entry.auth_state" {
+    var cap: PasswordCapture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    const entry = try newEntryFixture(testing.allocator);
+    defer freeEntryFixture(testing.allocator, entry);
+    handle.entry = entry;
+    defer handle.entry = null;
+
+    handle.emitStateFromConnectionState(.{ .password_required = buildPrompt("user@target", false) });
+    const tok = cap.last_auth_token;
+    try testing.expect(tok != 0);
+
+    ghostty_ssh_submit_password(handle, tok, "hunter2");
+
+    // Password should be on the auth_state, NUL-free (raw bytes),
+    // dupe via entry.alloc. Cancelled flag must NOT be set.
+    entry.auth_state.mutex.lock();
+    defer entry.auth_state.mutex.unlock();
+    try testing.expect(entry.auth_state.password != null);
+    try testing.expectEqualStrings("hunter2", entry.auth_state.password.?);
+    try testing.expect(!entry.auth_state.cancelled);
+
+    // Token must be consumed: current_auth_token cleared.
+    try testing.expect(handle.current_auth_token == null);
+}
+
+test "submit_password — stale token after new PASSWORD_REQUIRED is rejected" {
+    var cap: PasswordCapture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    const entry = try newEntryFixture(testing.allocator);
+    defer freeEntryFixture(testing.allocator, entry);
+    handle.entry = entry;
+    defer handle.entry = null;
+
+    handle.emitStateFromConnectionState(.{ .password_required = buildPrompt("user@target", false) });
+    const stale = cap.last_auth_token;
+    handle.emitStateFromConnectionState(.{ .password_required = buildPrompt("user@bastion", true) });
+    const current = cap.last_auth_token;
+    try testing.expect(stale != current);
+
+    ghostty_ssh_submit_password(handle, stale, "wrong-password");
+    // Stale submission must NOT have touched auth_state.password.
+    entry.auth_state.mutex.lock();
+    try testing.expect(entry.auth_state.password == null);
+    try testing.expect(!entry.auth_state.cancelled);
+    entry.auth_state.mutex.unlock();
+    // Current token must still be live for a follow-up submit.
+    try testing.expectEqual(current, handle.current_auth_token.?);
+
+    // Submitting against the current token now succeeds.
+    ghostty_ssh_submit_password(handle, current, "right-password");
+    entry.auth_state.mutex.lock();
+    try testing.expectEqualStrings("right-password", entry.auth_state.password.?);
+    entry.auth_state.mutex.unlock();
+}
+
+test "cancel_password — current token sets cancelled, stale is rejected" {
+    var cap: PasswordCapture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    const entry = try newEntryFixture(testing.allocator);
+    defer freeEntryFixture(testing.allocator, entry);
+    handle.entry = entry;
+    defer handle.entry = null;
+
+    handle.emitStateFromConnectionState(.{ .password_required = buildPrompt("user@target", false) });
+    const tok1 = cap.last_auth_token;
+
+    // Cancel with a wrong token → must NOT flip cancelled.
+    ghostty_ssh_cancel_password(handle, tok1 +% 999);
+    entry.auth_state.mutex.lock();
+    try testing.expect(!entry.auth_state.cancelled);
+    entry.auth_state.mutex.unlock();
+    try testing.expectEqual(tok1, handle.current_auth_token.?);
+
+    // Cancel with the current token → cancelled flag is set; token consumed.
+    ghostty_ssh_cancel_password(handle, tok1);
+    entry.auth_state.mutex.lock();
+    try testing.expect(entry.auth_state.cancelled);
+    entry.auth_state.mutex.unlock();
+    try testing.expect(handle.current_auth_token == null);
+
+    // A second cancel with the now-stale token must be a no-op
+    // (it's already invalidated). cancelled stays true.
+    ghostty_ssh_cancel_password(handle, tok1);
+    entry.auth_state.mutex.lock();
+    try testing.expect(entry.auth_state.cancelled);
+    entry.auth_state.mutex.unlock();
+}
+
+test "submit_password / cancel_password — no-op without an entry" {
+    var cap: PasswordCapture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+    // No entry attached — both calls must early-return without crashing.
+    ghostty_ssh_submit_password(handle, 1, "ignored");
+    ghostty_ssh_cancel_password(handle, 1);
 }
