@@ -162,16 +162,77 @@ pub const ServiceError = error{
     OutOfMemory,
 };
 
+/// Errors from `Mux.openChannelFromDaemon`.
+///
+/// The error tells the caller whether the service's `open` callback
+/// ran — this matters for resource ownership (e.g. a caller that passed
+/// an fd in `service_open_params` needs to know whether the service
+/// adopted it):
+///   * `ServiceNotRegistered`, `ChannelIdsExhausted` — `open` did NOT
+///     run; the caller still owns anything it passed in.
+///   * `InvalidRequest`, `ServiceError`, `PolicyDenied`,
+///     `ResourceExhausted`, `OutOfMemory` — `open` ran and rejected;
+///     the service's own error path has released what it adopted.
+pub const OpenChannelError = error{
+    /// Service id is not registered in the mux's `Registry`. This is a
+    /// programmer error inside the daemon — distinct from a peer
+    /// rejecting the open (that surfaces later via `handleOpened`).
+    /// `open` did not run.
+    ServiceNotRegistered,
+    /// Daemon-direction channel-id space exhausted. Requires ~2^31
+    /// opens on a single connection without rollover; effectively
+    /// unreachable. `open` did not run.
+    ChannelIdsExhausted,
+    /// The service's `open` callback rejected the request.
+    InvalidRequest,
+    ServiceError,
+    PolicyDenied,
+    /// The service's `open` callback ran out of a resource (e.g. could
+    /// not spawn a pump thread).
+    ResourceExhausted,
+    /// Allocator failure (either the service's `open` callback or the
+    /// mux's own channel allocation).
+    OutOfMemory,
+};
+
+/// Which side of the connection opened a channel. The opener picks the
+/// channel_id; this enum records, on each end, whether *we* sent the
+/// `channel_open` (`local`) or received it (`remote`). `handleOpened`
+/// gates on `origin == .local` — only a channel we opened expects a
+/// `channel_opened` reply.
+pub const ChannelOrigin = enum(u1) {
+    /// Opened by the local end (we sent the `channel_open` frame).
+    local,
+    /// Opened by the peer (we received the `channel_open` frame).
+    remote,
+};
+
 /// Per-channel state owned by the mux. Pointers into here are stable
 /// for the channel's lifetime (i.e. until `Service.on_close` returns).
+///
+/// A `Channel` is driven by exactly one of two backends:
+///   * daemon-side, service-driven: `vtable` is set, `client_callbacks`
+///     is null. The mux dispatches inbound frames to the service vtable.
+///   * client-side, embedder-driven: `client_callbacks` is set, `vtable`
+///     is null. `ClientMux` dispatches inbound frames to the embedder
+///     callbacks.
+/// Exactly one is non-null; both-null or both-set is a bug.
 pub const Channel = struct {
     id: u32,
     service_id: u8,
+    /// Which side opened this channel. See `ChannelOrigin`.
+    origin: ChannelOrigin,
     /// Per-service state returned by `Service.open`. Null for stateless
-    /// services.
+    /// services and for client-side channels.
     service_state: ?*anyopaque,
-    /// Vtable for fast dispatch (cached from the service entry).
-    vtable: *const Service.VTable,
+    /// Vtable for fast dispatch (cached from the service entry). Null on
+    /// client-side channels — see `client_callbacks`.
+    vtable: ?*const Service.VTable,
+    /// Embedder callbacks for client-side channels. Null on daemon-side
+    /// channels — see `vtable`.
+    client_callbacks: ?ClientMux.Callbacks = null,
+    /// Embedder context passed to every `client_callbacks` call.
+    client_ctx: ?*anyopaque = null,
     /// Outbound credit available to us in bytes (peer's window for our
     /// data). Decremented as we send `channel_data`; incremented by
     /// inbound `channel_window` frames. Read/written under `Mux.mutex`.
@@ -221,6 +282,13 @@ pub const Mux = struct {
     negotiated_max_window_units: u16 = protocol.max_channel_window_units,
     /// Active channels keyed by channel_id.
     channels: std.AutoHashMapUnmanaged(u32, *Channel) = .empty,
+    /// Next channel id to allocate for daemon-originated opens. Starts
+    /// at `protocol.channel_id_daemon_bit | 1` (daemon-direction ids
+    /// always have the high bit set) and increments monotonically under
+    /// `mutex`. Wrapping past `0xFFFF_FFFF` yields
+    /// `error.ResourceExhausted` — effectively unreachable (2^31 opens
+    /// on one connection).
+    next_daemon_channel_id: u32 = protocol.channel_id_daemon_bit | 1,
     /// Guards `fd` writes (every outbound frame), the channels map
     /// (since service pump threads also look channels up), and every
     /// channel field that's mutated outside the dispatch thread
@@ -236,16 +304,48 @@ pub const Mux = struct {
     }
 
     pub fn deinit(self: *Mux) void {
-        // Tear down any channels that didn't close cleanly. Signal
-        // pumps first so on_close can join them.
+        // Tear down any channels that didn't close cleanly.
+        //
+        // A service's `on_close` may itself reach back into the mux and
+        // remove other channels (e.g. `port_listener` closing its
+        // accepted children via `closeChannelById`). Mutating
+        // `self.channels` while iterating it would invalidate the
+        // iterator, so snapshot the channel pointers and clear the map
+        // up front: any `closeChannelById` from within an `on_close`
+        // then becomes a safe no-op, and we own every pointer exactly
+        // once for teardown.
         if (self.channels.count() != 0) {
+            const snapshot = self.alloc.alloc(*Channel, self.channels.count()) catch {
+                // Allocation failure during teardown — fall back to a
+                // best-effort in-place close. The map is not mutated
+                // here, but a misbehaving `on_close` could; this path
+                // only runs under genuine OOM.
+                var it = self.channels.iterator();
+                while (it.next()) |entry| {
+                    const ch = entry.value_ptr.*;
+                    ch.closing = true;
+                    ch.close_signal.set();
+                    ch.credit_signal.set();
+                    if (ch.vtable) |vt| vt.on_close(ch.service_state, .daemon_shutdown, "");
+                    self.alloc.destroy(ch);
+                }
+                self.channels.deinit(self.alloc);
+                return;
+            };
+            defer self.alloc.free(snapshot);
             var it = self.channels.iterator();
-            while (it.next()) |entry| {
-                const ch = entry.value_ptr.*;
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) snapshot[i] = entry.value_ptr.*;
+            self.channels.clearRetainingCapacity();
+
+            // Signal every pump first so each `on_close` can join.
+            for (snapshot) |ch| {
                 ch.closing = true;
                 ch.close_signal.set();
                 ch.credit_signal.set();
-                ch.vtable.on_close(ch.service_state, .daemon_shutdown, "");
+            }
+            for (snapshot) |ch| {
+                if (ch.vtable) |vt| vt.on_close(ch.service_state, .daemon_shutdown, "");
                 self.alloc.destroy(ch);
             }
         }
@@ -323,12 +423,7 @@ pub const Mux = struct {
     ) !void {
         switch (kind) {
             .channel_open => try self.handleOpen(payload),
-            .channel_opened => {
-                // The daemon does not accept channel-opened from the
-                // peer in this phase — daemon-originated channels
-                // (e.g. port_listener accepts) are a 6A.3 feature.
-                log.debug("ignoring channel_opened from peer", .{});
-            },
+            .channel_opened => try self.handleOpened(payload),
             .channel_data => try self.handleData(payload),
             .channel_window => try self.handleWindow(payload),
             .channel_eof => try self.handleEof(payload),
@@ -406,6 +501,7 @@ pub const Mux = struct {
         ch.* = .{
             .id = open.channel_id,
             .service_id = service.id,
+            .origin = .remote,
             .service_state = result.state,
             .vtable = service.vtable,
             .out_credit = window_bytes,
@@ -415,7 +511,7 @@ pub const Mux = struct {
             .flags = result.flags,
         };
         errdefer {
-            ch.vtable.on_close(ch.service_state, .normal, "");
+            ch.vtable.?.on_close(ch.service_state, .normal, "");
             self.alloc.destroy(ch);
         }
         self.mutex.lock();
@@ -440,6 +536,203 @@ pub const Mux = struct {
             peer_window_units,
             result.ack,
         );
+    }
+
+    /// Handle an inbound `channel_opened` frame. Only meaningful for
+    /// daemon-originated channels (`origin == .local`): the peer is
+    /// acking an open *we* initiated via `openChannelFromDaemon`. For
+    /// channels the peer opened we sent the `channel_opened` ourselves
+    /// and never expect one back, so those are logged and ignored.
+    fn handleOpened(self: *Mux, payload: []const u8) !void {
+        const opened = protocol.ChannelOpened.parse(payload) catch {
+            log.warn("malformed channel_opened frame", .{});
+            return;
+        };
+        self.mutex.lock();
+        const ch = self.channels.get(opened.channel_id) orelse {
+            self.mutex.unlock();
+            log.debug(
+                "channel_opened for unknown channel_id={x} — discarding",
+                .{opened.channel_id},
+            );
+            return;
+        };
+        if (ch.origin != .local) {
+            // We received this open from the peer; we already replied.
+            self.mutex.unlock();
+            log.debug(
+                "ignoring channel_opened for peer-opened channel_id={x}",
+                .{opened.channel_id},
+            );
+            return;
+        }
+        if (opened.status != .ok) {
+            // Peer rejected our open. Tear down our half of the channel.
+            self.mutex.unlock();
+            log.warn(
+                "peer rejected daemon-originated channel_id={x}: status={}",
+                .{ opened.channel_id, opened.status },
+            );
+            try self.closeChannel(ch, .peer_reset, "peer rejected open");
+            return;
+        }
+        // Record the negotiated outbound window. The open frame we sent
+        // pre-set `out_credit` to our advertised initial window; the
+        // peer's reply is authoritative, so override it.
+        if (opened.peer_window > 0) {
+            ch.out_credit = @as(usize, opened.peer_window) * 4 * 1024;
+        }
+        self.mutex.unlock();
+        // Wake any pump thread parked in `waitForCredit` now that the
+        // authoritative window is in place.
+        ch.credit_signal.set();
+    }
+
+    /// Open a channel from the daemon side. Allocates a daemon-direction
+    /// channel_id (high bit set), invokes the service's `open` callback,
+    /// records the channel locally, sends `channel_open` to the peer,
+    /// and returns the id. Best-effort: does NOT block waiting for the
+    /// peer's `channel_opened` ack; if the peer never acks, the channel
+    /// still exists on our side until torn down.
+    ///
+    /// `wire_params` is encoded into the `channel_open` frame sent to
+    /// the peer. `service_open_params` is passed to the service's
+    /// `open` callback and stays local — it can carry out-of-band state
+    /// (e.g. an already-accepted fd) that must not appear on the wire.
+    /// Daemon-originated services with no out-of-band state pass the
+    /// same slice for both.
+    ///
+    /// `initial_window_units` (in 4 KiB units) is the inbound window we
+    /// advertise to the peer; 0 means "use the negotiated default".
+    /// Until the peer's `channel_opened` reply arrives, `out_credit`
+    /// holds the same provisional value; `handleOpened` overrides it
+    /// with the peer's authoritative grant.
+    pub fn openChannelFromDaemon(
+        self: *Mux,
+        service_id: u8,
+        wire_params: []const u8,
+        service_open_params: []const u8,
+        initial_window_units: u16,
+    ) OpenChannelError!u32 {
+        // Resolve the service before allocating an id.
+        const service = self.registry.lookup(service_id) orelse
+            return error.ServiceNotRegistered;
+
+        // Allocate a daemon-direction channel id under the mutex. This
+        // happens before `open` runs — `ChannelIdsExhausted` therefore
+        // signals to the caller that `open` never ran.
+        const channel_id = try self.allocDaemonChannelId();
+
+        // Resolve the window. Caps at the negotiated max, falls back to
+        // the negotiated default — same policy as `handleOpen`.
+        const requested_units: u16 = if (initial_window_units == 0)
+            self.negotiated_default_window_units
+        else
+            @min(initial_window_units, self.negotiated_max_window_units);
+        const window_bytes: usize = @as(usize, requested_units) * 4 * 1024;
+
+        // Service-driven open. Called outside the mutex — the service
+        // may call back into the mux during its open. On a service
+        // error the service's own error path has released whatever it
+        // adopted; we just remap the error.
+        var ack_buf: [256]u8 = undefined;
+        const result: Service.OpenResult = service.vtable.open(
+            service.ctx,
+            self,
+            channel_id,
+            service_open_params,
+            &ack_buf,
+        ) catch |err| return switch (err) {
+            error.InvalidRequest => error.InvalidRequest,
+            error.ServiceError => error.ServiceError,
+            error.PolicyDenied => error.PolicyDenied,
+            error.ResourceExhausted => error.ResourceExhausted,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        // `open` succeeded — from here every error path must tear the
+        // service down via `on_close` (which joins any pump thread the
+        // service spawned in `open`).
+        errdefer service.vtable.on_close(result.state, .normal, "");
+
+        // Record the channel.
+        const ch = try self.alloc.create(Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = .{
+            .id = channel_id,
+            .service_id = service.id,
+            .origin = .local,
+            .service_state = result.state,
+            .vtable = service.vtable,
+            .out_credit = window_bytes,
+            .in_credit = window_bytes,
+            .initial_window_bytes = window_bytes,
+            .in_unacked = 0,
+            .flags = result.flags,
+        };
+        self.mutex.lock();
+        const put_err = self.channels.put(self.alloc, channel_id, ch);
+        self.mutex.unlock();
+        try put_err;
+
+        // The channel is now registered and fully live; no failure past
+        // this point rolls it back (the `errdefer`s above stop firing
+        // once we return success). The peer announcement below is
+        // best-effort: if encoding or sending the `channel_open` frame
+        // fails the channel still exists locally — it gets reaped by
+        // `Mux.deinit` or by the connection's outer teardown when the
+        // fd dies, the same as any other un-acked channel.
+
+        // Send the `channel_open` frame to the peer FIRST — before
+        // firing `on_opened`. `on_opened` unblocks the service's pump
+        // thread, which may immediately emit `channel_data`; the peer
+        // must see `channel_open` ahead of any data frame for the
+        // channel, so the open send has to win that race.
+        const open = protocol.ChannelOpen{
+            .channel_id = channel_id,
+            .service = @enumFromInt(service.id),
+            .flags = result.flags,
+            .initial_window = requested_units,
+            .service_params = wire_params,
+        };
+        if (open.encode(self.alloc)) |encoded| {
+            defer self.alloc.free(encoded);
+            self.sendFrame(.channel_open, encoded) catch |err| {
+                log.warn("failed to send channel_open: {}", .{err});
+            };
+        } else |err| {
+            log.warn("failed to encode channel_open: {}", .{err});
+        }
+
+        // Hand the now-registered *Channel to the service so a pump
+        // thread spawned in `open` can grab a stable pointer and start
+        // producing data.
+        if (service.vtable.on_opened) |hook| {
+            hook(result.state, ch);
+        }
+        return channel_id;
+    }
+
+    /// Allocate the next daemon-direction channel id. Caller must NOT
+    /// hold `mutex`. Monotonic, skips ids already in `channels`.
+    fn allocDaemonChannelId(self: *Mux) error{ChannelIdsExhausted}!u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Bound the search by the channel count + 1: with N live
+        // channels at most N+1 probes find a free slot.
+        var probes: usize = self.channels.count() + 1;
+        while (probes > 0) : (probes -= 1) {
+            const candidate = self.next_daemon_channel_id;
+            // Advance, wrapping back into the daemon-direction range.
+            // `invalid_channel_id` (all-ones) is reserved, so the range
+            // is [daemon_bit | 1, 0xFFFF_FFFF).
+            self.next_daemon_channel_id =
+                if (candidate >= protocol.invalid_channel_id - 1)
+                    protocol.channel_id_daemon_bit | 1
+                else
+                    candidate + 1;
+            if (!self.channels.contains(candidate)) return candidate;
+        }
+        return error.ChannelIdsExhausted;
     }
 
     fn handleData(self: *Mux, payload: []const u8) !void {
@@ -470,7 +763,7 @@ pub const Mux = struct {
 
         // Hand bytes to the service outside the mutex — the service
         // may call back into the mux (e.g. to send response data).
-        ch.vtable.on_data(ch.service_state, data.bytes) catch |err| {
+        ch.vtable.?.on_data(ch.service_state, data.bytes) catch |err| {
             const reason: protocol.ChannelCloseReason = switch (err) {
                 error.PolicyDenied => .policy_denied,
                 else => .service_error,
@@ -532,7 +825,7 @@ pub const Mux = struct {
         }
         ch.remote_eof = true;
         self.mutex.unlock();
-        ch.vtable.on_eof(ch.service_state);
+        ch.vtable.?.on_eof(ch.service_state);
     }
 
     fn handleClose(self: *Mux, payload: []const u8) !void {
@@ -551,7 +844,7 @@ pub const Mux = struct {
         ch.credit_signal.set();
         // Call on_close outside the mutex — it joins pump threads
         // which may currently be blocked acquiring the mutex.
-        ch.vtable.on_close(ch.service_state, close.reason, close.message);
+        ch.vtable.?.on_close(ch.service_state, close.reason, close.message);
         self.mutex.lock();
         _ = self.channels.remove(close.channel_id);
         self.mutex.unlock();
@@ -566,7 +859,7 @@ pub const Mux = struct {
             return;
         };
         self.mutex.unlock();
-        ch.vtable.on_control(ch.service_state, ctrl.op, ctrl.op_payload) catch |err| {
+        ch.vtable.?.on_control(ch.service_state, ctrl.op, ctrl.op_payload) catch |err| {
             const reason: protocol.ChannelCloseReason = switch (err) {
                 error.PolicyDenied => .policy_denied,
                 else => .service_error,
@@ -595,7 +888,7 @@ pub const Mux = struct {
         ch.credit_signal.set();
         // on_close outside the mutex — pump threads may be blocked
         // acquiring it.
-        ch.vtable.on_close(ch.service_state, reason, message);
+        ch.vtable.?.on_close(ch.service_state, reason, message);
 
         // Send the close frame. Best-effort — if the peer is gone the
         // outer loop will tear everything down anyway.
@@ -614,6 +907,39 @@ pub const Mux = struct {
         _ = self.channels.remove(id);
         self.mutex.unlock();
         self.alloc.destroy(ch);
+    }
+
+    /// Tear down a channel by id, running the full close path: the
+    /// service's `on_close` (which joins any pump threads), a
+    /// `channel_close` frame to the peer, removal from the registry,
+    /// and free. No-op if the channel id is unknown or already closing.
+    ///
+    /// Dispatch-thread-only — same constraint as `closeChannel`. This
+    /// is the safe way for one daemon-side service to tear down another
+    /// channel it spawned (e.g. `port_listener` closing its accepted
+    /// child channels on listener teardown): unlike `requestClose` it
+    /// never holds a `*Channel` that another thread could free, and it
+    /// invokes `on_close` so the child's pump is joined before the
+    /// `Channel` is destroyed.
+    pub fn closeChannelById(
+        self: *Mux,
+        channel_id: u32,
+        reason: protocol.ChannelCloseReason,
+        message: []const u8,
+    ) void {
+        self.mutex.lock();
+        const ch = self.channels.get(channel_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (ch.closing) {
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.unlock();
+        self.closeChannel(ch, reason, message) catch |err| {
+            log.warn("closeChannelById: {}", .{err});
+        };
     }
 
     // =====================================================================
@@ -773,6 +1099,526 @@ pub const Mux = struct {
         const encoded = try opened.encode(self.alloc);
         defer self.alloc.free(encoded);
         try self.sendFrame(.channel_opened, encoded);
+    }
+};
+
+// =========================================================================
+// Client-side multiplexer
+// =========================================================================
+//
+// `ClientMux` is the opener-side counterpart to `Mux`. Where `Mux`
+// serves a daemon's `Registry` of services, `ClientMux` is driven by an
+// embedder (libghostty → Swift): the embedder opens channels, supplies
+// per-channel callbacks, and writes/reads bytes. It reuses the shared
+// `Channel` struct (with `client_callbacks` set instead of `vtable`),
+// the same credit-accounting and max-payload chunking, and a symmetric
+// `handleOpened`.
+//
+// Threading model mirrors `Mux`:
+//   * a single dispatch thread reads frames and calls `dispatch`; every
+//     embedder callback fires from that thread.
+//   * `writeChannel` / `channelEof` / `channelClose` may be called from
+//     any thread; channels-map and `out_credit` access is `mutex`-
+//     guarded, frame writes go through `sendFrameLocked`.
+
+pub const ClientMux = struct {
+    alloc: Allocator,
+    /// Connection fd. Not owned — the caller closes it.
+    fd: posix.fd_t,
+    /// Negotiated default / max window (4 KiB units). Set from the
+    /// peer's `capabilities` frame via `applyPeerCapabilities`; until
+    /// then the protocol defaults stand.
+    negotiated_default_window_units: u16 = protocol.default_channel_window_units,
+    negotiated_max_window_units: u16 = protocol.max_channel_window_units,
+    /// Active channels keyed by channel_id.
+    channels: std.AutoHashMapUnmanaged(u32, *Channel) = .empty,
+    /// Next client-direction channel id. Client ids always have the
+    /// high bit clear; the allocator wraps at the daemon-bit boundary.
+    next_client_channel_id: u32 = 1,
+    /// Guards `fd` writes, the channels map, and every channel field
+    /// mutated outside the dispatch thread (notably `out_credit`).
+    mutex: std.Thread.Mutex = .{},
+
+    /// Per-channel embedder callbacks. All fire from the dispatch
+    /// thread; the embedder is responsible for hopping to its own
+    /// executor if needed.
+    pub const Callbacks = struct {
+        /// The peer accepted the open. `ack` is the service ack bytes
+        /// (borrowed — copy if retained); `peer_window_units` is the
+        /// outbound credit window the peer granted, in 4 KiB units.
+        on_opened: *const fn (ctx: ?*anyopaque, ack: []const u8, peer_window_units: u16) void,
+        /// Inbound `channel_data`. `bytes` is borrowed for the call.
+        on_data: *const fn (ctx: ?*anyopaque, bytes: []const u8) void,
+        /// Additional outbound credit became available (`channel_window`
+        /// frame, or the initial grant from `channel_opened`).
+        on_credit: *const fn (ctx: ?*anyopaque, credit_bytes: u32) void,
+        /// Peer half-closed (`channel_eof`).
+        on_eof: *const fn (ctx: ?*anyopaque) void,
+        /// Channel torn down. After this returns the channel id is
+        /// invalid; the embedder must drop its handle.
+        on_close: *const fn (ctx: ?*anyopaque, reason: protocol.ChannelCloseReason, message: []const u8) void,
+    };
+
+    pub fn init(alloc: Allocator, fd: posix.fd_t) ClientMux {
+        return .{ .alloc = alloc, .fd = fd };
+    }
+
+    pub fn deinit(self: *ClientMux) void {
+        // Fire on_close for every channel that's still live so the
+        // embedder can release its handles, then free.
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            const ch = entry.value_ptr.*;
+            ch.closing = true;
+            ch.close_signal.set();
+            ch.credit_signal.set();
+            if (ch.client_callbacks) |cb| {
+                cb.on_close(ch.client_ctx, .daemon_shutdown, "");
+            }
+            self.alloc.destroy(ch);
+        }
+        self.channels.deinit(self.alloc);
+    }
+
+    /// Record negotiated window limits from the peer's `capabilities`
+    /// frame. Takes the smaller of the two for safety, matching
+    /// `Mux.handshake`.
+    pub fn applyPeerCapabilities(self: *ClientMux, peer: protocol.Capabilities) void {
+        if (peer.default_window > 0 and
+            peer.default_window < self.negotiated_default_window_units)
+        {
+            self.negotiated_default_window_units = peer.default_window;
+        }
+        if (peer.max_window > 0 and peer.max_window < self.negotiated_max_window_units) {
+            self.negotiated_max_window_units = peer.max_window;
+        }
+    }
+
+    fn sendFrameLocked(
+        self: *ClientMux,
+        kind: protocol.Kind,
+        payload: []const u8,
+    ) !void {
+        try shared.sendFrameFd(self.fd, kind, 0, payload);
+    }
+
+    fn sendFrame(self: *ClientMux, kind: protocol.Kind, payload: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.sendFrameLocked(kind, payload);
+    }
+
+    /// Open a channel toward the peer. Allocates a client-direction
+    /// channel id, registers the channel, sends `channel_open`, and
+    /// returns the id. Best-effort: does not block for the peer's
+    /// `channel_opened` ack. Outbound credit starts at 0 — the embedder
+    /// must wait for `on_opened` / `on_credit` before `writeChannel`
+    /// will accept bytes.
+    pub fn openChannel(
+        self: *ClientMux,
+        service: protocol.ChannelService,
+        flags: protocol.ChannelOpenFlags,
+        initial_window_units: u16,
+        params: []const u8,
+        callbacks: Callbacks,
+        ctx: ?*anyopaque,
+    ) !u32 {
+        const channel_id = try self.allocClientChannelId();
+
+        const requested_units: u16 = if (initial_window_units == 0)
+            self.negotiated_default_window_units
+        else
+            @min(initial_window_units, self.negotiated_max_window_units);
+        const window_bytes: usize = @as(usize, requested_units) * 4 * 1024;
+
+        const ch = try self.alloc.create(Channel);
+        errdefer self.alloc.destroy(ch);
+        ch.* = .{
+            .id = channel_id,
+            .service_id = @intFromEnum(service),
+            .origin = .local,
+            .service_state = null,
+            .vtable = null,
+            .client_callbacks = callbacks,
+            .client_ctx = ctx,
+            // Pre-ack: no outbound credit until `channel_opened`. The
+            // embedder's `ghostty_channel_write` contract returns 0
+            // when credit is 0 and waits for `on_credit`.
+            // TODO(0.5-RTT): allow speculative pre-ack writes for
+            // browser_proxy.
+            .out_credit = 0,
+            .in_credit = window_bytes,
+            .initial_window_bytes = window_bytes,
+            .in_unacked = 0,
+            .flags = flags,
+        };
+        self.mutex.lock();
+        const put_err = self.channels.put(self.alloc, channel_id, ch);
+        self.mutex.unlock();
+        try put_err;
+
+        const open = protocol.ChannelOpen{
+            .channel_id = channel_id,
+            .service = service,
+            .flags = flags,
+            .initial_window = requested_units,
+            .service_params = params,
+        };
+        const encoded = open.encode(self.alloc) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.mutex.lock();
+                _ = self.channels.remove(channel_id);
+                self.mutex.unlock();
+                self.alloc.destroy(ch);
+                return error.OutOfMemory;
+            },
+        };
+        defer self.alloc.free(encoded);
+        self.sendFrame(.channel_open, encoded) catch |err| {
+            log.warn("client: failed to send channel_open: {}", .{err});
+        };
+        return channel_id;
+    }
+
+    /// Allocate the next client-direction channel id. Caller must NOT
+    /// hold `mutex`. Monotonic, wraps at the daemon-bit boundary, skips
+    /// ids already in `channels`.
+    fn allocClientChannelId(self: *ClientMux) error{ResourceExhausted}!u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var probes: usize = self.channels.count() + 1;
+        while (probes > 0) : (probes -= 1) {
+            const candidate = self.next_client_channel_id;
+            // Client ids must keep the high bit clear; wrap back to 1.
+            self.next_client_channel_id =
+                if (candidate >= protocol.channel_id_daemon_bit - 1)
+                    1
+                else
+                    candidate + 1;
+            if (!self.channels.contains(candidate)) return candidate;
+        }
+        return error.ResourceExhausted;
+    }
+
+    /// Dispatch a channel/capabilities frame. Mirrors `Mux.dispatch`.
+    pub fn dispatch(
+        self: *ClientMux,
+        kind: protocol.Kind,
+        payload: []const u8,
+    ) !void {
+        switch (kind) {
+            .channel_opened => try self.handleOpened(payload),
+            .channel_data => try self.handleData(payload),
+            .channel_window => try self.handleWindow(payload),
+            .channel_eof => try self.handleEof(payload),
+            .channel_close => try self.handleClose(payload),
+            .channel_control => self.handleControl(payload),
+            .channel_open => try self.handleInboundOpen(payload),
+            .capabilities => {
+                log.debug("client: late capabilities frame, ignoring", .{});
+            },
+            else => unreachable, // caller must filter
+        }
+    }
+
+    fn handleOpened(self: *ClientMux, payload: []const u8) !void {
+        const opened = protocol.ChannelOpened.parse(payload) catch {
+            log.warn("client: malformed channel_opened frame", .{});
+            return;
+        };
+        self.mutex.lock();
+        const ch = self.channels.get(opened.channel_id) orelse {
+            self.mutex.unlock();
+            log.debug(
+                "client: channel_opened for unknown channel_id={d} — discarding",
+                .{opened.channel_id},
+            );
+            return;
+        };
+        const cb = ch.client_callbacks orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (opened.status != .ok) {
+            // Peer rejected the open. Remove + notify the embedder.
+            ch.closing = true;
+            _ = self.channels.remove(opened.channel_id);
+            self.mutex.unlock();
+            ch.close_signal.set();
+            ch.credit_signal.set();
+            cb.on_close(ch.client_ctx, .peer_reset, "peer rejected open");
+            self.alloc.destroy(ch);
+            return;
+        }
+        // Record the negotiated flags + outbound window.
+        ch.flags = opened.flags;
+        const credit_units = opened.peer_window;
+        if (credit_units > 0) {
+            ch.out_credit = @as(usize, credit_units) * 4 * 1024;
+        }
+        self.mutex.unlock();
+
+        // Fire on_opened, then the initial credit grant. Both run on
+        // the dispatch thread; `service_ack` is borrowed from `payload`
+        // which outlives this call.
+        cb.on_opened(ch.client_ctx, opened.service_ack, credit_units);
+        if (credit_units > 0) {
+            ch.credit_signal.set();
+            cb.on_credit(ch.client_ctx, @as(u32, credit_units) * 4 * 1024);
+        }
+    }
+
+    fn handleData(self: *ClientMux, payload: []const u8) !void {
+        const data = protocol.ChannelData.parse(payload) catch {
+            log.warn("client: malformed channel_data frame", .{});
+            return;
+        };
+        self.mutex.lock();
+        const ch = self.channels.get(data.channel_id) orelse {
+            self.mutex.unlock();
+            log.debug(
+                "client: channel_data for unknown channel_id={d} — discarding",
+                .{data.channel_id},
+            );
+            return;
+        };
+        const cb = ch.client_callbacks orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (data.bytes.len > ch.in_credit) {
+            log.warn("client: channel_id={d} window violation: sent {d}, credit {d}", .{
+                ch.id, data.bytes.len, ch.in_credit,
+            });
+            self.mutex.unlock();
+            try self.requestCloseInternal(ch, .peer_reset, "window violation", true);
+            return;
+        }
+        ch.in_credit -= data.bytes.len;
+        ch.in_unacked += data.bytes.len;
+        self.mutex.unlock();
+
+        cb.on_data(ch.client_ctx, data.bytes);
+
+        // Replenish the inbound credit window eagerly, same 25%
+        // threshold as the daemon side.
+        self.mutex.lock();
+        const should_replenish = ch.in_unacked >= ch.initial_window_bytes / 4;
+        if (should_replenish) {
+            const credit_to_grant: u32 = @intCast(ch.in_unacked);
+            ch.in_credit += ch.in_unacked;
+            ch.in_unacked = 0;
+            const win = protocol.ChannelWindow{
+                .channel_id = ch.id,
+                .credit_bytes = credit_to_grant,
+            };
+            const win_bytes = win.encode();
+            self.sendFrameLocked(.channel_window, &win_bytes) catch |err| {
+                log.warn("client: failed to send channel_window: {}", .{err});
+            };
+        }
+        self.mutex.unlock();
+    }
+
+    fn handleWindow(self: *ClientMux, payload: []const u8) !void {
+        const win = protocol.ChannelWindow.parse(payload) catch {
+            log.warn("client: malformed channel_window frame", .{});
+            return;
+        };
+        self.mutex.lock();
+        const ch = self.channels.get(win.channel_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        const cb = ch.client_callbacks orelse {
+            self.mutex.unlock();
+            return;
+        };
+        ch.out_credit = std.math.add(usize, ch.out_credit, win.credit_bytes) catch
+            std.math.maxInt(usize);
+        self.mutex.unlock();
+        ch.credit_signal.set();
+        cb.on_credit(ch.client_ctx, win.credit_bytes);
+    }
+
+    fn handleEof(self: *ClientMux, payload: []const u8) !void {
+        const eof = protocol.ChannelEof.parse(payload) catch return;
+        self.mutex.lock();
+        const ch = self.channels.get(eof.channel_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        if (ch.remote_eof) {
+            self.mutex.unlock();
+            return; // duplicate
+        }
+        ch.remote_eof = true;
+        const cb = ch.client_callbacks;
+        self.mutex.unlock();
+        if (cb) |c| c.on_eof(ch.client_ctx);
+    }
+
+    fn handleClose(self: *ClientMux, payload: []const u8) !void {
+        const close = protocol.ChannelClose.parse(payload) catch return;
+        self.mutex.lock();
+        const ch = self.channels.get(close.channel_id) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        ch.closing = true;
+        _ = self.channels.remove(close.channel_id);
+        const cb = ch.client_callbacks;
+        self.mutex.unlock();
+        ch.close_signal.set();
+        ch.credit_signal.set();
+        if (cb) |c| c.on_close(ch.client_ctx, close.reason, close.message);
+        self.alloc.destroy(ch);
+    }
+
+    fn handleControl(_: *ClientMux, payload: []const u8) void {
+        const ctrl = protocol.ChannelControl.parse(payload) catch return;
+        // The client-side channel model has no service vtable, so there
+        // is no per-op handler. Control ops that the embedder cares
+        // about (port_listener status, etc.) are a future addition;
+        // until then, log and drop.
+        log.debug("client: ignoring channel_control op={d} channel_id={d}", .{
+            ctrl.op, ctrl.channel_id,
+        });
+    }
+
+    /// Inbound `channel_open` on the client side. Daemon-originated
+    /// channels (e.g. port_listener accepts) arrive this way, but the
+    /// client has no service registry to instantiate them against yet,
+    /// so we reject with `service_not_supported`.
+    /// TODO(daemon-originated-on-client): route to a client-side
+    /// service registry.
+    fn handleInboundOpen(self: *ClientMux, payload: []const u8) !void {
+        const open = protocol.ChannelOpen.parse(payload) catch {
+            log.warn("client: malformed channel_open frame", .{});
+            return;
+        };
+        log.debug(
+            "client: rejecting daemon-originated channel_open id={x} service={d}",
+            .{ open.channel_id, @intFromEnum(open.service) },
+        );
+        const opened = protocol.ChannelOpened{
+            .channel_id = open.channel_id,
+            .status = .service_not_supported,
+        };
+        const encoded = try opened.encode(self.alloc);
+        defer self.alloc.free(encoded);
+        try self.sendFrame(.channel_opened, encoded);
+    }
+
+    /// Write up to `bytes.len` bytes as one or more `channel_data`
+    /// frames, respecting the outbound credit window. Returns the
+    /// number of bytes accepted. Returns 0 if the channel is closing,
+    /// has sent EOF, or currently has no credit — the embedder waits
+    /// for `on_credit` and retries. Discipline matches
+    /// `Mux.sendChannelData`: lock once, check, encode + send under the
+    /// lock, unlock.
+    pub fn writeChannel(self: *ClientMux, channel_id: u32, bytes: []const u8) !usize {
+        if (bytes.len == 0) return 0;
+        const max_data = protocol.max_payload - protocol.ChannelData.fixed_size;
+
+        self.mutex.lock();
+        const ch = self.channels.get(channel_id) orelse {
+            self.mutex.unlock();
+            return error.UnknownChannel;
+        };
+        if (ch.closing or ch.local_eof) {
+            self.mutex.unlock();
+            return 0;
+        }
+        if (ch.out_credit == 0) {
+            ch.credit_signal.reset();
+            self.mutex.unlock();
+            return 0;
+        }
+        const to_send = @min(@min(bytes.len, ch.out_credit), max_data);
+        ch.out_credit -= to_send;
+        const frame = protocol.ChannelData{ .channel_id = channel_id, .bytes = bytes[0..to_send] };
+        const encoded = try frame.encode(self.alloc);
+        defer self.alloc.free(encoded);
+        try self.sendFrameLocked(.channel_data, encoded);
+        self.mutex.unlock();
+        return to_send;
+    }
+
+    /// Send `channel_eof` for the given channel. Idempotent.
+    pub fn channelEof(self: *ClientMux, channel_id: u32) !void {
+        self.mutex.lock();
+        const ch = self.channels.get(channel_id) orelse {
+            self.mutex.unlock();
+            return error.UnknownChannel;
+        };
+        if (ch.local_eof or ch.closing) {
+            self.mutex.unlock();
+            return;
+        }
+        ch.local_eof = true;
+        const eof_bytes = (protocol.ChannelEof{ .channel_id = channel_id }).encode();
+        try self.sendFrameLocked(.channel_eof, &eof_bytes);
+        self.mutex.unlock();
+    }
+
+    /// Send `channel_close` and tear down the channel locally. The
+    /// embedder's `on_close` callback is NOT fired — the embedder
+    /// initiated this teardown and already knows.
+    pub fn channelClose(
+        self: *ClientMux,
+        channel_id: u32,
+        reason: protocol.ChannelCloseReason,
+        message: []const u8,
+    ) !void {
+        self.mutex.lock();
+        const ch = self.channels.get(channel_id) orelse {
+            self.mutex.unlock();
+            return error.UnknownChannel;
+        };
+        self.mutex.unlock();
+        try self.requestCloseInternal(ch, reason, message, false);
+    }
+
+    /// Shared teardown for client-initiated close (`channelClose`) and
+    /// protocol-violation close (`handleData`). Sends `channel_close`,
+    /// removes the channel, frees it. `fire_on_close` controls whether
+    /// the embedder's `on_close` runs — true for involuntary teardown
+    /// (window violation), false for embedder-requested close.
+    fn requestCloseInternal(
+        self: *ClientMux,
+        ch: *Channel,
+        reason: protocol.ChannelCloseReason,
+        message: []const u8,
+        fire_on_close: bool,
+    ) !void {
+        self.mutex.lock();
+        if (ch.closing) {
+            self.mutex.unlock();
+            return;
+        }
+        ch.closing = true;
+        const id = ch.id;
+        const cb = ch.client_callbacks;
+        const frame = protocol.ChannelClose{
+            .channel_id = id,
+            .reason = reason,
+            .message = message,
+        };
+        const encoded = try frame.encode(self.alloc);
+        defer self.alloc.free(encoded);
+        self.sendFrameLocked(.channel_close, encoded) catch |err| {
+            log.warn("client: failed to send channel_close: {}", .{err});
+        };
+        _ = self.channels.remove(id);
+        self.mutex.unlock();
+
+        ch.close_signal.set();
+        ch.credit_signal.set();
+        if (fire_on_close) {
+            if (cb) |c| c.on_close(ch.client_ctx, reason, message);
+        }
+        self.alloc.destroy(ch);
     }
 };
 
@@ -1057,4 +1903,581 @@ test "mux ignores channel_data for unknown channel" {
     };
     const ready = try posix.poll(&pollfds, 0);
     try testing.expectEqual(@as(usize, 0), ready);
+}
+
+// =========================================================================
+// Daemon-originated channel tests (openChannelFromDaemon + handleOpened)
+// =========================================================================
+
+test "openChannelFromDaemon allocates a daemon-direction id and sends channel_open" {
+    var pair = try SocketPair.init(testing.allocator);
+    defer pair.deinit();
+
+    try pair.registry.register(.{
+        .id = echo_service_id,
+        .name = "echo",
+        .vtable = &echo_vtable,
+    });
+
+    const params = "hello-params";
+    const id = try pair.mux.openChannelFromDaemon(echo_service_id, params, params, 8);
+
+    // The id must carry the daemon-direction high bit.
+    try testing.expect((id & protocol.channel_id_daemon_bit) != 0);
+    // The channel must be registered with origin = local.
+    try testing.expect(pair.mux.channels.contains(id));
+    const ch = pair.mux.channels.get(id).?;
+    try testing.expectEqual(ChannelOrigin.local, ch.origin);
+
+    // A channel_open frame must have appeared on the wire.
+    const frame = try readFrameAlloc(testing.allocator, pair.b);
+    defer testing.allocator.free(frame.payload);
+    try testing.expectEqual(protocol.Kind.channel_open, frame.header.kind);
+    const open = try protocol.ChannelOpen.parse(frame.payload);
+    try testing.expectEqual(id, open.channel_id);
+    try testing.expect((open.channel_id & protocol.channel_id_daemon_bit) != 0);
+    try testing.expectEqual(@as(u8, echo_service_id), @intFromEnum(open.service));
+    try testing.expectEqualStrings(params, open.service_params);
+}
+
+test "openChannelFromDaemon rejects unregistered service" {
+    var pair = try SocketPair.init(testing.allocator);
+    defer pair.deinit();
+
+    try testing.expectError(
+        error.ServiceNotRegistered,
+        pair.mux.openChannelFromDaemon(200, "", "", 0),
+    );
+}
+
+test "handleOpened records peer_window on a daemon-originated channel" {
+    var pair = try SocketPair.init(testing.allocator);
+    defer pair.deinit();
+
+    try pair.registry.register(.{
+        .id = echo_service_id,
+        .name = "echo",
+        .vtable = &echo_vtable,
+    });
+
+    const id = try pair.mux.openChannelFromDaemon(echo_service_id, "", "", 8);
+    // Drain the channel_open frame.
+    const open_frame = try readFrameAlloc(testing.allocator, pair.b);
+    testing.allocator.free(open_frame.payload);
+
+    // Peer acks with a different window than we advertised.
+    const opened = protocol.ChannelOpened{
+        .channel_id = id,
+        .status = .ok,
+        .peer_window = 32, // 32 × 4 KiB = 128 KiB
+    };
+    const opened_buf = try opened.encode(testing.allocator);
+    defer testing.allocator.free(opened_buf);
+    try pair.mux.dispatch(.channel_opened, opened_buf);
+
+    // out_credit must now reflect the peer's authoritative grant.
+    const ch = pair.mux.channels.get(id).?;
+    try testing.expectEqual(@as(usize, 32 * 4 * 1024), ch.out_credit);
+}
+
+test "handleOpened with status != ok tears down the daemon-originated channel" {
+    var pair = try SocketPair.init(testing.allocator);
+    defer pair.deinit();
+
+    try pair.registry.register(.{
+        .id = echo_service_id,
+        .name = "echo",
+        .vtable = &echo_vtable,
+    });
+
+    const id = try pair.mux.openChannelFromDaemon(echo_service_id, "", "", 8);
+    const open_frame = try readFrameAlloc(testing.allocator, pair.b);
+    testing.allocator.free(open_frame.payload);
+
+    // Peer rejects the open.
+    const opened = protocol.ChannelOpened{
+        .channel_id = id,
+        .status = .service_error,
+    };
+    const opened_buf = try opened.encode(testing.allocator);
+    defer testing.allocator.free(opened_buf);
+    try pair.mux.dispatch(.channel_opened, opened_buf);
+
+    // The local channel must be gone, and a channel_close frame should
+    // have been emitted to the peer.
+    try testing.expect(!pair.mux.channels.contains(id));
+    const close_frame = try readFrameAlloc(testing.allocator, pair.b);
+    defer testing.allocator.free(close_frame.payload);
+    try testing.expectEqual(protocol.Kind.channel_close, close_frame.header.kind);
+    const close = try protocol.ChannelClose.parse(close_frame.payload);
+    try testing.expectEqual(id, close.channel_id);
+    try testing.expectEqual(protocol.ChannelCloseReason.peer_reset, close.reason);
+}
+
+test "handleOpened ignores channel_opened for a peer-opened channel" {
+    var pair = try SocketPair.init(testing.allocator);
+    defer pair.deinit();
+
+    try pair.registry.register(.{
+        .id = echo_service_id,
+        .name = "echo",
+        .vtable = &echo_vtable,
+    });
+
+    // Peer opens a channel (origin = remote).
+    const open = protocol.ChannelOpen{
+        .channel_id = 5,
+        .service = @enumFromInt(echo_service_id),
+    };
+    const open_buf = try open.encode(testing.allocator);
+    defer testing.allocator.free(open_buf);
+    try pair.mux.dispatch(.channel_open, open_buf);
+    const opened_reply = try readFrameAlloc(testing.allocator, pair.b);
+    testing.allocator.free(opened_reply.payload);
+
+    const before = pair.mux.channels.get(5).?.out_credit;
+
+    // A stray channel_opened for that id must be ignored, not applied.
+    const stray = protocol.ChannelOpened{
+        .channel_id = 5,
+        .status = .ok,
+        .peer_window = 999,
+    };
+    const stray_buf = try stray.encode(testing.allocator);
+    defer testing.allocator.free(stray_buf);
+    try pair.mux.dispatch(.channel_opened, stray_buf);
+
+    try testing.expectEqual(before, pair.mux.channels.get(5).?.out_credit);
+}
+
+// =========================================================================
+// ClientMux tests
+// =========================================================================
+
+/// Echo service that copies inbound channel_data straight back out as
+/// channel_data on the same channel. Used to exercise ClientMux against
+/// a real daemon-side Mux.
+const RoundtripState = struct {
+    mux: *Mux,
+    channel: ?*Channel = null,
+};
+
+fn rtOpen(
+    _: ?*anyopaque,
+    mux: *Mux,
+    _: u32,
+    _: []const u8,
+    _: []u8,
+) ServiceError!Service.OpenResult {
+    const state = try mux.alloc.create(RoundtripState);
+    state.* = .{ .mux = mux };
+    return .{ .state = state };
+}
+
+fn rtOnOpened(state_ptr: ?*anyopaque, ch: *Channel) void {
+    const state: *RoundtripState = @ptrCast(@alignCast(state_ptr orelse return));
+    state.channel = ch;
+}
+
+fn rtOnData(state_ptr: ?*anyopaque, bytes: []const u8) ServiceError!void {
+    const state: *RoundtripState = @ptrCast(@alignCast(state_ptr orelse return));
+    const ch = state.channel orelse return;
+    // Echo the bytes back, looping until the whole slice is sent.
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const sent = state.mux.sendChannelData(ch, bytes[off..]) catch
+            return error.ServiceError;
+        if (sent == 0) {
+            _ = state.mux.waitForCredit(ch, 1 * std.time.ns_per_s);
+            continue;
+        }
+        off += sent;
+    }
+}
+
+fn rtOnControl(_: ?*anyopaque, _: u8, _: []const u8) ServiceError!void {}
+fn rtOnEof(_: ?*anyopaque) void {}
+fn rtOnClose(state_ptr: ?*anyopaque, _: protocol.ChannelCloseReason, _: []const u8) void {
+    const state: *RoundtripState = @ptrCast(@alignCast(state_ptr orelse return));
+    state.mux.alloc.destroy(state);
+}
+
+const roundtrip_vtable: Service.VTable = .{
+    .open = rtOpen,
+    .on_opened = rtOnOpened,
+    .on_data = rtOnData,
+    .on_control = rtOnControl,
+    .on_eof = rtOnEof,
+    .on_close = rtOnClose,
+};
+
+const roundtrip_service_id: u8 = 101;
+
+/// Test harness pairing a daemon `Mux` and a `ClientMux` over a
+/// socketpair, with a background thread pumping the daemon's dispatch.
+const DaemonClientPair = struct {
+    a: posix.fd_t,
+    b: posix.fd_t,
+    alloc: Allocator,
+    registry: *Registry,
+    mux: *Mux,
+    client: *ClientMux,
+    daemon_thread: ?std.Thread = null,
+    daemon_stop: std.atomic.Value(bool) = .init(false),
+
+    fn init(alloc: Allocator) !*DaemonClientPair {
+        var fds: [2]posix.fd_t = undefined;
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SocketPairFailed;
+
+        const reg = try alloc.create(Registry);
+        reg.* = Registry.init(alloc);
+        const mux = try alloc.create(Mux);
+        mux.* = Mux.init(alloc, fds[0], reg);
+        const client = try alloc.create(ClientMux);
+        client.* = ClientMux.init(alloc, fds[1]);
+
+        const self = try alloc.create(DaemonClientPair);
+        self.* = .{
+            .a = fds[0],
+            .b = fds[1],
+            .alloc = alloc,
+            .registry = reg,
+            .mux = mux,
+            .client = client,
+        };
+        return self;
+    }
+
+    /// Start a background thread that reads frames off the daemon fd
+    /// and feeds them to `mux.dispatch`. Exits on EOF or stop flag.
+    fn startDaemonPump(self: *DaemonClientPair) !void {
+        self.daemon_thread = try std.Thread.spawn(.{}, daemonPump, .{self});
+    }
+
+    fn daemonPump(self: *DaemonClientPair) void {
+        while (!self.daemon_stop.load(.acquire)) {
+            const frame = readFrameAlloc(self.alloc, self.a) catch return;
+            defer self.alloc.free(frame.payload);
+            self.mux.dispatch(frame.header.kind, frame.payload) catch return;
+        }
+    }
+
+    fn deinit(self: *DaemonClientPair) void {
+        self.daemon_stop.store(true, .release);
+        // Break the daemon pump out of a blocking read.
+        posix.shutdown(self.a, .both) catch {};
+        if (self.daemon_thread) |t| t.join();
+        self.client.deinit();
+        self.mux.deinit();
+        self.registry.deinit();
+        posix.close(self.a);
+        posix.close(self.b);
+        self.alloc.destroy(self.client);
+        self.alloc.destroy(self.mux);
+        self.alloc.destroy(self.registry);
+        self.alloc.destroy(self);
+    }
+};
+
+/// Callback context for ClientMux tests — records every callback.
+const ClientObserver = struct {
+    mutex: std.Thread.Mutex = .{},
+    opened: bool = false,
+    opened_window: u16 = 0,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+    credit_total: u64 = 0,
+    eof: bool = false,
+    closed: bool = false,
+    close_reason: protocol.ChannelCloseReason = .normal,
+    alloc: Allocator,
+
+    fn deinit(self: *ClientObserver) void {
+        self.data.deinit(self.alloc);
+    }
+
+    fn onOpened(ctx: ?*anyopaque, _: []const u8, peer_window_units: u16) void {
+        const self: *ClientObserver = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.opened = true;
+        self.opened_window = peer_window_units;
+    }
+    fn onData(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *ClientObserver = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.data.appendSlice(self.alloc, bytes) catch {};
+    }
+    fn onCredit(ctx: ?*anyopaque, credit_bytes: u32) void {
+        const self: *ClientObserver = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.credit_total += credit_bytes;
+    }
+    fn onEof(ctx: ?*anyopaque) void {
+        const self: *ClientObserver = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.eof = true;
+    }
+    fn onClose(ctx: ?*anyopaque, reason: protocol.ChannelCloseReason, _: []const u8) void {
+        const self: *ClientObserver = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.close_reason = reason;
+    }
+
+    fn callbacks() ClientMux.Callbacks {
+        return .{
+            .on_opened = onOpened,
+            .on_data = onData,
+            .on_credit = onCredit,
+            .on_eof = onEof,
+            .on_close = onClose,
+        };
+    }
+};
+
+test "ClientMux roundtrip: open, write, echo back, close" {
+    const pair = try DaemonClientPair.init(testing.allocator);
+    defer pair.deinit();
+    try pair.registry.register(.{
+        .id = roundtrip_service_id,
+        .name = "roundtrip",
+        .vtable = &roundtrip_vtable,
+    });
+    try pair.startDaemonPump();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    const id = try pair.client.openChannel(
+        @enumFromInt(roundtrip_service_id),
+        .{},
+        8,
+        "",
+        ClientObserver.callbacks(),
+        &observer,
+    );
+
+    // The client must dispatch the daemon's channel_opened reply.
+    const opened_frame = try readFrameAlloc(testing.allocator, pair.b);
+    defer testing.allocator.free(opened_frame.payload);
+    try testing.expectEqual(protocol.Kind.channel_opened, opened_frame.header.kind);
+    try pair.client.dispatch(opened_frame.header.kind, opened_frame.payload);
+    try testing.expect(observer.opened);
+
+    // Write bytes; the daemon echo service bounces them back.
+    const greeting = "hello over the mux";
+    var written: usize = 0;
+    while (written < greeting.len) {
+        const n = try pair.client.writeChannel(id, greeting[written..]);
+        written += n;
+    }
+
+    // Read echoed channel_data frames off the client fd and dispatch
+    // them until the observer has the full payload.
+    while (true) {
+        observer.mutex.lock();
+        const have = observer.data.items.len;
+        observer.mutex.unlock();
+        if (have >= greeting.len) break;
+        const frame = try readFrameAlloc(testing.allocator, pair.b);
+        defer testing.allocator.free(frame.payload);
+        try pair.client.dispatch(frame.header.kind, frame.payload);
+    }
+    try testing.expectEqualStrings(greeting, observer.data.items);
+
+    // Clean close from the client side.
+    try pair.client.channelClose(id, .normal, "");
+    try testing.expect(!pair.client.channels.contains(id));
+}
+
+test "ClientMux window symmetry: tiny window drives channel_window updates" {
+    const pair = try DaemonClientPair.init(testing.allocator);
+    defer pair.deinit();
+    try pair.registry.register(.{
+        .id = roundtrip_service_id,
+        .name = "roundtrip",
+        .vtable = &roundtrip_vtable,
+    });
+    try pair.startDaemonPump();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    // Open with a 1 × 4 KiB window.
+    const id = try pair.client.openChannel(
+        @enumFromInt(roundtrip_service_id),
+        .{},
+        1,
+        "",
+        ClientObserver.callbacks(),
+        &observer,
+    );
+    const opened_frame = try readFrameAlloc(testing.allocator, pair.b);
+    defer testing.allocator.free(opened_frame.payload);
+    try pair.client.dispatch(opened_frame.header.kind, opened_frame.payload);
+    // Initial credit grant equals the 4 KiB window.
+    try testing.expectEqual(@as(u64, 4 * 1024), observer.credit_total);
+
+    // Push 6 KiB through — enough to cross the daemon's 25% replenish
+    // threshold and force a channel_window update back to the client.
+    const payload = try testing.allocator.alloc(u8, 6 * 1024);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'z');
+
+    var written: usize = 0;
+    var collected: usize = 0;
+    while (collected < payload.len) {
+        if (written < payload.len) {
+            const n = try pair.client.writeChannel(id, payload[written..]);
+            written += n;
+        }
+        // Drain frames the daemon sent us (echoed data + window grants).
+        var pollfds = [1]posix.pollfd{
+            .{ .fd = pair.b, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = try posix.poll(&pollfds, 50);
+        if (ready > 0) {
+            const frame = try readFrameAlloc(testing.allocator, pair.b);
+            defer testing.allocator.free(frame.payload);
+            if (frame.header.kind == .channel_data) {
+                const dd = try protocol.ChannelData.parse(frame.payload);
+                collected += dd.bytes.len;
+            }
+            try pair.client.dispatch(frame.header.kind, frame.payload);
+        }
+    }
+
+    // The client must have received more credit than the initial 4 KiB
+    // window — i.e. at least one channel_window frame was applied.
+    try testing.expect(observer.credit_total > 4 * 1024);
+}
+
+test "ClientMux peer rejection fires on_close(peer_reset)" {
+    const pair = try DaemonClientPair.init(testing.allocator);
+    defer pair.deinit();
+    // Intentionally do NOT register the service.
+    try pair.startDaemonPump();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    const id = try pair.client.openChannel(
+        .tcp_connect, // not registered on the daemon side
+        .{},
+        8,
+        "",
+        ClientObserver.callbacks(),
+        &observer,
+    );
+
+    // Daemon replies with channel_opened status=service_not_supported.
+    const opened_frame = try readFrameAlloc(testing.allocator, pair.b);
+    defer testing.allocator.free(opened_frame.payload);
+    try pair.client.dispatch(opened_frame.header.kind, opened_frame.payload);
+
+    try testing.expect(observer.closed);
+    try testing.expectEqual(protocol.ChannelCloseReason.peer_reset, observer.close_reason);
+    try testing.expect(!pair.client.channels.contains(id));
+}
+
+test "ClientMux pre-ack write returns 0 until channel_opened arrives" {
+    const pair = try DaemonClientPair.init(testing.allocator);
+    defer pair.deinit();
+    try pair.registry.register(.{
+        .id = roundtrip_service_id,
+        .name = "roundtrip",
+        .vtable = &roundtrip_vtable,
+    });
+    try pair.startDaemonPump();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    const id = try pair.client.openChannel(
+        @enumFromInt(roundtrip_service_id),
+        .{},
+        8,
+        "",
+        ClientObserver.callbacks(),
+        &observer,
+    );
+
+    // Before processing the channel_opened reply there is no outbound
+    // credit — a write must be refused (returns 0).
+    const pre = try pair.client.writeChannel(id, "data");
+    try testing.expectEqual(@as(usize, 0), pre);
+
+    // Process the daemon's channel_opened, then retry.
+    const opened_frame = try readFrameAlloc(testing.allocator, pair.b);
+    defer testing.allocator.free(opened_frame.payload);
+    try pair.client.dispatch(opened_frame.header.kind, opened_frame.payload);
+
+    const post = try pair.client.writeChannel(id, "data");
+    try testing.expect(post > 0);
+}
+
+test "ClientMux rejects daemon-originated channel_open" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var client = ClientMux.init(testing.allocator, fds[1]);
+    defer client.deinit();
+
+    // Synthesize a daemon-originated channel_open arriving at the client.
+    const open = protocol.ChannelOpen{
+        .channel_id = protocol.channel_id_daemon_bit | 7,
+        .service = .tcp_connect,
+    };
+    const open_buf = try open.encode(testing.allocator);
+    defer testing.allocator.free(open_buf);
+    try client.dispatch(.channel_open, open_buf);
+
+    // The client must have replied with channel_opened,
+    // status=service_not_supported, and registered nothing.
+    const reply = try readFrameAlloc(testing.allocator, fds[0]);
+    defer testing.allocator.free(reply.payload);
+    try testing.expectEqual(protocol.Kind.channel_opened, reply.header.kind);
+    const opened = try protocol.ChannelOpened.parse(reply.payload);
+    try testing.expectEqual(protocol.ChannelOpenStatus.service_not_supported, opened.status);
+    try testing.expectEqual(open.channel_id, opened.channel_id);
+    try testing.expect(!client.channels.contains(open.channel_id));
+}
+
+test "ClientMux channel id allocation skips the daemon-direction range" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var client = ClientMux.init(testing.allocator, fds[1]);
+    defer client.deinit();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    // Every allocated id must keep the high bit clear.
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const id = try client.openChannel(
+            .tcp_connect,
+            .{},
+            1,
+            "",
+            ClientObserver.callbacks(),
+            &observer,
+        );
+        try testing.expect((id & protocol.channel_id_daemon_bit) == 0);
+        // Drain the channel_open frame the client emitted.
+        const frame = try readFrameAlloc(testing.allocator, fds[0]);
+        testing.allocator.free(frame.payload);
+    }
 }
