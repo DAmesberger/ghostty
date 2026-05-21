@@ -1064,15 +1064,12 @@ typedef enum {
 //     embedder MUST hop to its own UI/serial queue if needed; do not
 //     assume the callback thread is stable across callbacks.
 //
-//     ONE EXCEPTION: ghostty_ssh_open fires the initial on_state
-//     transition (kind=CONNECTING) SYNCHRONOUSLY on the calling
-//     thread BEFORE returning, so embedders are guaranteed to see
-//     that transition even on a config-validation failure path. Every
-//     subsequent on_state — including any transitions emitted later
-//     in the same ghostty_ssh_open invocation (e.g. failed Entry
-//     acquisition) — fires on a libghostty worker thread. Embedders
-//     that hop to a serial queue from on_state should be prepared to
-//     see the very first dispatch happen on the open caller's thread.
+//     Exception: ghostty_ssh_open synchronously invokes on_state
+//     exactly once with kind = CONNECTING before returning, so
+//     embedders are guaranteed at-least-one state observation as
+//     part of construction. That single initial callback fires on
+//     the calling thread. ALL subsequent state, host-key, and
+//     channel callbacks honor the worker-thread rule.
 //   * Buffers passed INTO libghostty (passwords, write data, params)
 //     are copied internally — the caller may free or mutate them as
 //     soon as the call returns.

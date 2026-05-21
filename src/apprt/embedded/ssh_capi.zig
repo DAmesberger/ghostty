@@ -39,8 +39,14 @@
 //!   * Every exported function is non-blocking and may be called from
 //!     any thread.
 //!   * Callbacks fire on libghostty-owned worker threads. The handle
-//!     holds the callback set behind a small spinlock so submit_*
-//!     calls from inside a callback are safe.
+//!     holds the callback set behind a mutex so submit_* calls from
+//!     inside a callback are safe.
+//!   * Exception: ghostty_ssh_open synchronously invokes on_state
+//!     exactly once with kind = CONNECTING before returning, so
+//!     embedders are guaranteed at-least-one state observation as
+//!     part of construction. That single initial callback fires on
+//!     the calling thread. ALL subsequent state, host-key, and
+//!     channel callbacks honor the worker-thread rule.
 //!   * Buffers passed in are copied; buffers handed to callbacks are
 //!     borrowed for the callback duration.
 
@@ -730,6 +736,10 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
 
     // Snapshot the channel list under the mutex, then close each
     // outside the mutex (emitClose calls back into the embedder).
+    // append() failures are intentionally swallowed: if we OOM here,
+    // any channel we couldn't enqueue stays live, ghostty_ssh_free's
+    // live-channels guard refuses to destroy the parent handle, and
+    // the embedder sees a loud leak instead of a use-after-free.
     h.mutex.lock();
     var snapshot = std.ArrayList(*ChannelHandle).empty;
     defer snapshot.deinit(h.alloc);
@@ -818,10 +828,16 @@ export fn ghostty_channel_write(
     _ = bytes;
     const ch = channel orelse return std.math.maxInt(usize);
     if (ch.closed.load(.acquire)) return std.math.maxInt(usize);
-    // TODO(client-mux): hand off to ClientMux.writeChannel(ch.channel_id, bytes[0..len])
-    // and return the number of bytes accepted. Until then, accept
-    // nothing (caller will park waiting for on_window_credit).
-    return if (len == 0) 0 else 0;
+    if (len == 0) return 0;
+    // TODO(client-mux): real credit-based write path will hand off to
+    // ClientMux.writeChannel(ch.channel_id, bytes[0..len]) and return
+    // the number of bytes accepted. For now, every non-empty write
+    // reports terminal failure (SIZE_MAX, per the header contract:
+    // "channel closed; caller should expect on_close shortly"). This
+    // pairs with the synthetic on_close(SERVICE_ERROR) fired from
+    // ghostty_ssh_open_channel so embedders see the channel is dead
+    // immediately instead of parking on credit that will never arrive.
+    return std.math.maxInt(usize);
 }
 
 /// Implements `ghostty_channel_eof`.
@@ -839,6 +855,9 @@ export fn ghostty_channel_close(
 ) void {
     const ch = channel orelse return;
     // TODO(client-mux): emit channel_close frame via ClientMux.
+    // The `message` arg to emitClose is NULL today; round-tripping a
+    // reason string from the embedder + back through on_close is a
+    // follow-up alongside the real channel_close-frame plumbing.
     ch.emitClose(reason, null);
 }
 
@@ -1030,6 +1049,52 @@ test "ghostty_ssh_open_channel synthesizes a close until mux wires" {
 
     // After the stub close, free still works.
     ghostty_channel_free(ch);
+}
+
+test "ghostty_channel_write returns SIZE_MAX on the stubbed mux path" {
+    // While the client-mux is stubbed, non-empty writes MUST report
+    // terminal failure (SIZE_MAX) instead of silently parking the
+    // caller on credit that will never arrive. Empty writes (len=0)
+    // still succeed as a no-op for embedder convenience.
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    const ch_cbs = cap.chCbs();
+    const ch = ghostty_ssh_open_channel(handle, .tcp_connect, null, 0, &ch_cbs).?;
+    defer ghostty_channel_free(ch);
+
+    // Channel was closed during open; write must report SIZE_MAX
+    // for both empty and non-empty writes — the closed check fires
+    // first and is the dominant signal an embedder needs.
+    const payload = "hi";
+    try testing.expectEqual(std.math.maxInt(usize), ghostty_channel_write(
+        ch,
+        payload.ptr,
+        payload.len,
+    ));
+    try testing.expectEqual(std.math.maxInt(usize), ghostty_channel_write(ch, null, 0));
+}
+
+test "ghostty_channel_write on null handle is a terminal error" {
+    try testing.expectEqual(std.math.maxInt(usize), ghostty_channel_write(null, null, 0));
+    const payload = "hi";
+    try testing.expectEqual(std.math.maxInt(usize), ghostty_channel_write(
+        null,
+        payload.ptr,
+        payload.len,
+    ));
 }
 
 test "ghostty_ssh_close closes live channels before freeing" {
