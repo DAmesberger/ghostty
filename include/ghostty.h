@@ -1046,6 +1046,300 @@ typedef enum {
 } ghostty_ipc_action_tag_e;
 
 //-------------------------------------------------------------------
+// SSH connection + channel multiplexing API
+//
+// Mirrors src/session/protocol.zig (ConnectionState + Channel*) and
+// src/termio/SshConnectionManager.zig. Embedders use this surface to
+// run remote ghostty sessions through libghostty's libssh2-backed
+// transport and to ride arbitrary byte streams (TCP, file transfer,
+// browser proxy, ...) over the same SSH connection via a credit-flow
+// multiplexer.
+//
+// THREADING & OWNERSHIP RULES (read before integrating):
+//
+//   * All ghostty_ssh_* / ghostty_channel_* entry points are
+//     NON-BLOCKING and THREAD-SAFE. They may be called from any
+//     thread, including from inside a callback.
+//   * All callbacks fire on libghostty-owned worker threads. The
+//     embedder MUST hop to its own UI/serial queue if needed; do not
+//     assume the callback thread is stable across callbacks.
+//   * Buffers passed INTO libghostty (passwords, write data, params)
+//     are copied internally — the caller may free or mutate them as
+//     soon as the call returns.
+//   * Buffers handed to the embedder THROUGH callbacks (data bytes,
+//     ack bytes, message strings, host-key fingerprint, ...) are
+//     valid ONLY for the callback's duration. If you need them past
+//     that, memcpy.
+//   * Strings inside config structs (target, jump, identity_file)
+//     must remain valid for the duration of the ghostty_ssh_open
+//     call; libghostty copies them before returning.
+//   * Handles (ghostty_ssh_t, ghostty_channel_t) are reference-
+//     counted internally. ghostty_*_free is REQUIRED for every
+//     handle the embedder receives; channels MUST be freed BEFORE
+//     the parent ssh handle.
+
+// Opaque handles. ghostty_ssh_t represents a single multiplexed SSH
+// connection (one per remote host). ghostty_channel_t represents one
+// muxed byte stream within that connection.
+typedef void* ghostty_ssh_t;
+typedef void* ghostty_channel_t;
+
+// Connection state kind. Mirrors session.protocol.ConnectionState's
+// tag and is reported through the on_state callback. The payload union
+// (ghostty_ssh_state_t) is read according to this kind.
+typedef enum {
+  GHOSTTY_SSH_STATE_CONNECTING = 0,
+  GHOSTTY_SSH_STATE_PASSWORD_REQUIRED = 1,
+  GHOSTTY_SSH_STATE_UPLOADING = 2,
+  GHOSTTY_SSH_STATE_DOWNLOADING = 3,
+  GHOSTTY_SSH_STATE_SETUP = 4,
+  GHOSTTY_SSH_STATE_CONNECTED = 5,
+  GHOSTTY_SSH_STATE_RECONNECTING = 6,
+  GHOSTTY_SSH_STATE_STALE = 7,
+  GHOSTTY_SSH_STATE_FAILED = 8,
+  GHOSTTY_SSH_STATE_DISCONNECTED = 9,
+} ghostty_ssh_state_kind_e;
+
+// Source of a ghostty-daemon provision (upload) during the UPLOADING
+// state. Mirrors ConnectionState.ProvisionSource.
+typedef enum {
+  GHOSTTY_SSH_PROVISION_LOCAL_DAEMON = 0,
+  GHOSTTY_SSH_PROVISION_LOCAL_SELF = 1,
+  GHOSTTY_SSH_PROVISION_GITHUB = 2,
+} ghostty_ssh_provision_source_e;
+
+// Reason a DISCONNECTED terminal state was entered. Mirrors
+// ConnectionState.DisconnectReason.
+typedef enum {
+  GHOSTTY_SSH_DISCONNECT_EXHAUSTED = 0,
+  GHOSTTY_SSH_DISCONNECT_CANCELLED = 1,
+  GHOSTTY_SSH_DISCONNECT_DISABLED = 2,
+} ghostty_ssh_disconnect_reason_e;
+
+// Reason a FAILED state was entered. Mirrors ConnectionState.FailReason.
+typedef enum {
+  GHOSTTY_SSH_FAIL_UNKNOWN = 0,
+  GHOSTTY_SSH_FAIL_AUTH_FAILED = 1,
+  GHOSTTY_SSH_FAIL_TIMEOUT = 2,
+  GHOSTTY_SSH_FAIL_HELPER_FAILED = 3,
+} ghostty_ssh_fail_reason_e;
+
+// Built-in channel services. Matches session.protocol.ChannelService.
+// custom (255) lets embedders carry an arbitrary length-prefixed name
+// + payload through service_params (see channel_mux design doc).
+typedef enum {
+  GHOSTTY_CHANNEL_SERVICE_INVALID = 0,
+  GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT = 1,
+  GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER = 2,
+  GHOSTTY_CHANNEL_SERVICE_FILE_TRANSFER = 3,
+  GHOSTTY_CHANNEL_SERVICE_BROWSER_PROXY = 4,
+  GHOSTTY_CHANNEL_SERVICE_PROCESS_EXEC = 5,
+  GHOSTTY_CHANNEL_SERVICE_TERMINAL = 6,
+  GHOSTTY_CHANNEL_SERVICE_CUSTOM = 255,
+} ghostty_channel_service_e;
+
+// Reason carried in on_close. Matches session.protocol.ChannelCloseReason.
+// TRANSPORT is libghostty-synthesized (no wire kind) and means "the
+// underlying SSH connection went away"; the channel will be auto-
+// reopened iff the service is TERMINAL.
+typedef enum {
+  GHOSTTY_CHANNEL_CLOSE_NORMAL = 0,
+  GHOSTTY_CHANNEL_CLOSE_PEER_RESET = 1,
+  GHOSTTY_CHANNEL_CLOSE_SERVICE_ERROR = 2,
+  GHOSTTY_CHANNEL_CLOSE_POLICY_DENIED = 3,
+  GHOSTTY_CHANNEL_CLOSE_IDLE_TIMEOUT = 4,
+  GHOSTTY_CHANNEL_CLOSE_DAEMON_SHUTDOWN = 5,
+  GHOSTTY_CHANNEL_CLOSE_TRANSPORT = 254,
+  GHOSTTY_CHANNEL_CLOSE_UNKNOWN = 255,
+} ghostty_channel_close_reason_e;
+
+// Host-key verification policy. STRICT rejects on first-sight mismatch
+// or unknown keys; TOFU accepts on first sight and pins; INSECURE
+// accepts every key (development only).
+typedef enum {
+  GHOSTTY_SSH_HOST_KEY_STRICT = 0,
+  GHOSTTY_SSH_HOST_KEY_TOFU = 1,
+  GHOSTTY_SSH_HOST_KEY_INSECURE = 2,
+} ghostty_ssh_host_key_policy_e;
+
+// Per-state payloads. Read the variant that matches state.kind in
+// ghostty_ssh_state_t.
+
+// PASSWORD_REQUIRED — the embedder must call
+// ghostty_ssh_submit_password(auth_token, password) or
+// ghostty_ssh_cancel_password(auth_token) on the same handle. auth_token
+// is opaque and tied to the prompt; libghostty rejects stale tokens
+// silently after a new prompt is issued.
+typedef struct {
+  // True if the password is for a jump host, false for the target.
+  bool is_jump;
+  // Host being authenticated, NUL-terminated. Valid for callback.
+  const char* host;
+  // Opaque token to feed back to submit/cancel. Stable until next
+  // PASSWORD_REQUIRED transition.
+  uint64_t auth_token;
+} ghostty_ssh_state_password_t;
+
+// UPLOADING — daemon provisioning progress. Embedders typically render
+// a progress bar.
+typedef struct {
+  uint64_t bytes_sent;
+  uint64_t total_bytes;
+  ghostty_ssh_provision_source_e source;
+} ghostty_ssh_state_upload_t;
+
+// RECONNECTING — exponential-backoff retry in progress.
+typedef struct {
+  uint32_t attempt;
+  uint32_t max_attempts;
+  // Nanoseconds since the failure that triggered this reconnect.
+  int64_t elapsed_ns;
+  // Wall-clock nanos (CLOCK_REALTIME) when the next attempt fires.
+  // 0 means "attempting now".
+  int64_t next_retry_ns;
+} ghostty_ssh_state_reconnect_t;
+
+typedef struct {
+  uint32_t attempts_made;
+  ghostty_ssh_disconnect_reason_e reason;
+} ghostty_ssh_state_disconnect_t;
+
+typedef struct {
+  ghostty_ssh_fail_reason_e reason;
+  // Optional human-readable message (NUL-terminated). May be NULL.
+  // Valid only for callback duration.
+  const char* message;
+} ghostty_ssh_state_fail_t;
+
+// Tagged union surfaced via on_state. Read state.payload.<variant>
+// only when state.kind matches.
+typedef struct {
+  ghostty_ssh_state_kind_e kind;
+  union {
+    ghostty_ssh_state_password_t password;
+    ghostty_ssh_state_upload_t upload;
+    ghostty_ssh_state_reconnect_t reconnect;
+    ghostty_ssh_state_disconnect_t disconnect;
+    ghostty_ssh_state_fail_t fail;
+    // CONNECTING / DOWNLOADING / SETUP / CONNECTED / STALE carry no
+    // additional payload.
+  } payload;
+} ghostty_ssh_state_t;
+
+// Host-key verification callback payload. The embedder MUST call
+// ghostty_ssh_submit_host_key_decision(ssh, decision_token, accept,
+// persist) — synchronously from the callback or later from any thread
+// — to unblock the connection. Until that happens, the connection
+// stays parked in CONNECTING.
+//
+// fingerprint_*: SSHA-256 hex digest of the host key (NUL-terminated).
+// known_match: true if this exact key is in the known_hosts pin file.
+// known_mismatch: true if a DIFFERENT key for this host is pinned (the
+//   common MITM-suspect case).
+typedef struct {
+  const char* host;
+  const char* fingerprint_sha256;
+  const char* key_type;  // e.g. "ssh-ed25519"
+  bool known_match;
+  bool known_mismatch;
+  uint64_t decision_token;
+} ghostty_ssh_host_key_t;
+
+// Connection configuration. All string fields are NUL-terminated and
+// borrowed for the duration of ghostty_ssh_open only (libghostty
+// memcpies before returning). Fields marked optional may be NULL or 0.
+typedef struct {
+  // Required. "user@host[:port]" — e.g. "alice@example.com" or
+  // "deploy@10.0.0.5:2222".
+  const char* target;
+
+  // Optional. Comma-separated jump-host chain, same format as target.
+  // NULL = direct connect.
+  const char* jump;
+
+  // Optional. Path to a private key on disk. NULL = let libssh2 try
+  // the SSH agent and the default identities under ~/.ssh.
+  const char* identity_file;
+
+  // Optional override of the SSH-level keepalive interval. 0 uses the
+  // libghostty default (15 s). Caps at 5 minutes.
+  uint32_t keepalive_interval_ms;
+
+  // Number of automatic reconnect attempts after an unexpected drop.
+  // 0 disables auto-reconnect entirely (the embedder must call
+  // ghostty_ssh_request_reconnect). Default 5 when set to UINT32_MAX.
+  uint32_t max_reconnect_attempts;
+
+  // Initial backoff interval; doubles per failed attempt up to a
+  // 60s cap. 0 uses the libghostty default (1000 ms).
+  uint32_t reconnect_interval_ms;
+
+  // How strictly host keys are checked. See enum docs.
+  ghostty_ssh_host_key_policy_e host_key_policy;
+
+  // Soft cap on per-surface scrollback retention requested from the
+  // daemon (bytes). 0 = daemon default.
+  uint32_t scrollback_limit_bytes;
+} ghostty_ssh_config_t;
+
+// Callbacks set at ghostty_ssh_open time. All fire on libghostty-owned
+// worker threads — hop to your own queue if needed.
+//
+// on_state: every state transition (and the initial CONNECTING). The
+//   `state` pointer is valid only for the duration of the callback.
+// on_host_key: invoked once during CONNECTING when host-key verification
+//   is required. The connection blocks until
+//   ghostty_ssh_submit_host_key_decision is called.
+typedef struct {
+  void (*on_state)(void* userdata, const ghostty_ssh_state_t* state);
+  void (*on_host_key)(void* userdata, const ghostty_ssh_host_key_t* hk);
+  void* userdata;
+} ghostty_ssh_callbacks_t;
+
+// Channel callbacks. Same threading rules as ssh callbacks: any libghostty
+// worker thread, buffers borrowed for callback duration only.
+//
+// on_opened: fires once after a successful open. `service_ack` is
+//   service-defined (e.g. accepted host:port for tcp_connect); may be
+//   empty (ack=NULL, ack_len=0).
+// on_data: inbound bytes from the remote peer. `bytes` is valid only
+//   for the callback's duration — memcpy if needed.
+// on_window_credit: outbound flow control. The peer has granted you
+//   `credit_bytes` more bytes of write capacity. Embedders that
+//   buffered data due to backpressure should retry now.
+// on_eof: peer half-closed. No more on_data will fire.
+// on_close: terminal — the channel is dead. After this returns, the
+//   handle is invalid and the embedder MUST call ghostty_channel_free.
+//   reason indicates whether the close was clean or forced; `message`
+//   is a UTF-8 NUL-terminated string (may be empty).
+typedef struct {
+  void (*on_opened)(void* userdata,
+                    const void* service_ack,
+                    size_t ack_len,
+                    uint32_t initial_peer_window);
+  void (*on_data)(void* userdata, const void* bytes, size_t len);
+  void (*on_window_credit)(void* userdata, uint32_t credit_bytes);
+  void (*on_eof)(void* userdata);
+  void (*on_close)(void* userdata,
+                   ghostty_channel_close_reason_e reason,
+                   const char* message);
+  void* userdata;
+} ghostty_channel_callbacks_t;
+
+// Session list entry surfaced via ghostty_ssh_list_sessions. All
+// pointers are valid only for the callback's duration. surface_count
+// is the number of attached surfaces in the session.
+typedef struct {
+  // 16-byte group UUID, raw bytes (no NUL).
+  const uint8_t* group_id;
+  // Optional NUL-terminated label (may be empty string, not NULL).
+  const char* label;
+  uint32_t surface_count;
+  // Wall-clock nanos when the session was created.
+  int64_t created_at_ns;
+} ghostty_ssh_session_entry_t;
+
+//-------------------------------------------------------------------
 // Published API
 
 int ghostty_init(uintptr_t, char**);
@@ -1186,6 +1480,149 @@ void ghostty_set_window_background_blur(ghostty_app_t, void*);
 
 // Benchmark API, if available.
 bool ghostty_benchmark_cli(const char*, const char*);
+
+//-------------------------------------------------------------------
+// SSH connection + channel API.
+//
+// See the type-section comment block above (search "Threading & ownership
+// rules") for the contracts governing every entry point and callback
+// here. Highlights: non-blocking, thread-safe, callbacks fire on
+// libghostty worker threads, in-buffers are copied, out-buffers are
+// borrowed for callback duration only.
+
+// Open an SSH connection. Returns NULL on configuration error
+// (e.g. malformed target). On success, the on_state callback will
+// fire repeatedly as the connection progresses through CONNECTING ->
+// (PASSWORD_REQUIRED) -> (UPLOADING) -> SETUP -> CONNECTED. The
+// returned handle is owned by the caller and MUST be released with
+// ghostty_ssh_free.
+ghostty_ssh_t ghostty_ssh_open(ghostty_app_t app,
+                               const ghostty_ssh_config_t* config,
+                               const ghostty_ssh_callbacks_t* callbacks);
+
+// Submit a password in response to PASSWORD_REQUIRED. `auth_token`
+// must equal the value from the state payload. `password` is borrowed
+// and MUST be NUL-terminated; libghostty copies + zeroes immediately.
+void ghostty_ssh_submit_password(ghostty_ssh_t ssh,
+                                 uint64_t auth_token,
+                                 const char* password);
+
+// Abort a pending password prompt. The connection transitions to
+// FAILED with reason=AUTH_FAILED.
+void ghostty_ssh_cancel_password(ghostty_ssh_t ssh, uint64_t auth_token);
+
+// Submit a host-key decision in response to on_host_key. If accept is
+// false the connection transitions to FAILED. If accept is true and
+// persist is true, the key is pinned to the known_hosts file for
+// future TOFU matches.
+void ghostty_ssh_submit_host_key_decision(ghostty_ssh_t ssh,
+                                          uint64_t decision_token,
+                                          bool accept,
+                                          bool persist);
+
+// Force the reconnect machinery to skip remaining backoff and retry
+// now. No-op when not in RECONNECTING / DISCONNECTED.
+void ghostty_ssh_request_reconnect(ghostty_ssh_t ssh);
+
+// Cancel any in-flight reconnect attempts. Transitions to
+// DISCONNECTED with reason=CANCELLED. Reactivate via
+// ghostty_ssh_request_reconnect.
+void ghostty_ssh_cancel_reconnect(ghostty_ssh_t ssh);
+
+// Initiate teardown of the SSH connection. Pending channels receive
+// on_close(reason=DAEMON_SHUTDOWN). After close the handle is still
+// valid (it can be inspected) but cannot reconnect or open channels.
+// ghostty_ssh_free still must be called.
+void ghostty_ssh_close(ghostty_ssh_t ssh);
+
+// Release the handle. Safe to call after ghostty_ssh_close; if the
+// connection is still live, this implicitly closes it. All child
+// channels MUST have been freed first — calling with live channels
+// is a programming error and is fatal in debug builds.
+void ghostty_ssh_free(ghostty_ssh_t ssh);
+
+// Open a new multiplexed channel. service identifies the service id
+// (see ghostty_channel_service_e). `params` is service-specific (e.g.
+// "host\0port" for TCP_CONNECT) and is copied. The returned handle is
+// valid for use BEFORE on_opened fires — the embedder may queue
+// initial writes against the channel's declared window (used by
+// browser_proxy to shave half an RTT off the CONNECT handshake; see
+// channel_mux design doc). The caller MUST release the handle with
+// ghostty_channel_free regardless of how it ended.
+ghostty_channel_t ghostty_ssh_open_channel(
+    ghostty_ssh_t ssh,
+    ghostty_channel_service_e service,
+    const void* params,
+    size_t params_len,
+    const ghostty_channel_callbacks_t* callbacks);
+
+// Write bytes to a channel. Returns the number of bytes accepted
+// (possibly less than len when outbound credit is exhausted; 0 means
+// "no credit right now — wait for on_window_credit and retry"). The
+// caller may free `bytes` immediately; libghostty copies internally.
+// Returns SIZE_MAX (i.e. (size_t)-1) on terminal error (channel
+// closed); the caller should expect an on_close shortly.
+size_t ghostty_channel_write(ghostty_channel_t channel,
+                             const void* bytes,
+                             size_t len);
+
+// Send EOF: signal to the peer that we are done writing. Subsequent
+// ghostty_channel_write calls return SIZE_MAX. The channel stays
+// half-open until the peer also closes — on_data may still fire.
+void ghostty_channel_eof(ghostty_channel_t channel);
+
+// Close the channel from our side. Triggers an on_close callback with
+// the embedder-chosen reason (any value of ghostty_channel_close_reason_e
+// other than TRANSPORT) and the channel becomes unusable. The handle
+// is still valid until ghostty_channel_free.
+void ghostty_channel_close(ghostty_channel_t channel,
+                           ghostty_channel_close_reason_e reason);
+
+// Release the channel handle. Implicitly closes if still open.
+void ghostty_channel_free(ghostty_channel_t channel);
+
+// Attach a terminal surface over the SSH connection. Sugar over
+// ghostty_ssh_open_channel(..., TERMINAL, ...) — internally drives
+// the legacy session-protocol "open" / "data_in" / "data_out" frames
+// but presents the same channel callback shape. group_id and
+// surface_id are 16-byte UUIDs; pass NULL to let libghostty generate
+// one (a "new" session) or pass the bytes of an existing pair to
+// re-attach. `label` is a NUL-terminated UTF-8 name shown in the
+// remote daemon's session list.
+//
+// Reconnect semantics: terminal channels SURVIVE the underlying SSH
+// drop. The embedder sees on_close(reason=TRANSPORT) followed by an
+// automatic on_opened once the daemon re-attaches by (group_id,
+// surface_id). Non-terminal channels are NOT auto-reopened.
+ghostty_channel_t ghostty_ssh_attach_surface(
+    ghostty_ssh_t ssh,
+    const uint8_t* group_id,   // 16 bytes or NULL
+    const uint8_t* surface_id, // 16 bytes or NULL
+    uint16_t rows,
+    uint16_t cols,
+    uint32_t width_px,
+    uint32_t height_px,
+    const char* label,
+    const ghostty_channel_callbacks_t* callbacks);
+
+// Query the daemon for the list of running sessions. The callback fires
+// once per entry, on a libghostty worker thread, then once more with
+// entry=NULL to signal completion. Returns true if the query was
+// issued; false if the connection isn't ready yet.
+bool ghostty_ssh_list_sessions(
+    ghostty_ssh_t ssh,
+    void (*on_entry)(void* userdata, const ghostty_ssh_session_entry_t* entry),
+    void* userdata);
+
+// Rename a session. group_id is a 16-byte UUID. `label` is borrowed,
+// NUL-terminated, copied internally. No-op if the session is unknown.
+void ghostty_ssh_rename_session(ghostty_ssh_t ssh,
+                                const uint8_t* group_id,
+                                const char* label);
+
+// Kill a session and all its surfaces. group_id is a 16-byte UUID.
+// No-op if the session is unknown.
+void ghostty_ssh_kill_session(ghostty_ssh_t ssh, const uint8_t* group_id);
 
 #ifdef __cplusplus
 }
