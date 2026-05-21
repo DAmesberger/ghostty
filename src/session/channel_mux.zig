@@ -263,6 +263,15 @@ pub const Channel = struct {
     /// Set by `closeChannel` before invoking `on_close` so pump
     /// threads waiting on credit can exit promptly.
     close_signal: std.Thread.ResetEvent = .{},
+
+    /// Assert the backend invariant: exactly one of `vtable` /
+    /// `client_callbacks` is set. Called right after construction at
+    /// every channel-creation site; compiled out in release builds.
+    pub fn assertBackendInvariant(self: *const Channel) void {
+        const has_vtable = self.vtable != null;
+        const has_callbacks = self.client_callbacks != null;
+        std.debug.assert(has_vtable != has_callbacks);
+    }
 };
 
 /// Per-connection multiplexer.
@@ -510,6 +519,7 @@ pub const Mux = struct {
             .in_unacked = 0,
             .flags = result.flags,
         };
+        ch.assertBackendInvariant();
         errdefer {
             ch.vtable.?.on_close(ch.service_state, .normal, "");
             self.alloc.destroy(ch);
@@ -669,6 +679,7 @@ pub const Mux = struct {
             .in_unacked = 0,
             .flags = result.flags,
         };
+        ch.assertBackendInvariant();
         self.mutex.lock();
         const put_err = self.channels.put(self.alloc, channel_id, ch);
         self.mutex.unlock();
@@ -830,25 +841,21 @@ pub const Mux = struct {
 
     fn handleClose(self: *Mux, payload: []const u8) !void {
         const close = protocol.ChannelClose.parse(payload) catch return;
+        // Resolve the id and claim the teardown in one critical
+        // section. If a pump thread already claimed it via
+        // `requestClose`, back off — that thread owns the destroy.
         self.mutex.lock();
         const ch = self.channels.get(close.channel_id) orelse {
             self.mutex.unlock();
             return;
         };
-        // Mark + signal first so any pump thread parked on credit or
-        // waiting on close exits before we call on_close (which must
-        // join the pump).
+        if (ch.closing) {
+            self.mutex.unlock();
+            return;
+        }
         ch.closing = true;
         self.mutex.unlock();
-        ch.close_signal.set();
-        ch.credit_signal.set();
-        // Call on_close outside the mutex — it joins pump threads
-        // which may currently be blocked acquiring the mutex.
-        ch.vtable.?.on_close(ch.service_state, close.reason, close.message);
-        self.mutex.lock();
-        _ = self.channels.remove(close.channel_id);
-        self.mutex.unlock();
-        self.alloc.destroy(ch);
+        try self.teardownClaimedChannel(ch, close.reason, close.message, false);
     }
 
     fn handleControl(self: *Mux, payload: []const u8) !void {
@@ -878,12 +885,40 @@ pub const Mux = struct {
         reason: protocol.ChannelCloseReason,
         message: []const u8,
     ) !void {
-        const id = ch.id;
-        // Mark + signal first so the service's pump threads can exit
-        // before `on_close` tries to join them.
+        // Claim the teardown: flip `closing` false->true under the lock.
+        // The thread that wins this claim owns the destroy; any other
+        // path observing `closing == true` backs off. If it was already
+        // claimed this is a no-op — `closeChannel` is now idempotent.
         self.mutex.lock();
+        if (ch.closing) {
+            self.mutex.unlock();
+            return;
+        }
         ch.closing = true;
         self.mutex.unlock();
+        try self.teardownClaimedChannel(ch, reason, message, true);
+    }
+
+    /// Run the teardown for a channel whose `closing` flag this caller
+    /// has already claimed (flipped false->true under `mutex`). Once
+    /// claimed, the `*Channel` is stable — no other path destroys a
+    /// channel it did not claim — so this is safe to run with the lock
+    /// released.
+    ///
+    /// `send_close_frame` controls whether a `channel_close` frame is
+    /// emitted to the peer: true for daemon-initiated teardown, false
+    /// when responding to a peer-initiated close (the peer already tore
+    /// down its side — echoing a close back would be redundant).
+    fn teardownClaimedChannel(
+        self: *Mux,
+        ch: *Channel,
+        reason: protocol.ChannelCloseReason,
+        message: []const u8,
+        send_close_frame: bool,
+    ) !void {
+        const id = ch.id;
+        // Signal first so the service's pump threads can exit before
+        // `on_close` tries to join them.
         ch.close_signal.set();
         ch.credit_signal.set();
         // on_close outside the mutex — pump threads may be blocked
@@ -892,16 +927,21 @@ pub const Mux = struct {
 
         // Send the close frame. Best-effort — if the peer is gone the
         // outer loop will tear everything down anyway.
-        const close = protocol.ChannelClose{
-            .channel_id = id,
-            .reason = reason,
-            .message = message,
-        };
-        const encoded = close.encode(self.alloc) catch return;
-        defer self.alloc.free(encoded);
-        self.sendFrame(.channel_close, encoded) catch |err| {
-            log.warn("failed to send channel_close: {}", .{err});
-        };
+        if (send_close_frame) {
+            const close = protocol.ChannelClose{
+                .channel_id = id,
+                .reason = reason,
+                .message = message,
+            };
+            if (close.encode(self.alloc)) |encoded| {
+                defer self.alloc.free(encoded);
+                self.sendFrame(.channel_close, encoded) catch |err| {
+                    log.warn("failed to send channel_close: {}", .{err});
+                };
+            } else |err| {
+                log.warn("failed to encode channel_close: {}", .{err});
+            }
+        }
 
         self.mutex.lock();
         _ = self.channels.remove(id);
@@ -914,19 +954,21 @@ pub const Mux = struct {
     /// `channel_close` frame to the peer, removal from the registry,
     /// and free. No-op if the channel id is unknown or already closing.
     ///
-    /// Dispatch-thread-only — same constraint as `closeChannel`. This
-    /// is the safe way for one daemon-side service to tear down another
-    /// channel it spawned (e.g. `port_listener` closing its accepted
-    /// child channels on listener teardown): unlike `requestClose` it
-    /// never holds a `*Channel` that another thread could free, and it
-    /// invokes `on_close` so the child's pump is joined before the
-    /// `Channel` is destroyed.
+    /// This is the safe way for one daemon-side service to tear down
+    /// another channel it spawned (e.g. `port_listener` closing its
+    /// accepted child channels on listener teardown). Only the
+    /// `channel_id` crosses the lock boundary — the id lookup and the
+    /// `closing` claim happen in one critical section, so this never
+    /// holds a `*Channel` another thread could free. Safe to call from
+    /// any thread.
     pub fn closeChannelById(
         self: *Mux,
         channel_id: u32,
         reason: protocol.ChannelCloseReason,
         message: []const u8,
     ) void {
+        // Resolve the id and claim the teardown in one critical
+        // section. Whoever flips `closing` owns the destroy.
         self.mutex.lock();
         const ch = self.channels.get(channel_id) orelse {
             self.mutex.unlock();
@@ -936,8 +978,9 @@ pub const Mux = struct {
             self.mutex.unlock();
             return;
         }
+        ch.closing = true;
         self.mutex.unlock();
-        self.closeChannel(ch, reason, message) catch |err| {
+        self.teardownClaimedChannel(ch, reason, message, true) catch |err| {
             log.warn("closeChannelById: {}", .{err});
         };
     }
@@ -1166,16 +1209,49 @@ pub const ClientMux = struct {
     pub fn deinit(self: *ClientMux) void {
         // Fire on_close for every channel that's still live so the
         // embedder can release its handles, then free.
-        var it = self.channels.iterator();
-        while (it.next()) |entry| {
-            const ch = entry.value_ptr.*;
-            ch.closing = true;
-            ch.close_signal.set();
-            ch.credit_signal.set();
-            if (ch.client_callbacks) |cb| {
-                cb.on_close(ch.client_ctx, .daemon_shutdown, "");
+        //
+        // An embedder `on_close` callback may itself call back into the
+        // mux and close a sibling channel (`channelClose`), mutating
+        // `self.channels` mid-iteration. Snapshot the channel pointers
+        // and clear the map up front — mirroring `Mux.deinit` — so any
+        // re-entrant `channelClose` becomes a safe no-op and every
+        // pointer is owned exactly once for teardown.
+        if (self.channels.count() != 0) {
+            const snapshot = self.alloc.alloc(*Channel, self.channels.count()) catch {
+                // Allocation failure during teardown — best-effort
+                // in-place close. Only runs under genuine OOM.
+                var it = self.channels.iterator();
+                while (it.next()) |entry| {
+                    const ch = entry.value_ptr.*;
+                    ch.closing = true;
+                    ch.close_signal.set();
+                    ch.credit_signal.set();
+                    if (ch.client_callbacks) |cb| {
+                        cb.on_close(ch.client_ctx, .daemon_shutdown, "");
+                    }
+                    self.alloc.destroy(ch);
+                }
+                self.channels.deinit(self.alloc);
+                return;
+            };
+            defer self.alloc.free(snapshot);
+            var it = self.channels.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) snapshot[i] = entry.value_ptr.*;
+            self.channels.clearRetainingCapacity();
+
+            // Signal every channel first, then fire callbacks + free.
+            for (snapshot) |ch| {
+                ch.closing = true;
+                ch.close_signal.set();
+                ch.credit_signal.set();
             }
-            self.alloc.destroy(ch);
+            for (snapshot) |ch| {
+                if (ch.client_callbacks) |cb| {
+                    cb.on_close(ch.client_ctx, .daemon_shutdown, "");
+                }
+                self.alloc.destroy(ch);
+            }
         }
         self.channels.deinit(self.alloc);
     }
@@ -1252,6 +1328,7 @@ pub const ClientMux = struct {
             .in_unacked = 0,
             .flags = flags,
         };
+        ch.assertBackendInvariant();
         self.mutex.lock();
         const put_err = self.channels.put(self.alloc, channel_id, ch);
         self.mutex.unlock();
@@ -1391,7 +1468,7 @@ pub const ClientMux = struct {
                 ch.id, data.bytes.len, ch.in_credit,
             });
             self.mutex.unlock();
-            try self.requestCloseInternal(ch, .peer_reset, "window violation", true);
+            _ = self.closeByIdInternal(data.channel_id, .peer_reset, "window violation", true);
             return;
         }
         ch.in_credit -= data.bytes.len;
@@ -1564,61 +1641,76 @@ pub const ClientMux = struct {
 
     /// Send `channel_close` and tear down the channel locally. The
     /// embedder's `on_close` callback is NOT fired — the embedder
-    /// initiated this teardown and already knows.
+    /// initiated this teardown and already knows. Returns
+    /// `error.UnknownChannel` if the id is not (or no longer) live.
     pub fn channelClose(
         self: *ClientMux,
         channel_id: u32,
         reason: protocol.ChannelCloseReason,
         message: []const u8,
     ) !void {
-        self.mutex.lock();
-        const ch = self.channels.get(channel_id) orelse {
-            self.mutex.unlock();
+        if (!self.closeByIdInternal(channel_id, reason, message, false)) {
             return error.UnknownChannel;
-        };
-        self.mutex.unlock();
-        try self.requestCloseInternal(ch, reason, message, false);
+        }
     }
 
     /// Shared teardown for client-initiated close (`channelClose`) and
-    /// protocol-violation close (`handleData`). Sends `channel_close`,
-    /// removes the channel, frees it. `fire_on_close` controls whether
-    /// the embedder's `on_close` runs — true for involuntary teardown
-    /// (window violation), false for embedder-requested close.
-    fn requestCloseInternal(
+    /// protocol-violation close (`handleData`). Resolves `channel_id`,
+    /// claims the teardown, sends `channel_close`, removes + frees the
+    /// channel. Returns `false` if the id is unknown or already closing.
+    ///
+    /// Only the `channel_id` crosses the lock boundary — the lookup,
+    /// the `closing` claim, and the map removal all happen inside one
+    /// critical section, so a `*Channel` is never held past a point
+    /// where another thread could free it. Safe to call from any
+    /// thread, which `channelClose` requires (the embedder may close a
+    /// channel concurrently with the dispatch thread).
+    ///
+    /// `fire_on_close` controls whether the embedder's `on_close` runs:
+    /// true for involuntary teardown (window violation), false for
+    /// embedder-requested close (the embedder already knows).
+    fn closeByIdInternal(
         self: *ClientMux,
-        ch: *Channel,
+        channel_id: u32,
         reason: protocol.ChannelCloseReason,
         message: []const u8,
         fire_on_close: bool,
-    ) !void {
+    ) bool {
         self.mutex.lock();
+        const ch = self.channels.get(channel_id) orelse {
+            self.mutex.unlock();
+            return false;
+        };
         if (ch.closing) {
             self.mutex.unlock();
-            return;
+            return false;
         }
         ch.closing = true;
-        const id = ch.id;
         const cb = ch.client_callbacks;
+        const ctx = ch.client_ctx;
         const frame = protocol.ChannelClose{
-            .channel_id = id,
+            .channel_id = channel_id,
             .reason = reason,
             .message = message,
         };
-        const encoded = try frame.encode(self.alloc);
-        defer self.alloc.free(encoded);
-        self.sendFrameLocked(.channel_close, encoded) catch |err| {
-            log.warn("client: failed to send channel_close: {}", .{err});
-        };
-        _ = self.channels.remove(id);
+        if (frame.encode(self.alloc)) |encoded| {
+            defer self.alloc.free(encoded);
+            self.sendFrameLocked(.channel_close, encoded) catch |err| {
+                log.warn("client: failed to send channel_close: {}", .{err});
+            };
+        } else |err| {
+            log.warn("client: failed to encode channel_close: {}", .{err});
+        }
+        _ = self.channels.remove(channel_id);
         self.mutex.unlock();
 
         ch.close_signal.set();
         ch.credit_signal.set();
         if (fire_on_close) {
-            if (cb) |c| c.on_close(ch.client_ctx, reason, message);
+            if (cb) |c| c.on_close(ctx, reason, message);
         }
         self.alloc.destroy(ch);
+        return true;
     }
 };
 
@@ -2293,6 +2385,27 @@ test "ClientMux roundtrip: open, write, echo back, close" {
     // Clean close from the client side.
     try pair.client.channelClose(id, .normal, "");
     try testing.expect(!pair.client.channels.contains(id));
+
+    // A second close of the same id is a safe no-op that reports the
+    // channel is gone — the id-keyed teardown resolves + claims under
+    // one lock, so it cannot act on a freed Channel.
+    try testing.expectError(error.UnknownChannel, pair.client.channelClose(id, .normal, ""));
+}
+
+test "ClientMux channelClose on an unknown channel reports UnknownChannel" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var client = ClientMux.init(testing.allocator, fds[1]);
+    defer client.deinit();
+
+    try testing.expectError(
+        error.UnknownChannel,
+        client.channelClose(12345, .normal, ""),
+    );
 }
 
 test "ClientMux window symmetry: tiny window drives channel_window updates" {
