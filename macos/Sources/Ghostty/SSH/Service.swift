@@ -6,6 +6,12 @@ extension Ghostty {
     /// service id (`ghostty_channel_service_e`) and the wire `params` payload
     /// to send at open time.
     ///
+    /// Every `encodeParams()` implementation here is byte-for-byte locked to
+    /// the corresponding decoder in `src/session/services/*.zig`. Drift will
+    /// surface as `error.InvalidRequest` from the daemon → on_close(SERVICE_ERROR)
+    /// on the embedder's side, so the integration tests under task #6
+    /// (stub-libghostty mock) will catch any regression.
+    ///
     /// The protocol is `Sendable` because services are passed across actor
     /// boundaries on the open path.
     protocol ChannelService: Sendable {
@@ -26,7 +32,17 @@ extension Ghostty {
     }
 
     /// Open a raw TCP connection through the remote host.
+    ///
+    /// Wire format (matches `src/session/services/tcp_connect.zig`):
+    ///
+    ///     [u16 LE host_len][host UTF-8 bytes][u16 LE port]
     struct TCPConnectService: ChannelService {
+        /// Max accepted host length on the daemon side. Mirrors
+        /// `tcp_connect.zig`'s `max_host_len` — the daemon will reject
+        /// `error.InvalidRequest` if this is exceeded; we mirror the limit
+        /// so the wire stays clean.
+        static let maxHostLen: Int = 255
+
         let host: String
         let port: UInt16
 
@@ -37,22 +53,31 @@ extension Ghostty {
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT }
 
-        /// Wire format: NUL-terminated host string, followed by big-endian
-        /// uint16 port. Matches `session/services/tcp_connect.zig`.
         func encodeParams() -> Data {
-            var out = Data(host.utf8)
-            out.append(0)
-            var be = port.bigEndian
-            withUnsafeBytes(of: &be) { out.append(contentsOf: $0) }
+            let hostBytes = Array(host.utf8)
+            let truncated = hostBytes.count > Self.maxHostLen
+                ? Array(hostBytes.prefix(Self.maxHostLen))
+                : hostBytes
+            var out = Data()
+            appendLEUInt16(UInt16(truncated.count), to: &out)
+            out.append(contentsOf: truncated)
+            appendLEUInt16(port, to: &out)
             return out
         }
     }
 
-    /// Ask the remote to listen on a port and forward each accepted connection
-    /// back as a sub-channel. Inbound sub-channels are surfaced via the
-    /// owning `SSHConnection`'s incoming-channel stream (out of scope for
-    /// this file).
+    /// Ask the remote to listen on `bindHost:port` and surface each accepted
+    /// connection back as an inbound sub-channel.
+    ///
+    /// Wire format mirrors `tcp_connect`'s open-params (length-prefixed host,
+    /// little-endian port) to match the project house style. The Zig encoder
+    /// is in flight under Phase 6A.5; once it lands, this comment + the
+    /// integration test in task #6 must verify the layout matches.
+    ///
+    ///     [u16 LE bind_host_len][bind_host UTF-8 bytes][u16 LE port]
     struct PortListenerService: ChannelService {
+        static let maxBindHostLen: Int = 255
+
         let bindHost: String
         let port: UInt16
 
@@ -64,18 +89,45 @@ extension Ghostty {
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER }
 
         func encodeParams() -> Data {
-            var out = Data(bindHost.utf8)
-            out.append(0)
-            var be = port.bigEndian
-            withUnsafeBytes(of: &be) { out.append(contentsOf: $0) }
+            let hostBytes = Array(bindHost.utf8)
+            let truncated = hostBytes.count > Self.maxBindHostLen
+                ? Array(hostBytes.prefix(Self.maxBindHostLen))
+                : hostBytes
+            var out = Data()
+            appendLEUInt16(UInt16(truncated.count), to: &out)
+            out.append(contentsOf: truncated)
+            appendLEUInt16(port, to: &out)
             return out
         }
     }
 
-    /// File transfer operations performed against the remote daemon.
+    /// File transfer (upload or download) against the remote daemon's
+    /// sandboxed file roots.
+    ///
+    /// Wire format (matches `src/session/services/file_transfer.zig`):
+    ///
+    ///     [u8 direction]    // 0 = upload, 1 = download
+    ///     [u32 LE mode]     // POSIX file mode; uploads only, ignored on download
+    ///     [u16 LE path_len]
+    ///     [path UTF-8 bytes]
+    ///     ── upload-only trailer ──
+    ///     [32-byte expected_sha256]  // all-zero = skip verification
+    ///     [u64 LE total_size]        // 0 = unknown
     struct FileTransferService: ChannelService {
+        static let maxPathLen: Int = 4096
+        static let sha256Length: Int = 32
+
         enum Operation: Sendable {
-            case upload(remotePath: String)
+            /// Upload a file to the remote daemon. `expectedSHA256`, when
+            /// 32 bytes, is verified at completion; pass `nil` (or empty)
+            /// to skip. `totalSize == 0` signals "unknown".
+            case upload(
+                remotePath: String,
+                mode: UInt32 = 0o644,
+                expectedSHA256: Data? = nil,
+                totalSize: UInt64 = 0
+            )
+            /// Download a file from the remote daemon.
             case download(remotePath: String)
         }
 
@@ -87,82 +139,121 @@ extension Ghostty {
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_FILE_TRANSFER }
 
-        /// Wire format: 1-byte op tag (0=upload, 1=download), then
-        /// NUL-terminated remote path.
         func encodeParams() -> Data {
             var out = Data()
             switch operation {
-            case .upload(let path):
-                out.append(0)
-                out.append(contentsOf: path.utf8)
-            case .download(let path):
-                out.append(1)
-                out.append(contentsOf: path.utf8)
+            case let .upload(path, mode, expected, totalSize):
+                let pathBytes = truncatedPath(path)
+                out.append(0)                                     // direction
+                appendLEUInt32(mode, to: &out)                    // mode
+                appendLEUInt16(UInt16(pathBytes.count), to: &out) // path_len
+                out.append(contentsOf: pathBytes)
+                // 32-byte SHA-256: copy what was given, zero-pad/truncate to 32.
+                var sha = [UInt8](repeating: 0, count: Self.sha256Length)
+                if let e = expected {
+                    let take = min(e.count, Self.sha256Length)
+                    e.copyBytes(to: &sha, count: take)
+                }
+                out.append(contentsOf: sha)
+                appendLEUInt64(totalSize, to: &out)
+            case let .download(path):
+                let pathBytes = truncatedPath(path)
+                out.append(1)                                     // direction
+                appendLEUInt32(0, to: &out)                       // mode (unused)
+                appendLEUInt16(UInt16(pathBytes.count), to: &out) // path_len
+                out.append(contentsOf: pathBytes)
             }
-            out.append(0)
             return out
+        }
+
+        private func truncatedPath(_ s: String) -> [UInt8] {
+            let bytes = Array(s.utf8)
+            if bytes.count > Self.maxPathLen {
+                return Array(bytes.prefix(Self.maxPathLen))
+            }
+            return bytes
         }
     }
 
-    /// HTTP/HTTPS-aware browser proxy. The remote daemon issues the
-    /// outbound CONNECT/GET on the embedder's behalf; the channel carries
-    /// the resulting bidirectional byte stream (transparent TLS payload for
-    /// CONNECT, body bytes for plain HTTP).
+    /// Browser-proxy channel. Carries an SSH-tunneled byte stream to one
+    /// upstream `host:port`, with an `upstreamKind` byte that tells the
+    /// daemon what wire-level shape to expect on the channel (direct passthrough,
+    /// HTTP CONNECT target, SOCKS5 target). `metadata` is an opaque UTF-8
+    /// blob the daemon passes through to upstream-kind-specific logic;
+    /// today it's informational and ≤ 8 KiB.
+    ///
+    /// Wire format (matches `src/session/services/browser_proxy.zig`):
+    ///
+    ///     [u8 upstream_kind]
+    ///     [u16 LE host_len]
+    ///     [host UTF-8 bytes]
+    ///     [u16 LE port]
+    ///     [metadata UTF-8 bytes; may be empty]
     struct BrowserProxyService: ChannelService {
-        enum Method: Sendable {
-            case connect  // HTTPS CONNECT tunnel — `target` is host:port
-            case get
-            case post
-            case put
-            case delete
-            case head
-            case options
-            case patch
+        static let maxHostLen: Int = 255
+        static let maxMetadataLen: Int = 8 * 1024
+
+        /// Mirrors `browser_proxy.zig`'s `UpstreamKind` enum byte values.
+        enum UpstreamKind: UInt8, Sendable {
+            case direct = 0
+            case httpConnectTarget = 1
+            case socks5Target = 2
         }
 
-        let target: String
-        let method: Method
-        let headers: [String: String]
+        let upstreamKind: UpstreamKind
+        let host: String
+        let port: UInt16
+        let metadata: Data
 
-        init(target: String, method: Method = .connect, headers: [String: String] = [:]) {
-            self.target = target
-            self.method = method
-            self.headers = headers
+        init(
+            upstreamKind: UpstreamKind,
+            host: String,
+            port: UInt16,
+            metadata: Data = Data()
+        ) {
+            self.upstreamKind = upstreamKind
+            self.host = host
+            self.port = port
+            self.metadata = metadata
         }
 
         var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_BROWSER_PROXY }
 
-        /// Wire format: 1-byte method tag, NUL-terminated target,
-        /// big-endian uint16 header count, then for each header:
-        /// NUL-terminated name, NUL-terminated value.
-        /// Matches `session/services/browser_proxy.zig`.
         func encodeParams() -> Data {
+            let hostBytes = Array(host.utf8)
+            let truncatedHost = hostBytes.count > Self.maxHostLen
+                ? Array(hostBytes.prefix(Self.maxHostLen))
+                : hostBytes
+            let meta = metadata.count > Self.maxMetadataLen
+                ? metadata.prefix(Self.maxMetadataLen)
+                : metadata
             var out = Data()
-            out.append(methodTag)
-            out.append(contentsOf: target.utf8)
-            out.append(0)
-            var count = UInt16(min(headers.count, Int(UInt16.max))).bigEndian
-            withUnsafeBytes(of: &count) { out.append(contentsOf: $0) }
-            for (name, value) in headers {
-                out.append(contentsOf: name.utf8)
-                out.append(0)
-                out.append(contentsOf: value.utf8)
-                out.append(0)
-            }
+            out.append(upstreamKind.rawValue)
+            appendLEUInt16(UInt16(truncatedHost.count), to: &out)
+            out.append(contentsOf: truncatedHost)
+            appendLEUInt16(port, to: &out)
+            out.append(meta)
             return out
         }
-
-        private var methodTag: UInt8 {
-            switch method {
-            case .connect: return 0
-            case .get: return 1
-            case .post: return 2
-            case .put: return 3
-            case .delete: return 4
-            case .head: return 5
-            case .options: return 6
-            case .patch: return 7
-            }
-        }
     }
+}
+
+// MARK: - Little-endian encoding helpers
+
+/// Append a little-endian `UInt16` to `out`.
+private func appendLEUInt16(_ v: UInt16, to out: inout Data) {
+    var le = v.littleEndian
+    withUnsafeBytes(of: &le) { out.append(contentsOf: $0) }
+}
+
+/// Append a little-endian `UInt32` to `out`.
+private func appendLEUInt32(_ v: UInt32, to out: inout Data) {
+    var le = v.littleEndian
+    withUnsafeBytes(of: &le) { out.append(contentsOf: $0) }
+}
+
+/// Append a little-endian `UInt64` to `out`.
+private func appendLEUInt64(_ v: UInt64, to out: inout Data) {
+    var le = v.littleEndian
+    withUnsafeBytes(of: &le) { out.append(contentsOf: $0) }
 }

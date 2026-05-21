@@ -98,65 +98,134 @@ struct SSHTests {
     }
 
     // MARK: - Service param encoding (wire-format contract)
+    //
+    // These tests are spec-locked against the Zig decoders in
+    // `src/session/services/*.zig`. If a decoder's wire format changes,
+    // the corresponding test here must change in lockstep — drift makes
+    // every open() return on_close(SERVICE_ERROR) at runtime.
 
+    /// `[u16 LE host_len][host][u16 LE port]` — matches tcp_connect.zig:16-18.
     @Test
-    func tcpConnectEncodesNullTerminatedHostPlusBEPort() {
-        let svc = Ghostty.TCPConnectService(host: "example.com", port: 0x1F90)  // 8080
+    func tcpConnectEncodesLengthPrefixedHostAndLEPort() {
+        let svc = Ghostty.TCPConnectService(host: "example.com", port: 8080)
         let bytes = [UInt8](svc.encodeParams())
-        var expected: [UInt8] = Array("example.com".utf8)
-        expected.append(0)        // NUL
-        expected.append(0x1F)     // port big-endian high
-        expected.append(0x90)     // port big-endian low
+        var expected: [UInt8] = []
+        // host_len = 11, LE
+        expected += [0x0B, 0x00]
+        expected += Array("example.com".utf8)
+        // port = 8080 = 0x1F90, LE
+        expected += [0x90, 0x1F]
         #expect(bytes == expected)
     }
 
+    /// `[u16 LE bind_host_len][bind_host][u16 LE port]` — same shape as
+    /// tcp_connect (house style). Re-verify against port_listener.zig once
+    /// Phase 6A.5 lands.
     @Test
-    func portListenerEncodingMatchesTCPShape() {
+    func portListenerEncodesLengthPrefixedHostAndLEPort() {
         let svc = Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22)
         let bytes = [UInt8](svc.encodeParams())
-        var expected: [UInt8] = Array("0.0.0.0".utf8)
-        expected.append(0)
-        expected.append(0)   // port BE high
-        expected.append(22)  // port BE low
+        var expected: [UInt8] = []
+        expected += [0x07, 0x00]                      // host_len = 7
+        expected += Array("0.0.0.0".utf8)
+        expected += [0x16, 0x00]                      // port = 22 LE
         #expect(bytes == expected)
     }
 
-    @Test(arguments: [
-        (Ghostty.FileTransferService.Operation.upload(remotePath: "/tmp/a"), UInt8(0)),
-        (Ghostty.FileTransferService.Operation.download(remotePath: "/tmp/a"), UInt8(1)),
-    ])
-    func fileTransferEncoding(op: Ghostty.FileTransferService.Operation, tag: UInt8) {
-        let svc = Ghostty.FileTransferService(operation: op)
+    /// Upload params: `[u8 direction=0][u32 LE mode][u16 LE path_len][path]
+    /// [32-byte expected_sha256][u64 LE total_size]` — matches
+    /// file_transfer.zig:18-26.
+    @Test
+    func fileTransferUploadEncodesAllFields() {
+        var sha = Data(count: 32)
+        sha[0] = 0xAB
+        sha[31] = 0xCD
+        let svc = Ghostty.FileTransferService(operation: .upload(
+            remotePath: "/tmp/a",
+            mode: 0o644,
+            expectedSHA256: sha,
+            totalSize: 0x0102_0304_0506_0708
+        ))
         let bytes = [UInt8](svc.encodeParams())
-        #expect(bytes.first == tag)
-        #expect(bytes.last == 0)  // NUL terminator
-        let path = String(decoding: bytes.dropFirst().dropLast(), as: UTF8.self)
-        #expect(path == "/tmp/a")
+
+        var expected: [UInt8] = []
+        expected += [0x00]                                              // direction = upload
+        expected += [0xA4, 0x01, 0x00, 0x00]                            // mode = 0o644 = 0x1A4 LE
+        expected += [0x06, 0x00]                                        // path_len = 6 LE
+        expected += Array("/tmp/a".utf8)
+        var sha32 = [UInt8](repeating: 0, count: 32)
+        sha32[0] = 0xAB; sha32[31] = 0xCD
+        expected += sha32
+        expected += [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]    // total_size LE
+
+        #expect(bytes == expected)
+    }
+
+    /// Download params: `[u8 direction=1][u32 LE mode=0][u16 LE path_len][path]`
+    /// — no trailer (file_transfer.zig:733).
+    @Test
+    func fileTransferDownloadEncodesNoTrailer() {
+        let svc = Ghostty.FileTransferService(operation: .download(remotePath: "/tmp/a"))
+        let bytes = [UInt8](svc.encodeParams())
+
+        var expected: [UInt8] = []
+        expected += [0x01]                                              // direction = download
+        expected += [0x00, 0x00, 0x00, 0x00]                            // mode = 0 (unused)
+        expected += [0x06, 0x00]                                        // path_len = 6
+        expected += Array("/tmp/a".utf8)
+
+        #expect(bytes == expected)
+    }
+
+    /// Upload with no expected SHA: 32 zero bytes, signalling
+    /// "skip verification" per file_transfer.zig:24.
+    @Test
+    func fileTransferUploadWithoutSHAUsesZeroes() {
+        let svc = Ghostty.FileTransferService(operation: .upload(
+            remotePath: "/tmp/a",
+            mode: 0o644,
+            expectedSHA256: nil,
+            totalSize: 0
+        ))
+        let bytes = [UInt8](svc.encodeParams())
+        // SHA section starts after: 1 + 4 + 2 + 6 = 13 bytes.
+        let sha = Array(bytes[13..<45])
+        #expect(sha == [UInt8](repeating: 0, count: 32))
+    }
+
+    /// `[u8 upstream_kind][u16 LE host_len][host][u16 LE port][metadata]`
+    /// — matches browser_proxy.zig:17-24.
+    @Test
+    func browserProxyEncodesKindHostPortMetadata() {
+        let svc = Ghostty.BrowserProxyService(
+            upstreamKind: .httpConnectTarget,
+            host: "example.com",
+            port: 443,
+            metadata: Data([0x01, 0x02, 0x03])
+        )
+        let bytes = [UInt8](svc.encodeParams())
+
+        var expected: [UInt8] = []
+        expected += [0x01]                            // upstream_kind = http_connect_target
+        expected += [0x0B, 0x00]                      // host_len = 11
+        expected += Array("example.com".utf8)
+        expected += [0xBB, 0x01]                      // port = 443 LE
+        expected += [0x01, 0x02, 0x03]                // metadata
+
+        #expect(bytes == expected)
     }
 
     @Test
-    func browserProxyEncodesMethodTargetAndHeaders() {
+    func browserProxyEmptyMetadataOk() {
         let svc = Ghostty.BrowserProxyService(
-            target: "example.com:443",
-            method: .connect,
-            headers: ["X-Foo": "bar"]
+            upstreamKind: .direct,
+            host: "10.0.0.1",
+            port: 1080
         )
         let bytes = [UInt8](svc.encodeParams())
-        // [0] method tag (connect=0)
-        #expect(bytes[0] == 0)
-        // [1..N] target NUL-terminated
-        let nulIdx = bytes[1...].firstIndex(of: 0)!
-        #expect(String(decoding: bytes[1..<nulIdx], as: UTF8.self) == "example.com:443")
-        // [N+1..N+2] header count BE = 1
-        #expect(bytes[nulIdx + 1] == 0)
-        #expect(bytes[nulIdx + 2] == 1)
-        // Followed by NUL-terminated "X-Foo" then NUL-terminated "bar"
-        let rest = Array(bytes[(nulIdx + 3)...])
-        let firstNul = rest.firstIndex(of: 0)!
-        #expect(String(decoding: rest[0..<firstNul], as: UTF8.self) == "X-Foo")
-        let after = Array(rest[(firstNul + 1)...])
-        let secondNul = after.firstIndex(of: 0)!
-        #expect(String(decoding: after[0..<secondNul], as: UTF8.self) == "bar")
+        // No metadata appended — total = 1 + 2 + 8 + 2 = 13 bytes.
+        #expect(bytes.count == 13)
+        #expect(bytes[0] == 0)                        // direct = 0
     }
 
     @Test
