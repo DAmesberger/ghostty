@@ -718,7 +718,12 @@ fn notifyAllSurfaces(entry: *Entry) void {
     }
 }
 
-fn broadcastConnectionState(entry: *Entry, state: session.protocol.ConnectionState) void {
+/// Broadcast a connection-state transition to every consumer attached
+/// to the Entry — both the per-surface mailbox fan-out (for the GTK
+/// terminal renderer) and the generic SshListener registry (for the
+/// libghostty C API and any other embedder). Public so the shared
+/// attach helper in `session/client.zig` can drive it.
+pub fn broadcastConnectionState(entry: *Entry, state: session.protocol.ConnectionState) void {
     // Surface fan-out runs under surfaces_mutex. Scope-block so the
     // defer releases it before we touch listener_mutex — the two
     // locks intentionally do not nest, so a listener callback that

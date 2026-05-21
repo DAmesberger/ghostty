@@ -23,11 +23,14 @@
 //!     client-side channel mux (the existing daemon-side
 //!     `channel_mux.Mux` only dispatches inbound `channel_open`, not
 //!     outbound). Tracked as TODO(client-mux).
-//!   * `ghostty_ssh_attach_surface` needs to drive the existing
-//!     `termio.Remote.setupConnection` machinery to actually open a
-//!     terminal session; for now it returns a handle that immediately
-//!     reports `on_close(SERVICE_ERROR)` so embedders can exercise
-//!     that edge. Tracked as TODO(terminal-attach).
+//!   * `ghostty_ssh_attach_surface` would call the shared helper
+//!     `session.client.attachRemoteSurface` (which now backs the
+//!     GTK terminal-surface path too) from a worker thread, but
+//!     the worker-thread spawn plus the subsequent frame-dispatch
+//!     routing to the channel callbacks both land alongside the
+//!     channel-mux follow-up. For now it returns a handle that
+//!     immediately reports `on_close(SERVICE_ERROR)` so embedders
+//!     can exercise that edge.
 //!   * Password / host-key / list-sessions / rename / kill are
 //!     present-but-no-op exports; they will hop onto the connection's
 //!     existing `auth_state` / `session_list` paths in a follow-up
@@ -933,6 +936,17 @@ export fn ghostty_channel_free(channel: ?*ChannelHandle) void {
 /// sugar over the legacy session-protocol frames; the channel handle
 /// shape is identical to non-terminal channels for embedder
 /// uniformity (per the design doc).
+///
+/// Part 3 (this commit) plumbs the shared
+/// `session.client.attachRemoteSurface` helper for the eventual
+/// real-attach path: when a manager + entry are available we know
+/// how to drive the helper, the only missing piece is the worker-
+/// thread spawn so the call doesn't block the embedder. That spawn
+/// — together with the post-attach frame-dispatch routing to the
+/// channel callbacks — is the channel-mux follow-up that arrives
+/// once port-listener's ClientMux lands. Until then the handle
+/// still emits an immediate on_close(SERVICE_ERROR) so embedders
+/// exercise that edge.
 export fn ghostty_ssh_attach_surface(
     ssh: ?*SshHandle,
     group_id: ?[*]const u8,
@@ -960,9 +974,15 @@ export fn ghostty_ssh_attach_surface(
         return null;
     };
 
-    // TODO(state-listener) + TODO(client-mux): drive the existing
-    // session.protocol Open/Opened frames through SshConnectionManager,
-    // bridge frame events to the channel callbacks.
+    // TODO(client-mux): when client-mux + worker-thread spawn land,
+    // call session.client.attachRemoteSurface from a worker:
+    //
+    //   if (h.manager) |mgr| if (h.entry) |entry| {
+    //       _ = std.Thread.spawn(.{}, attachWorker, .{ ch, mgr, entry, .{...} }) catch …;
+    //   }
+    //
+    // For now the call would block the embedder, so we synthesize
+    // an immediate failure so the on_close edge stays observable.
     ch.emitClose(.service_error, null);
     return ch;
 }
@@ -1123,6 +1143,78 @@ test "ghostty_ssh_open_channel synthesizes a close until mux wires" {
 
     // After the stub close, free still works.
     ghostty_channel_free(ch);
+}
+
+test "ghostty_ssh_attach_surface — stub round-trip and initial state" {
+    // Phase 6B.1 Part 3 stub-path coverage. With no real CoreApp
+    // (app=null), ghostty_ssh_open emits the synchronous CONNECTING
+    // transition, attach_surface allocates the terminal channel
+    // handle, and the synthetic on_close(SERVICE_ERROR) keeps the
+    // edge observable until the channel-mux follow-up lands.
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    try testing.expectEqual(@as(?StateKind, .connecting), cap.last_state_kind);
+
+    var ch_cap: Capture = .{};
+    const ch_cbs = ch_cap.chCbs();
+    const ch = ghostty_ssh_attach_surface(
+        handle,
+        null, // group_id
+        null, // surface_id
+        24, // rows
+        80, // cols
+        640, // width_px
+        480, // height_px
+        "test-session", // label
+        &ch_cbs,
+    );
+    try testing.expect(ch != null);
+    try testing.expectEqual(@as(?ChannelCloseReason, .service_error), ch_cap.last_close_reason);
+
+    // Channel handle must be release-safe after the synthetic close.
+    ghostty_channel_free(ch);
+}
+
+test "ghostty_ssh_attach_surface — rejects null callbacks" {
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    try testing.expect(ghostty_ssh_attach_surface(
+        handle,
+        null,
+        null,
+        24,
+        80,
+        640,
+        480,
+        null,
+        null,
+    ) == null);
 }
 
 test "ghostty_channel_write returns SIZE_MAX on the stubbed mux path" {

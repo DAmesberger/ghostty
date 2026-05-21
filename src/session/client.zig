@@ -6,6 +6,14 @@ const shared = @import("shared.zig");
 const protocol = @import("protocol.zig");
 const ssh = @import("ssh.zig");
 
+/// Connection-pool manager type imported lazily — `attachRemoteSurface`
+/// needs the `Entry` pointer + the manager's mutex/alloc to mirror the
+/// behavior previously living inline in `termio/Remote.zig:setupConnection`.
+/// The cycle (session → termio → session) is fine: Zig's @import graph
+/// resolves declarations on demand, and `client.zig`'s use is opaque
+/// pointers + field reads, no struct-layout reentry.
+const SshConnectionManager = @import("../termio/SshConnectionManager.zig");
+
 const c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("termios.h");
     @cInclude("unistd.h");
@@ -716,6 +724,207 @@ pub fn openMultiplexChannel(
 
     try channel.exec(cmd);
     return channel;
+}
+
+/// Knobs threaded into `attachRemoteSurface` so callers (terminal
+/// surfaces via `termio/Remote.zig`, the libghostty C API via
+/// `apprt/embedded/ssh_capi.zig`) can override defaults without
+/// reaching into the connection-pool Entry. Mirrors the fields
+/// previously read off `Remote.ssh_ctx` + `Remote.scrollback_limit`.
+pub const AttachConfig = struct {
+    /// Number of automatic reconnect attempts after an unexpected
+    /// drop. 0 disables auto-reconnect entirely; callers should
+    /// drive `requestReconnect` manually if desired.
+    max_reconnect_attempts: u32,
+    /// Backoff strategy for the reconnect interval.
+    reconnect_backoff: @import("../config.zig").Config.SshReconnectBackoff,
+    /// Initial reconnect interval in milliseconds.
+    reconnect_interval_ms: u32,
+    /// Client-side scrollback retention requested from the daemon.
+    scrollback_limit: u32,
+};
+
+/// Establish the SSH connection on an `SshConnectionManager.Entry`,
+/// provision/ensure the remote `ghostty-daemon`, open the multiplexed
+/// channel, stamp the Entry's reconnect/scrollback config, and spawn
+/// the dedicated SSH I/O thread. Used by both the GTK terminal-
+/// surface path (`termio/Remote.zig`) and the libghostty C API
+/// (`apprt/embedded/ssh_capi.zig`) so the two callers share an
+/// identical setup sequence.
+///
+/// State transitions are broadcast via the Entry-level
+/// `broadcastConnectionState` fan-out (visible to BOTH the per-
+/// surface mailbox path and the generic SshListener registry).
+/// Additionally, when a non-null `mailbox` is supplied it receives
+/// every transition directly — preserved for backward compatibility
+/// with the GTK overlay code that today reads its own surface
+/// mailbox during connection setup (before the surface is registered
+/// on the Entry, so the broadcast fan-out wouldn't reach it).
+///
+/// Returns on success; the caller is responsible for the post-setup
+/// steps (allocateTarget / registerSurface / sending the Open frame
+/// / final CONNECTED broadcast). The caller is also responsible for
+/// transitioning the Entry's `conn_state` atomic.
+///
+/// NOTE: this function BLOCKS — it performs the full SSH handshake,
+/// possible interactive password prompts via the Entry's auth_state
+/// condition variable, and the binary provisioning round-trips.
+/// Callers that must remain non-blocking (e.g. the C API) MUST spawn
+/// a worker thread.
+pub fn attachRemoteSurface(
+    alloc: Allocator,
+    manager: *SshConnectionManager,
+    entry: *SshConnectionManager.Entry,
+    mailbox: ?*Mailbox,
+    cfg: AttachConfig,
+) !void {
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_writer_.interface;
+
+    // Password authentication loop: use connectWithAuth so passwords
+    // come from the GUI overlay (or any other on-state consumer)
+    // instead of stdin.
+    var for_jump: bool = false;
+    while (true) {
+        const result = entry.ctx.connectWithAuth(stderr, entry.auth_state.password, for_jump) catch |err| {
+            const reason: protocol.ConnectionState.FailReason = switch (err) {
+                error.SshConnectFailed, error.SshHandshakeFailed => .timeout,
+                error.SshAuthFailed => .auth_failed,
+                else => .unknown,
+            };
+            pushAttachState(mailbox, entry, .{ .failed = reason });
+            return err;
+        };
+
+        // Zero and free the previous password after use
+        if (entry.auth_state.password) |pw| {
+            @memset(@constCast(pw), 0);
+            entry.alloc.free(pw);
+            entry.auth_state.password = null;
+        }
+
+        switch (result) {
+            .success => break,
+            .password_required_jump, .password_required_target => {
+                for_jump = (result == .password_required_jump);
+
+                // Surface a password prompt to all listeners + the
+                // calling mailbox.
+                var prompt: protocol.ConnectionState.PasswordPrompt = .{
+                    .is_jump = for_jump,
+                    .auth_state = @ptrCast(&entry.auth_state),
+                };
+                const host_name = if (for_jump) (entry.ctx.jump orelse "jump host") else entry.ctx.ssh_target;
+                prompt.setHost(host_name);
+                pushAttachState(mailbox, entry, .{ .password_required = prompt });
+
+                // Wait for someone (GUI overlay, C API embedder via
+                // submit_password) to provide a password OR cancel.
+                entry.auth_state.mutex.lock();
+                while (entry.auth_state.password == null and !entry.auth_state.cancelled) {
+                    entry.auth_state.cond.wait(&entry.auth_state.mutex);
+                }
+
+                if (entry.auth_state.cancelled) {
+                    entry.auth_state.mutex.unlock();
+                    pushAttachState(mailbox, entry, .{ .failed = .auth_failed });
+                    return error.RemoteAuthRequired;
+                }
+                entry.auth_state.mutex.unlock();
+                // Loop back to retry connectWithAuth with the new password.
+            },
+        }
+    }
+
+    const provision = ensureRemoteGhostty(alloc, &entry.ctx, stderr, mailbox) catch |err| {
+        pushAttachState(mailbox, entry, .{ .failed = .helper_failed });
+        return err;
+    };
+    const remote_bin_path = provision.path;
+
+    // Only force-restart the daemon if the binary was re-provisioned
+    // (version mismatch). Otherwise reuse the running daemon to
+    // preserve existing sessions.
+    ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, provision.provisioned) catch |err| {
+        alloc.free(remote_bin_path);
+        pushAttachState(mailbox, entry, .{ .failed = .helper_failed });
+        return err;
+    };
+
+    entry.surfaces_mutex.lock();
+    if (entry.remote_bin_path.len > 0) manager.alloc.free(entry.remote_bin_path);
+    entry.remote_bin_path = remote_bin_path;
+    entry.surfaces_mutex.unlock();
+
+    // Copy remote_bin_path for use below so we don't read the field
+    // after releasing the lock (the reconnect thread could modify it).
+    const remote_bin_path_local = alloc.dupe(u8, remote_bin_path) catch return error.OutOfMemory;
+    defer alloc.free(remote_bin_path_local);
+
+    const channel = openMultiplexChannel(
+        alloc,
+        &entry.ctx,
+        remote_bin_path_local,
+    ) catch |err| {
+        pushAttachState(mailbox, entry, .{ .failed = .unknown });
+        return err;
+    };
+
+    // Switch to non-blocking for the SSH thread
+    var sess = &entry.ctx.session.?;
+    sess.setBlocking(0);
+
+    manager.mutex.lock();
+    entry.channel = channel;
+    manager.mutex.unlock();
+
+    // Stamp reconnect config + scrollback limit so the per-Entry SSH
+    // thread (and any reconnect attempt) honors the caller's policy.
+    entry.max_reconnect_attempts = cfg.max_reconnect_attempts;
+    entry.reconnect_backoff = cfg.reconnect_backoff;
+    entry.reconnect_interval_ms = cfg.reconnect_interval_ms;
+    entry.scrollback_limit = cfg.scrollback_limit;
+
+    // Pipes used by the SSH thread for quit / write-wakeup /
+    // reconnect-request IPC.
+    entry.quit_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(entry.quit_pipe[0]);
+        posix.close(entry.quit_pipe[1]);
+    }
+    entry.write_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(entry.write_pipe[0]);
+        posix.close(entry.write_pipe[1]);
+    }
+    entry.reconnect_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(entry.reconnect_pipe[0]);
+        posix.close(entry.reconnect_pipe[1]);
+    }
+
+    // Spawn the dedicated SSH I/O thread.
+    entry.ssh_thread = try std.Thread.spawn(.{}, SshConnectionManager.sshThreadMain, .{entry});
+    entry.ssh_thread.?.setName("ssh-io") catch {};
+}
+
+/// Push a state through BOTH the per-surface mailbox (if non-null)
+/// AND the Entry's broadcast fan-out (which reaches every other
+/// surface registered on the Entry + every libghostty C API
+/// listener). During first-surface setup the Entry has zero
+/// registered surfaces, so `broadcastConnectionState` does NOT
+/// duplicate the `mailbox` push to the caller's surface; the
+/// listener-side fan-out is the only consumer that observes the
+/// transition twice would be problematic for, and listeners only
+/// see this state via the broadcast path (not the mailbox).
+fn pushAttachState(
+    mailbox: ?*Mailbox,
+    entry: *SshConnectionManager.Entry,
+    state: protocol.ConnectionState,
+) void {
+    pushConnectionState(mailbox, state);
+    SshConnectionManager.broadcastConnectionState(entry, state);
 }
 
 // -- Internal --

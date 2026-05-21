@@ -10,9 +10,7 @@
 const Remote = @This();
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
@@ -245,140 +243,31 @@ pub fn threadEnter(
     } };
 }
 
-/// Performs SSH connection setup: connect, provision ghostty, start daemon,
-/// open channel, switch to non-blocking, and spawn the SSH thread.
+/// Performs SSH connection setup: delegates to the shared
+/// `session.client.attachRemoteSurface` helper so the libghostty C
+/// API path (`apprt/embedded/ssh_capi.zig`) and this terminal-
+/// surface path stay in lockstep. State transitions still flow
+/// through the calling surface's mailbox AND the Entry's
+/// broadcast fan-out (which is a no-op during first-surface setup
+/// since no surfaces are registered yet — see helper docstring).
 fn setupConnection(
     self: *Remote,
     alloc: Allocator,
     mailbox: *apprt.surface.Mailbox,
     entry: *SshConnectionManager.Entry,
 ) !void {
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer_ = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer_.interface;
-
-    // Password authentication loop: use connectWithAuth so passwords come
-    // from the GUI overlay instead of stdin.
-    var for_jump: bool = false;
-    while (true) {
-        const result = entry.ctx.connectWithAuth(stderr, entry.auth_state.password, for_jump) catch |err| {
-            const reason: session.protocol.ConnectionState.FailReason = switch (err) {
-                error.SshConnectFailed, error.SshHandshakeFailed => .timeout,
-                error.SshAuthFailed => .auth_failed,
-                else => .unknown,
-            };
-            _ = mailbox.push(.{ .connection_state = .{ .failed = reason } }, .{ .forever = {} });
-            return err;
-        };
-
-        // Zero and free the previous password after use
-        if (entry.auth_state.password) |pw| {
-            @memset(@constCast(pw), 0);
-            entry.alloc.free(pw);
-            entry.auth_state.password = null;
-        }
-
-        switch (result) {
-            .success => break,
-            .password_required_jump, .password_required_target => {
-                for_jump = (result == .password_required_jump);
-
-                // Tell the GTK overlay to show the password prompt
-                var prompt: session.protocol.ConnectionState.PasswordPrompt = .{
-                    .is_jump = for_jump,
-                    .auth_state = @ptrCast(&entry.auth_state),
-                };
-                const host_name = if (for_jump) (entry.ctx.jump orelse "jump host") else entry.ctx.ssh_target;
-                prompt.setHost(host_name);
-                _ = mailbox.push(.{ .connection_state = .{
-                    .password_required = prompt,
-                } }, .{ .forever = {} });
-
-                // Wait for the GTK thread to provide a password
-                entry.auth_state.mutex.lock();
-                while (entry.auth_state.password == null and !entry.auth_state.cancelled) {
-                    entry.auth_state.cond.wait(&entry.auth_state.mutex);
-                }
-
-                if (entry.auth_state.cancelled) {
-                    entry.auth_state.mutex.unlock();
-                    _ = mailbox.push(.{ .connection_state = .{ .failed = .auth_failed } }, .{ .forever = {} });
-                    return error.RemoteAuthRequired;
-                }
-                entry.auth_state.mutex.unlock();
-                // Loop back to retry connectWithAuth with the provided password
-            },
-        }
-    }
-
-    const provision = session.client.ensureRemoteGhostty(alloc, &entry.ctx, stderr, mailbox) catch |err| {
-        _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
-        return err;
-    };
-    const remote_bin_path = provision.path;
-
-    // Only force-restart the daemon if the binary was re-provisioned
-    // (version mismatch). Otherwise reuse the running daemon to preserve
-    // existing sessions.
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, provision.provisioned) catch |err| {
-        alloc.free(remote_bin_path);
-        _ = mailbox.push(.{ .connection_state = .{ .failed = .helper_failed } }, .{ .forever = {} });
-        return err;
-    };
-
-    entry.surfaces_mutex.lock();
-    if (entry.remote_bin_path.len > 0) self.connection_manager.alloc.free(entry.remote_bin_path);
-    entry.remote_bin_path = remote_bin_path;
-    entry.surfaces_mutex.unlock();
-
-    // Copy remote_bin_path for use below so we don't read the field after
-    // releasing the lock (another thread could modify it).
-    const remote_bin_path_local = self.alloc.dupe(u8, remote_bin_path) catch return error.OutOfMemory;
-    defer self.alloc.free(remote_bin_path_local);
-
-    const channel = session.client.openMultiplexChannel(
+    try session.client.attachRemoteSurface(
         alloc,
-        &entry.ctx,
-        remote_bin_path_local,
-    ) catch |err| {
-        _ = mailbox.push(.{ .connection_state = .{ .failed = .unknown } }, .{ .forever = {} });
-        return err;
-    };
-
-    // Switch to non-blocking for the SSH thread
-    var sess = &entry.ctx.session.?;
-    sess.setBlocking(0);
-
-    self.connection_manager.mutex.lock();
-    entry.channel = channel;
-    self.connection_manager.mutex.unlock();
-
-    // Store reconnect config into the entry (first surface only)
-    entry.max_reconnect_attempts = self.ssh_ctx.reconnect_attempts;
-    entry.reconnect_backoff = self.ssh_ctx.reconnect_backoff;
-    entry.reconnect_interval_ms = self.ssh_ctx.reconnect_interval_ms;
-    entry.scrollback_limit = self.scrollback_limit;
-
-    // Create pipes for SSH thread communication
-    entry.quit_pipe = try posix.pipe2(.{ .CLOEXEC = true });
-    errdefer {
-        posix.close(entry.quit_pipe[0]);
-        posix.close(entry.quit_pipe[1]);
-    }
-    entry.write_pipe = try posix.pipe2(.{ .CLOEXEC = true });
-    errdefer {
-        posix.close(entry.write_pipe[0]);
-        posix.close(entry.write_pipe[1]);
-    }
-    entry.reconnect_pipe = try posix.pipe2(.{ .CLOEXEC = true });
-    errdefer {
-        posix.close(entry.reconnect_pipe[0]);
-        posix.close(entry.reconnect_pipe[1]);
-    }
-
-    // Spawn the dedicated SSH thread
-    entry.ssh_thread = try std.Thread.spawn(.{}, SshConnectionManager.sshThreadMain, .{entry});
-    entry.ssh_thread.?.setName("ssh-io") catch {};
+        self.connection_manager,
+        entry,
+        mailbox,
+        .{
+            .max_reconnect_attempts = self.ssh_ctx.reconnect_attempts,
+            .reconnect_backoff = self.ssh_ctx.reconnect_backoff,
+            .reconnect_interval_ms = self.ssh_ctx.reconnect_interval_ms,
+            .scrollback_limit = self.scrollback_limit,
+        },
+    );
 }
 
 pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
