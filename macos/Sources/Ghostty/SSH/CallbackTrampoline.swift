@@ -79,11 +79,18 @@ final class ConnectionBox: @unchecked Sendable {
 /// `deinit` race safely.
 final class ChannelBox: @unchecked Sendable {
     private let lock = NSLock()
-    /// Holds a strong reference to the channel only via these three fields;
-    /// we keep them nil-able so `detach()` can drop the references and
-    /// stop forwarding once the wrapper's `deinit` runs.
+    /// Holds the channel's stream plumbing. All fields nil-able so
+    /// `detach()` can drop them and stop forwarding once the wrapper's
+    /// `deinit` runs.
+    ///
+    /// `eventForwarder` is the generic-erased "yield a translated event"
+    /// closure; `eventFinish` is a separate "finish the events stream"
+    /// closure. They MUST be paired — finishing the stream without also
+    /// having a way to do so was the bug that left consumers' `for await`
+    /// loops hanging after `on_close`.
     private var outputCont: AsyncStream<Data>.Continuation?
     private var eventForwarder: ((TypeErasedChannelEvent) -> Void)?
+    private var eventFinish: (() -> Void)?
     private var state: ChannelState?
 
     func attach<S: Ghostty.ChannelService>(_ c: Ghostty.SSHChannel<S>) {
@@ -92,9 +99,11 @@ final class ChannelBox: @unchecked Sendable {
         let forwarder: (TypeErasedChannelEvent) -> Void = { ev in
             evtCont.yield(ev.translated(for: S.self))
         }
+        let finisher: () -> Void = { evtCont.finish() }
         lock.lock()
         outputCont = outCont
         eventForwarder = forwarder
+        eventFinish = finisher
         state = c.state
         lock.unlock()
     }
@@ -102,8 +111,10 @@ final class ChannelBox: @unchecked Sendable {
     func detach() {
         lock.lock()
         outputCont?.finish()
+        eventFinish?()
         outputCont = nil
         eventForwarder = nil
+        eventFinish = nil
         state = nil
         lock.unlock()
     }
@@ -123,12 +134,16 @@ final class ChannelBox: @unchecked Sendable {
         cont?.finish()
     }
 
-    /// Drop both streams atomically. Used from on_close.
+    /// Drop both streams atomically. Used from on_close for a terminal
+    /// (non-transport) close — the channel is dead, so both `output` and
+    /// `events` consumers should see end-of-stream.
     func finishAll() {
         lock.lock()
         outputCont?.finish()
+        eventFinish?()
         outputCont = nil
         eventForwarder = nil
+        eventFinish = nil
         lock.unlock()
     }
 
@@ -210,7 +225,8 @@ extension Ghostty.SSHConnection {
             knownMismatch: hk.known_mismatch,
             submit: { accept, persist in
                 let h = ghostty_ssh_t(bitPattern: handleBits)
-                ghostty_ssh_submit_host_key_decision(h, token, accept, persist)
+                Ghostty.LibghosttySSHAPI.current.sshSubmitHostKeyDecision(
+                    h, token, accept, persist)
             }
         )
 
@@ -254,12 +270,12 @@ extension Ghostty.SSHConnection {
                 submit: { pw in
                     let h = ghostty_ssh_t(bitPattern: handleBits)
                     pw.withCString { ptr in
-                        ghostty_ssh_submit_password(h, token, ptr)
+                        Ghostty.LibghosttySSHAPI.current.sshSubmitPassword(h, token, ptr)
                     }
                 },
                 cancel: {
                     let h = ghostty_ssh_t(bitPattern: handleBits)
-                    ghostty_ssh_cancel_password(h, token)
+                    Ghostty.LibghosttySSHAPI.current.sshCancelPassword(h, token)
                 }
             ))
         case GHOSTTY_SSH_STATE_UPLOADING:

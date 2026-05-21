@@ -374,12 +374,14 @@ struct SSHTests {
 
     @Test
     func sshConnectionEmitsInitialConnectingAndDisconnectsOnClose() async throws {
-        // Dummy non-null app pointer — the stub ignores it.
-        let dummyApp = ghostty_app_t(bitPattern: 0xDEAD_BEEF)!
+        // app: nil keeps libghostty on its no-CoreApp stub path — the
+        // ssh_capi.zig path that emits a synchronous CONNECTING and, on
+        // ghostty_ssh_close, a disconnected(cancelled). A unit test can't
+        // construct a real ghostty_app_t / CoreApp.
         let conn = try Ghostty.SSHConnection(
             config: .init(target: "stub@localhost"),
             hostKey: .insecure,
-            app: dummyApp
+            app: nil
         )
 
         // The stub emits CONNECTING synchronously inside ghostty_ssh_open,
@@ -397,7 +399,7 @@ struct SSHTests {
                 if !emittedClose {
                     emittedClose = true
                     let h = ghostty_ssh_t(bitPattern: handleBits)
-                    ghostty_ssh_close(h)
+                    Ghostty.LibghosttySSHAPI.current.sshClose(h)
                 }
                 if collected.count >= 2 { break }
             }
@@ -415,11 +417,11 @@ struct SSHTests {
 
     @Test
     func sshChannelOpenSurfacesStubServiceErrorClose() async throws {
-        let dummyApp = ghostty_app_t(bitPattern: 0xCAFE_BABE)!
+        // app: nil — stub path, see the test above.
         let conn = try Ghostty.SSHConnection(
             config: .init(target: "stub@localhost"),
             hostKey: .insecure,
-            app: dummyApp
+            app: nil
         )
 
         // ghostty_ssh_open_channel returns a handle, then synchronously

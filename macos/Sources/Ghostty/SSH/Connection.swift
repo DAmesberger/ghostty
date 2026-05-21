@@ -84,7 +84,14 @@ extension Ghostty {
 
         // MARK: Internal storage
 
-        let handle: ghostty_ssh_t
+        /// Backing C handle. Stamped in after `ghostty_ssh_open` returns.
+        /// `var ... ?` (not `let`) because the `userdata` box must be
+        /// attached to `self` BEFORE `ghostty_ssh_open` is called — the
+        /// stub-path open emits the initial CONNECTING state synchronously
+        /// from inside `ghostty_ssh_open`, so the trampoline must already
+        /// resolve back to this connection by the time the call returns.
+        /// Read through `requireHandle()`.
+        var handle: ghostty_ssh_t?
         let stateContinuation: AsyncStream<ConnectionState>.Continuation
         let stateSubject: CurrentValueSubject<ConnectionState, Never>
         let hostKeyHandler: HostKeyHandler
@@ -102,9 +109,15 @@ extension Ghostty {
         /// to observe transitions — including `passwordRequired`, whose
         /// callbacks need to fire before `connected` is reachable, which
         /// rules out a blocking "await connected" init.
-        init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t) throws {
+        ///
+        /// `app` is optional: passing `nil` keeps libghostty on its
+        /// no-CoreApp stub path (synchronous CONNECTING emit, no real
+        /// `SshConnectionManager`), which is what unit tests exercise.
+        /// Production callers always pass a real `ghostty_app_t`.
+        init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t?) throws {
             self.hostKeyHandler = hostKey
             self.stateSubject = CurrentValueSubject(.connecting)
+            self.handle = nil
 
             var stateCont: AsyncStream<ConnectionState>.Continuation!
             self.state = AsyncStream<ConnectionState>(bufferingPolicy: .unbounded) { stateCont = $0 }
@@ -113,10 +126,18 @@ extension Ghostty {
             let box = ConnectionBox()
             self.userdataBox = box
 
+            // CRITICAL ordering: attach the box to `self` BEFORE calling
+            // ghostty_ssh_open. The stub-path open (app == nil) emits the
+            // initial CONNECTING state synchronously, from inside
+            // ghostty_ssh_open, by calling the on_state trampoline. That
+            // trampoline resolves `self` from the box — so the box must
+            // already be wired up, or the first state transition is lost.
+            box.attach(self)
+
             // Stage the C config + callbacks. String fields are borrowed for
             // the duration of ghostty_ssh_open only; libghostty copies before
             // returning, so the .withCString chain below is sufficient.
-            let handle: ghostty_ssh_t? = config.target.withCString { targetPtr in
+            let opened: ghostty_ssh_t? = config.target.withCString { targetPtr in
                 config.jump.withCString { jumpPtr in
                     config.identityFile.withCString { identityPtr in
                         var cCfg = ghostty_ssh_config_t(
@@ -134,17 +155,21 @@ extension Ghostty {
                             on_host_key: SSHConnection.cOnHostKey,
                             userdata: Unmanaged.passUnretained(box).toOpaque()
                         )
-                        return ghostty_ssh_open(app, &cCfg, &cbs)
+                        return LibghosttySSHAPI.current.sshOpen(app, &cCfg, &cbs)
                     }
                 }
             }
 
-            guard let h = handle else {
+            guard let h = opened else {
+                box.detach()
                 stateContinuation.finish()
                 throw SSHError.openFailed
             }
             self.handle = h
-            box.attach(self)
+            // Register the live handle so the test harness can't swap the
+            // LibghosttySSHAPI table out from under it. Balanced by the
+            // decrement in deinit after sshFree.
+            LibghosttySSHAPI.incrementHandleCount()
             // ghostty_ssh_open synchronously emits the initial CONNECTING
             // state before returning, so by the time we reach here it has
             // already been yielded into `state`.
@@ -155,14 +180,28 @@ extension Ghostty {
             // (the weak ref is cleared before the C handle goes away).
             userdataBox.detach()
             stateContinuation.finish()
-            let h = handle
+            // `handle` is nil only when init threw before ghostty_ssh_open
+            // succeeded — in that case there is nothing to free and the
+            // handle counter was never incremented.
+            guard let h = handle else { return }
+            let api = LibghosttySSHAPI.current
             Task.detached {
-                ghostty_ssh_close(h)
-                ghostty_ssh_free(h)
+                api.sshClose(h)
+                api.sshFree(h)
+                LibghosttySSHAPI.decrementHandleCount()
             }
         }
 
         // MARK: Public API
+
+        /// The C handle, asserted non-nil. Init stamps `handle` before it
+        /// returns successfully, so every externally-reachable method sees
+        /// a bound handle — a nil here is a programmer error in this file,
+        /// not a recoverable runtime condition.
+        private func requireHandle() -> ghostty_ssh_t {
+            precondition(handle != nil, "SSHConnection used before handle was bound")
+            return handle!
+        }
 
         /// Open a typed channel. Returns once the C-side open call is in-
         /// flight; subscribe to the channel's `events` stream for the
@@ -190,8 +229,8 @@ extension Ghostty {
                     on_close: SSHConnection.cOnChannelClose,
                     userdata: Unmanaged.passUnretained(channelBox).toOpaque()
                 )
-                return ghostty_ssh_open_channel(
-                    handle,
+                return LibghosttySSHAPI.current.sshOpenChannel(
+                    requireHandle(),
                     service.cService,
                     raw.baseAddress,
                     raw.count,
@@ -231,8 +270,8 @@ extension Ghostty {
                             on_close: SSHConnection.cOnChannelClose,
                             userdata: Unmanaged.passUnretained(channelBox).toOpaque()
                         )
-                        return ghostty_ssh_attach_surface(
-                            handle,
+                        return LibghosttySSHAPI.current.sshAttachSurface(
+                            requireHandle(),
                             groupPtr,
                             surfacePtr,
                             size.rows,
@@ -257,7 +296,8 @@ extension Ghostty {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[SessionListEntry], Swift.Error>) in
                 let collector = SessionListCollector(continuation: cont)
                 let ptr = Unmanaged.passRetained(collector).toOpaque()
-                let ok = ghostty_ssh_list_sessions(handle, SSHConnection.cOnSessionEntry, ptr)
+                let ok = LibghosttySSHAPI.current.sshListSessions(
+                    requireHandle(), SSHConnection.cOnSessionEntry, ptr)
                 if !ok {
                     // Take it back and drop on the floor.
                     Unmanaged<SessionListCollector>.fromOpaque(ptr).release()
@@ -267,11 +307,11 @@ extension Ghostty {
         }
 
         func requestReconnect() {
-            ghostty_ssh_request_reconnect(handle)
+            LibghosttySSHAPI.current.sshRequestReconnect(requireHandle())
         }
 
         func cancelReconnect() {
-            ghostty_ssh_cancel_reconnect(handle)
+            LibghosttySSHAPI.current.sshCancelReconnect(requireHandle())
         }
 
         // MARK: Helpers
