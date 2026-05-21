@@ -3,24 +3,30 @@ import Foundation
 @testable import Ghostty
 @testable import GhosttyKit
 
-// Tests that don't require a live libghostty (no ghostty_app_t, no real SSH
-// connection). They cover:
+// Two flavors of tests live here:
 //
-//   * The pure-Swift backpressure actor inside SSHChannel
-//   * Service.encodeParams() wire formats — these are spec-locked because
-//     the daemon-side decoders depend on them byte-for-byte.
-//   * C-enum → Swift-enum mappings.
+//   1. Pure-Swift unit tests for the parts that don't touch libghostty at
+//      all — backpressure actor, wire-format encoding, C-enum mappings.
+//      These are fast and deterministic.
 //
-// Tests that DO require a live libghostty (full SSHConnection state-machine,
-// SSHChannel.write through a real channel) are in scope but blocked on a
-// stub libghostty for the test target. See SSHTestPlan.swift.txt notes.
+//   2. Integration-against-stub tests that exercise the trampoline ↔
+//      AsyncStream plumbing through the real `ghostty_ssh_*` C entry
+//      points exported by `src/apprt/embedded/ssh_capi.zig`. Those exports
+//      are stubs today (no real libssh2 transport) but they do drive the
+//      callback contract — emit CONNECTING, cascade DAEMON_SHUTDOWN on
+//      close, emit SERVICE_ERROR on channel open. That's enough to verify
+//      the Swift wrapper translates them correctly.
+//
+// The integration tests require GhosttyKit.xcframework to be built (i.e.
+// the test runs through xcodebuild against the real GhosttyKit target).
+// They do NOT require a network, ssh daemon, or libssh2.
 
 struct SSHTests {
 
     // MARK: - Backpressure actor
 
     @Test
-    func channelStateBlocksUntilGrant() async {
+    func channelStateBlocksUntilGrant() async throws {
         let s = ChannelState()
         let task = Task { try await s.awaitCredit() }
         // Should be parked.
@@ -28,7 +34,7 @@ struct SSHTests {
         #expect(!task.isCancelled)
 
         await s.grant(64)
-        await #expect(throws: Never.self) { try await task.value }
+        try await task.value
         let took = await s.takeCredit(max: 64)
         #expect(took == 64)
     }
@@ -52,8 +58,11 @@ struct SSHTests {
     func channelStateCloseThrows() async {
         let s = ChannelState()
         await s.markClosed()
-        await #expect(throws: Ghostty.SSHError.self) {
+        do {
             try await s.awaitCredit()
+            Issue.record("awaitCredit on closed state should throw")
+        } catch {
+            #expect(error is Ghostty.SSHError)
         }
     }
 
@@ -94,8 +103,7 @@ struct SSHTests {
     func tcpConnectEncodesNullTerminatedHostPlusBEPort() {
         let svc = Ghostty.TCPConnectService(host: "example.com", port: 0x1F90)  // 8080
         let bytes = [UInt8](svc.encodeParams())
-        let host = "example.com".utf8.map(UInt8.init)
-        var expected = host
+        var expected: [UInt8] = Array("example.com".utf8)
         expected.append(0)        // NUL
         expected.append(0x1F)     // port big-endian high
         expected.append(0x90)     // port big-endian low
@@ -189,10 +197,122 @@ struct SSHTests {
     ) {
         #expect(Ghostty.SSHChannel<Ghostty.TerminalService>.CloseReason.from(c) == swift)
     }
+
+    // MARK: - Integration: SSHConnection state-machine over real C ABI
+    //
+    // Drives the stub `ghostty_ssh_*` exports in
+    // `src/apprt/embedded/ssh_capi.zig`. The stub's contract is:
+    //
+    //   * `ghostty_ssh_open` synchronously emits a CONNECTING state then
+    //     parks (no further callbacks until the embedder calls close).
+    //   * `ghostty_ssh_close` cascades `on_close(DAEMON_SHUTDOWN)` to every
+    //     live channel, then emits `disconnected(reason=cancelled)`.
+    //
+    // Both tests verify the Swift trampoline → AsyncStream plumbing on the
+    // real C ABI, not on a Swift mock.
+
+    @Test
+    func sshConnectionEmitsInitialConnectingAndDisconnectsOnClose() async throws {
+        // Dummy non-null app pointer — the stub ignores it.
+        let dummyApp = ghostty_app_t(bitPattern: 0xDEAD_BEEF)!
+        let conn = try Ghostty.SSHConnection(
+            config: .init(target: "stub@localhost"),
+            hostKey: .insecure,
+            app: dummyApp
+        )
+
+        // The stub emits CONNECTING synchronously inside ghostty_ssh_open,
+        // and emits disconnected(cancelled) when we call ghostty_ssh_close.
+        // Collect the first two state values, then verify.
+        // Pass the handle through UInt(bitPattern:) since `ghostty_ssh_t`
+        // is `UnsafeMutableRawPointer`, intentionally non-Sendable.
+        let handleBits = UInt(bitPattern: conn.handle)
+        let stream = conn.state
+        let firstTwo: [Ghostty.ConnectionState] = try await withTimeout(seconds: 2) {
+            var collected: [Ghostty.ConnectionState] = []
+            var emittedClose = false
+            for await s in stream {
+                collected.append(s)
+                if !emittedClose {
+                    emittedClose = true
+                    let h = ghostty_ssh_t(bitPattern: handleBits)
+                    ghostty_ssh_close(h)
+                }
+                if collected.count >= 2 { break }
+            }
+            return collected
+        }
+
+        #expect(firstTwo.count == 2)
+        #expect(firstTwo.first?.kind == .connecting)
+        guard case let .disconnected(d) = firstTwo.last else {
+            Issue.record("expected .disconnected, got \(String(describing: firstTwo.last))")
+            return
+        }
+        #expect(d.reason == .cancelled)
+    }
+
+    @Test
+    func sshChannelOpenSurfacesStubServiceErrorClose() async throws {
+        let dummyApp = ghostty_app_t(bitPattern: 0xCAFE_BABE)!
+        let conn = try Ghostty.SSHConnection(
+            config: .init(target: "stub@localhost"),
+            hostKey: .insecure,
+            app: dummyApp
+        )
+
+        // ghostty_ssh_open_channel returns a handle, then synchronously
+        // emits on_close(SERVICE_ERROR) — exactly what we want to verify
+        // the trampoline turns into a .closed event with the right reason
+        // and that the events AsyncStream finishes afterwards.
+        let channel = try conn.openChannel(Ghostty.TCPConnectService(host: "x", port: 1))
+
+        let events: [Ghostty.SSHChannel<Ghostty.TCPConnectService>.Event] =
+            try await withTimeout(seconds: 2) {
+                var collected: [Ghostty.SSHChannel<Ghostty.TCPConnectService>.Event] = []
+                for await ev in channel.events {
+                    collected.append(ev)
+                }
+                return collected
+            }
+
+        // Stub emits exactly one event: the SERVICE_ERROR close. The stream
+        // then finishes (loop exits).
+        #expect(events.count == 1)
+        guard case let .closed(reason, _, wasTransport) = events.first else {
+            Issue.record("expected .closed event, got \(String(describing: events.first))")
+            return
+        }
+        #expect(reason == .serviceError)
+        #expect(wasTransport == false)
+    }
 }
+
+// MARK: - Test helpers
+
+/// Race `op` against a timeout. Throws `TimeoutError` if `op` doesn't
+/// produce a value in time. Keeps the suite responsive when a regression
+/// in the trampoline plumbing causes a stream to never yield or finish.
+func withTimeout<T: Sendable>(
+    seconds: Double,
+    op: @Sendable @escaping () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask {
+            try await op()
+        }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw TimeoutError()
+        }
+        let first = try await group.next()!
+        group.cancelAll()
+        return first
+    }
+}
+
+struct TimeoutError: Swift.Error {}
 
 // MARK: - Equatable conformances for test convenience
 
-extension Ghostty.ConnectionState.ProvisionSource: Equatable {}
-extension Ghostty.ConnectionState.Failure.Reason: Equatable {}
 extension Ghostty.SSHChannel.CloseReason: Equatable {}

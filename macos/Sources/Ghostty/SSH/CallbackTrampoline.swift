@@ -19,6 +19,32 @@ import GhosttyKit
 // * Trampolines never block the C thread. They memcpy callback buffers
 //   immediately into Swift-owned storage, then yield to continuations
 //   (non-blocking) or hop into a `Task` for actor calls.
+//
+// Sendable / strict-concurrency note:
+//
+//   `ghostty_ssh_t` and `ghostty_channel_t` are imported as
+//   `UnsafeMutableRawPointer`, which the stdlib intentionally marks
+//   `@available(*, unavailable) extension UnsafeMutableRawPointer: Sendable`
+//   — i.e. it is NOT Sendable. When we need to capture a handle in a
+//   `@Sendable` closure (the resume / cancel closures handed back to the
+//   embedder inside `passwordRequired` and `hostKeyChallenge`), we round-
+//   trip the pointer through `UInt(bitPattern:)`. `UInt` is trivially
+//   Sendable, and the rebuilt pointer is bit-identical.
+//
+//   Lifetime safety of that round-trip relies on a separate invariant:
+//   the closures we hand out belong to a `ConnectionState` value which is
+//   yielded into the connection's `AsyncStream`. The connection wrapper
+//   owns the C handle and only frees it in `deinit`; the box's
+//   `weak`-resolved `nil` guard at the top of every trampoline blocks
+//   any callback after `deinit` started. The embedder *can* still hold
+//   onto a stale `ConnectionState.passwordRequired` value across the
+//   wrapper's `deinit` and invoke `submit` — at which point the captured
+//   pointer would be dangling. That's a documented misuse (you must not
+//   keep state-payload closures past the connection's lifetime), not a
+//   round-trip bug; the UInt-bit-pattern indirection does not introduce
+//   it. We could harden by storing the handle in a Sendable wrapper
+//   class with a `weak`-resolved guard, but that adds an allocation per
+//   prompt for no gain over the existing weak-ref discipline.
 // =====================================================================
 
 // MARK: - Userdata boxes

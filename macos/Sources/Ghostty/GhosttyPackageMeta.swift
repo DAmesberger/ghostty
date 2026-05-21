@@ -4,7 +4,12 @@ import os
 // This defines the minimal information required so all other files can do
 // `extension Ghostty` to add more to it. This purposely has minimal
 // dependencies so things like our dock tile plugin can use it.
-enum Ghostty {
+//
+// `public` so external modules (cmux) can reach the SSH wrapper types
+// added in `SSH/`. The existing `logger` / `Notification` members below
+// stay internal — only members deliberately marked `public` in extensions
+// become part of the cross-module API.
+public enum Ghostty {
     // The primary logger used by the GhosttyKit libraries.
     static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier!,

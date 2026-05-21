@@ -8,10 +8,11 @@ extension Ghostty {
     /// from the C surface (see the "SSH connection + channel API" block in
     /// `include/ghostty.h`).
     ///
-    /// `passwordRequired` and `hostKeyChallenge` carry closures that resume the
-    /// connection — they encapsulate the C-side `auth_token` / `decision_token`
-    /// so embedders don't have to thread them around.
-    enum ConnectionState: Sendable {
+    /// `passwordRequired` carries closures that resume the connection — they
+    /// encapsulate the C-side `auth_token` so embedders don't have to thread
+    /// it around. The same pattern is used for the host-key prompt
+    /// (`Ghostty.HostKeyChallenge`).
+    public enum ConnectionState: Sendable {
         case connecting
         case passwordRequired(PasswordPrompt)
         case uploading(Upload)
@@ -23,30 +24,30 @@ extension Ghostty {
         case failed(Failure)
         case disconnected(Disconnect)
 
-        struct PasswordPrompt: Sendable {
+        public struct PasswordPrompt: Sendable {
             /// True when the prompt is for a jump host rather than the target.
-            let isJump: Bool
+            public let isJump: Bool
             /// Host being authenticated.
-            let host: String
+            public let host: String
             /// Submit a password. Safe to call from any thread; callable at most
             /// once per prompt — subsequent calls are no-ops.
-            let submit: @Sendable (String) -> Void
+            public let submit: @Sendable (String) -> Void
             /// Abort the prompt; the connection transitions to FAILED.
-            let cancel: @Sendable () -> Void
+            public let cancel: @Sendable () -> Void
         }
 
-        struct Upload: Sendable {
-            let bytesSent: UInt64
-            let totalBytes: UInt64
-            let source: ProvisionSource
+        public struct Upload: Sendable {
+            public let bytesSent: UInt64
+            public let totalBytes: UInt64
+            public let source: ProvisionSource
 
-            var progress: Double {
+            public var progress: Double {
                 guard totalBytes > 0 else { return 0 }
                 return Double(bytesSent) / Double(totalBytes)
             }
         }
 
-        enum ProvisionSource: Sendable {
+        public enum ProvisionSource: Sendable, Equatable {
             case localDaemon
             case localSelf
             case github
@@ -61,20 +62,20 @@ extension Ghostty {
             }
         }
 
-        struct Reconnect: Sendable {
-            let attempt: UInt32
-            let maxAttempts: UInt32
+        public struct Reconnect: Sendable {
+            public let attempt: UInt32
+            public let maxAttempts: UInt32
             /// Time since the failure that triggered this reconnect.
-            let elapsed: TimeInterval
+            public let elapsed: TimeInterval
             /// Wall-clock instant the next attempt fires. `nil` means "now".
-            let nextRetry: Date?
+            public let nextRetry: Date?
         }
 
-        struct Disconnect: Sendable {
-            let attemptsMade: UInt32
-            let reason: Reason
+        public struct Disconnect: Sendable {
+            public let attemptsMade: UInt32
+            public let reason: Reason
 
-            enum Reason: Sendable {
+            public enum Reason: Sendable, Equatable {
                 case exhausted
                 case cancelled
                 case disabled
@@ -90,11 +91,11 @@ extension Ghostty {
             }
         }
 
-        struct Failure: Sendable {
-            let reason: Reason
-            let message: String?
+        public struct Failure: Sendable {
+            public let reason: Reason
+            public let message: String?
 
-            enum Reason: Sendable {
+            public enum Reason: Sendable, Equatable {
                 case unknown
                 case authFailed
                 case timeout
@@ -112,10 +113,31 @@ extension Ghostty {
             }
         }
 
+        /// Convenience tag for cheap pattern-matching in tests + UI.
+        public enum Kind: Sendable, Equatable {
+            case connecting, passwordRequired, uploading, downloading,
+                 setup, connected, reconnecting, stale, failed, disconnected
+        }
+
+        public var kind: Kind {
+            switch self {
+            case .connecting: return .connecting
+            case .passwordRequired: return .passwordRequired
+            case .uploading: return .uploading
+            case .downloading: return .downloading
+            case .setup: return .setup
+            case .connected: return .connected
+            case .reconnecting: return .reconnecting
+            case .stale: return .stale
+            case .failed: return .failed
+            case .disconnected: return .disconnected
+            }
+        }
+
         /// True for terminal states: `failed`, `disconnected`.
         ///
         /// `stale` and `reconnecting` are recoverable.
-        var isTerminal: Bool {
+        public var isTerminal: Bool {
             switch self {
             case .failed, .disconnected: return true
             default: return false
@@ -125,12 +147,9 @@ extension Ghostty {
 
     /// Public error type for the SSH wrapper. Distinct from the package-
     /// internal `Ghostty.Error` so embedders can pattern-match.
-    enum SSHError: Swift.Error, Sendable, CustomStringConvertible {
+    public enum SSHError: Swift.Error, Sendable, CustomStringConvertible, Equatable {
         /// `ghostty_ssh_open` returned NULL — config was malformed.
         case openFailed
-        /// Connection terminated unexpectedly while an async operation was
-        /// in flight.
-        case connectionTerminated
         /// `ghostty_ssh_open_channel` returned NULL.
         case channelOpenFailed
         /// The channel was closed before / during a write.
@@ -138,10 +157,9 @@ extension Ghostty {
         /// `ghostty_ssh_list_sessions` returned false (connection not ready).
         case notReady
 
-        var description: String {
+        public var description: String {
             switch self {
             case .openFailed: return "ghostty_ssh_open failed (invalid configuration)"
-            case .connectionTerminated: return "SSH connection terminated"
             case .channelOpenFailed: return "ghostty_ssh_open_channel failed"
             case .channelClosed: return "channel closed"
             case .notReady: return "SSH connection not ready"
@@ -150,7 +168,7 @@ extension Ghostty {
     }
 
     /// Host key verification policy applied to the SSH transport.
-    enum HostKeyHandler: Sendable {
+    public enum HostKeyHandler: Sendable {
         /// Reject unknown hosts and any pinned-key mismatch.
         case strict
         /// Trust-on-first-use: accept on first sight, pin, then enforce.
@@ -171,37 +189,37 @@ extension Ghostty {
     }
 
     /// Payload + resolver for an interactive host-key prompt.
-    struct HostKeyChallenge: Sendable {
-        let host: String
+    public struct HostKeyChallenge: Sendable {
+        public let host: String
         /// SHA-256 hex fingerprint of the offered key.
-        let fingerprintSHA256: String
+        public let fingerprintSHA256: String
         /// e.g. "ssh-ed25519".
-        let keyType: String
+        public let keyType: String
         /// The offered key matches a pinned entry.
-        let knownMatch: Bool
+        public let knownMatch: Bool
         /// A *different* key for the host is pinned (MITM-suspect).
-        let knownMismatch: Bool
+        public let knownMismatch: Bool
         /// Resolve the challenge. Safe to call from any thread; callable at
         /// most once per challenge.
-        let submit: @Sendable (_ accept: Bool, _ persist: Bool) -> Void
+        public let submit: @Sendable (_ accept: Bool, _ persist: Bool) -> Void
     }
 
     /// An entry returned from `SSHConnection.listSessions()`.
-    struct SessionListEntry: Sendable {
-        let groupID: UUID
-        let label: String
-        let surfaceCount: UInt32
-        let createdAt: Date
+    public struct SessionListEntry: Sendable {
+        public let groupID: UUID
+        public let label: String
+        public let surfaceCount: UInt32
+        public let createdAt: Date
     }
 
     /// Logical terminal size used by `SSHConnection.attachSurface`.
-    struct TerminalSize: Sendable {
-        let rows: UInt16
-        let cols: UInt16
-        let widthPx: UInt32
-        let heightPx: UInt32
+    public struct TerminalSize: Sendable {
+        public let rows: UInt16
+        public let cols: UInt16
+        public let widthPx: UInt32
+        public let heightPx: UInt32
 
-        init(rows: UInt16, cols: UInt16, widthPx: UInt32 = 0, heightPx: UInt32 = 0) {
+        public init(rows: UInt16, cols: UInt16, widthPx: UInt32 = 0, heightPx: UInt32 = 0) {
             self.rows = rows
             self.cols = cols
             self.widthPx = widthPx

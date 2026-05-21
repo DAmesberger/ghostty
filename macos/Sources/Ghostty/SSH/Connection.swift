@@ -5,38 +5,40 @@ import GhosttyKit
 extension Ghostty {
     /// A single multiplexed SSH connection to one remote host.
     ///
-    /// Wraps `ghostty_ssh_t`. Construction is `async` because libghostty's
-    /// open path is asynchronous — the initializer suspends until the
-    /// underlying connection reaches `connected` (or fails). Embedders
-    /// observe further state transitions via `state`.
+    /// Wraps `ghostty_ssh_t`. The initializer is synchronous and returns as
+    /// soon as the C-side handle is allocated and the initial CONNECTING
+    /// state is emitted — embedders observe every subsequent transition
+    /// (including `passwordRequired`, `uploading`, `connected`) by iterating
+    /// `state` (AsyncStream) or subscribing to `connectionStatePublisher`
+    /// (Combine).
     ///
     /// Threading: all C callbacks fire on libghostty worker threads. The
-    /// wrapper hops every callback through its private `ConnectionMailbox`
-    /// actor before mutating Swift state, so the public API can be called
-    /// from any concurrency context.
-    final class SSHConnection: @unchecked Sendable {
+    /// wrapper hops every callback through `AsyncStream` continuations and
+    /// `MainActor`-isolated property updates, so the public API can be
+    /// called from any concurrency context.
+    public final class SSHConnection: @unchecked Sendable {
         // MARK: Configuration
 
-        struct Config: Sendable {
+        public struct Config: Sendable {
             /// "user@host[:port]".
-            let target: String
+            public let target: String
             /// Comma-separated jump-host chain. Empty = direct connect.
-            let jump: String
+            public let jump: String
             /// Path to an identity file. Empty = let libssh2 try the agent +
             /// default identities under ~/.ssh.
-            let identityFile: String
+            public let identityFile: String
             /// SSH keepalive interval; 0 uses libghostty default (15 s).
-            let keepaliveIntervalMs: UInt32
+            public let keepaliveIntervalMs: UInt32
             /// Reconnect attempts after an unexpected drop. 0 disables auto-
             /// reconnect entirely; UINT32_MAX gives the libghostty default.
-            let maxReconnectAttempts: UInt32
+            public let maxReconnectAttempts: UInt32
             /// Initial backoff; doubles per attempt, capped at 60 s. 0 uses
             /// libghostty default (1000 ms).
-            let reconnectIntervalMs: UInt32
+            public let reconnectIntervalMs: UInt32
             /// Soft cap on per-surface scrollback bytes; 0 = daemon default.
-            let scrollbackLimitBytes: UInt32
+            public let scrollbackLimitBytes: UInt32
 
-            init(
+            public init(
                 target: String,
                 jump: String = "",
                 identityFile: String = "",
@@ -58,17 +60,16 @@ extension Ghostty {
         // MARK: Public surface
 
         /// All connection state transitions, including the initial `connecting`.
-        let state: AsyncStream<ConnectionState>
+        public let state: AsyncStream<ConnectionState>
 
         /// The most recent state snapshot. Read this on `MainActor` for a
         /// stable value; off-actor reads are safe but may observe a value
         /// that was just superseded.
-        @MainActor private(set) var currentState: ConnectionState = .connecting
+        @MainActor public private(set) var currentState: ConnectionState = .connecting
 
-        /// Combine bridge over `state`. Drains the `AsyncStream` in a
-        /// detached task and republishes via a `CurrentValueSubject` so
-        /// consumers always see a value on subscribe.
-        var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
+        /// Combine bridge over `state`. The subject is fed alongside the
+        /// `AsyncStream` so consumers always see a value on subscribe.
+        public var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
             stateSubject.eraseToAnyPublisher()
         }
 
@@ -78,7 +79,6 @@ extension Ghostty {
         let stateContinuation: AsyncStream<ConnectionState>.Continuation
         let stateSubject: CurrentValueSubject<ConnectionState, Never>
         let hostKeyHandler: HostKeyHandler
-        let mailbox: ConnectionMailbox
 
         /// Strong-ref box backing the C userdata pointer. Held by `self` —
         /// released in `deinit` after the C handle is freed so trampolines
@@ -87,9 +87,14 @@ extension Ghostty {
 
         // MARK: Init
 
-        init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t) async throws {
+        /// Open an SSH connection. Returns immediately once `ghostty_ssh_open`
+        /// has installed the C-side handle and emitted the initial CONNECTING
+        /// state. Embedders MUST consume `state` (or `connectionStatePublisher`)
+        /// to observe transitions — including `passwordRequired`, whose
+        /// callbacks need to fire before `connected` is reachable, which
+        /// rules out a blocking "await connected" init.
+        public init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t) throws {
             self.hostKeyHandler = hostKey
-            self.mailbox = ConnectionMailbox()
             self.stateSubject = CurrentValueSubject(.connecting)
 
             var stateCont: AsyncStream<ConnectionState>.Continuation!
@@ -131,11 +136,9 @@ extension Ghostty {
             }
             self.handle = h
             box.attach(self)
-
-            // Suspend until the connection reaches `connected` or terminates.
-            // The trampoline yields each transition through `state` *and*
-            // notifies the mailbox; we await the mailbox for the resolution.
-            try await mailbox.awaitInitialConnect()
+            // ghostty_ssh_open synchronously emits the initial CONNECTING
+            // state before returning, so by the time we reach here it has
+            // already been yielded into `state`.
         }
 
         deinit {
@@ -152,9 +155,10 @@ extension Ghostty {
 
         // MARK: Public API
 
-        /// Open a typed channel. Returns once the open is in-flight; subscribe
-        /// to the channel's `events` stream for the `opened` event.
-        func openChannel<S: ChannelService>(_ service: S) async throws -> SSHChannel<S> {
+        /// Open a typed channel. Returns once the C-side open call is in-
+        /// flight; subscribe to the channel's `events` stream for the
+        /// `opened` event (success) or `closed` event (failure).
+        public func openChannel<S: ChannelService>(_ service: S) throws -> SSHChannel<S> {
             let params = service.encodeParams()
 
             // Construct the wrapper + box up front and wire the box to the
@@ -196,12 +200,12 @@ extension Ghostty {
 
         /// Attach (or re-attach) a terminal surface over this connection.
         /// Pass `nil` for either UUID to let libghostty generate one.
-        func attachSurface(
+        public func attachSurface(
             groupID: UUID?,
             surfaceID: UUID?,
             size: TerminalSize,
             label: String
-        ) async throws -> SSHChannel<TerminalService> {
+        ) throws -> SSHChannel<TerminalService> {
             let channel = SSHChannel<TerminalService>(service: TerminalService())
             let channelBox = ChannelBox()
             channelBox.attach(channel)
@@ -240,7 +244,7 @@ extension Ghostty {
             return channel
         }
 
-        func listSessions() async throws -> [SessionListEntry] {
+        public func listSessions() async throws -> [SessionListEntry] {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[SessionListEntry], Swift.Error>) in
                 let collector = SessionListCollector(continuation: cont)
                 let ptr = Unmanaged.passRetained(collector).toOpaque()
@@ -253,11 +257,11 @@ extension Ghostty {
             }
         }
 
-        func requestReconnect() {
+        public func requestReconnect() {
             ghostty_ssh_request_reconnect(handle)
         }
 
-        func cancelReconnect() {
+        public func cancelReconnect() {
             ghostty_ssh_cancel_reconnect(handle)
         }
 
@@ -278,9 +282,9 @@ extension Ghostty {
 
         // MARK: Trampoline-internal state dispatch
 
-        /// Called from the `on_state` trampoline (off-actor thread). Emits to
-        /// every channel: `state` stream, `currentState`, Combine subject,
-        /// and the mailbox. Allocates closures here so the C-side opaque
+        /// Called from the `on_state` trampoline (off-libghostty thread).
+        /// Yields to the AsyncStream + Combine subject and updates the
+        /// MainActor snapshot. Allocates closures here so the C-side opaque
         /// tokens never leak into the public state value.
         func emitState(_ state: ConnectionState) {
             stateContinuation.yield(state)
@@ -288,50 +292,6 @@ extension Ghostty {
             Task { @MainActor in
                 self.currentState = state
             }
-            Task { await self.mailbox.deliver(state) }
-        }
-    }
-}
-
-// MARK: - Mailbox actor
-
-/// Bookkeeping actor used by `SSHConnection` to track the initial-connect
-/// continuation. Kept private because it has no public surface.
-actor ConnectionMailbox {
-    private var initialContinuation: CheckedContinuation<Void, Swift.Error>?
-    private var resolved: Bool = false
-    private var resolvedError: Swift.Error?
-
-    func awaitInitialConnect() async throws {
-        if resolved {
-            if let e = resolvedError { throw e }
-            return
-        }
-        try await withCheckedThrowingContinuation { cont in
-            self.initialContinuation = cont
-        }
-    }
-
-    func deliver(_ state: Ghostty.ConnectionState) {
-        guard !resolved else { return }
-        switch state {
-        case .connected:
-            resolved = true
-            initialContinuation?.resume()
-            initialContinuation = nil
-        case .failed(let f):
-            resolved = true
-            resolvedError = Ghostty.SSHError.connectionTerminated
-            _ = f
-            initialContinuation?.resume(throwing: Ghostty.SSHError.connectionTerminated)
-            initialContinuation = nil
-        case .disconnected:
-            resolved = true
-            resolvedError = Ghostty.SSHError.connectionTerminated
-            initialContinuation?.resume(throwing: Ghostty.SSHError.connectionTerminated)
-            initialContinuation = nil
-        default:
-            break
         }
     }
 }
