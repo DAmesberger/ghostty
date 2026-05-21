@@ -1138,8 +1138,15 @@ export fn ghostty_ssh_list_sessions(
 
         fn run(self: *@This()) void {
             defer {
+                // Read self.handle.alloc BEFORE decrementing active_workers:
+                // once the counter drops to 0, the embedder may race us to
+                // ghostty_ssh_free (which acquire-loads active_workers and
+                // proceeds to destroy the SshHandle when it sees 0), so any
+                // subsequent dereference of self.handle.* would be a UAF.
+                // Allocator is a value type — capturing by value is safe.
+                const alloc = self.handle.alloc;
                 _ = self.handle.active_workers.fetchSub(1, .acq_rel);
-                self.handle.alloc.destroy(self);
+                alloc.destroy(self);
             }
 
             const alloc = self.handle.alloc;
