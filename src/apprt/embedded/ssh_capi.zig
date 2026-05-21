@@ -16,21 +16,36 @@
 //!     `on_close(reason=daemon_shutdown)` to every live channel
 //!     handle rooted on the connection.
 //!
+//! Channel transport status:
+//!
+//!   * The C-API ↔ `channel_mux.ClientMux` bridge IS wired —
+//!     `ghostty_ssh_open_channel` / `ghostty_channel_write` /
+//!     `_eof` / `_close` all route through a real ClientMux, and
+//!     the five `ChannelHandle.mux*` bridge callbacks forward mux
+//!     events to the embedder's `ghostty_channel_callbacks_t`.
+//!   * What's NOT wired in this build: a production ClientMux fed
+//!     by a live SSH connection. A ClientMux needs an fd; an SSH
+//!     connection carries its bytes over a libssh2 channel, not a
+//!     kernel fd, and that channel is driven solely by
+//!     `SshConnectionManager.sshThreadMain`. Routing inbound
+//!     channel-kind frames (27, 30-36) from `sshThreadMain` into a
+//!     per-Entry ClientMux — and giving the ClientMux an outbound
+//!     path onto the libssh2 channel — is Phase 6C / task #23.
+//!     Until then `SshHandle.client_mux` is null on real
+//!     connections, so `ghostty_ssh_open_channel` allocates the
+//!     handle then immediately reports `on_close(SERVICE_ERROR)`.
+//!     Unit tests inject a socketpair-backed ClientMux directly
+//!     (`setClientMuxForTest`) and exercise the full bridge.
+//!
 //! Still gated on a follow-up:
 //!
-//!   * Channel transport: write/eof/close currently only manipulate
-//!     the channel handle's local state. Real byte flow needs a
-//!     client-side channel mux (the existing daemon-side
-//!     `channel_mux.Mux` only dispatches inbound `channel_open`, not
-//!     outbound). Tracked as TODO(client-mux).
 //!   * `ghostty_ssh_attach_surface` would call the shared helper
 //!     `session.client.attachRemoteSurface` (which now backs the
 //!     GTK terminal-surface path too) from a worker thread, but
 //!     the worker-thread spawn plus the subsequent frame-dispatch
 //!     routing to the channel callbacks both land alongside the
-//!     channel-mux follow-up. For now it returns a handle that
-//!     immediately reports `on_close(SERVICE_ERROR)` so embedders
-//!     can exercise that edge.
+//!     production transport (task #23). For now it returns a handle
+//!     that immediately reports `on_close(SERVICE_ERROR)`.
 //!   * `ghostty_ssh_submit_host_key_decision` is a no-op today —
 //!     the underlying libssh2 host-key check (src/session/ssh.zig
 //!     verifyHostKey) auto-accepts unknown keys via TOFU and never
@@ -64,8 +79,11 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const protocol = @import("../../session/protocol.zig");
 const session_shared = @import("../../session/shared.zig");
+const channel_mux = @import("../../session/channel_mux.zig");
 const SshConnectionManager = @import("../../termio/SshConnectionManager.zig");
 const apprt_embedded = @import("../embedded.zig");
+
+const ClientMux = channel_mux.ClientMux;
 
 const log = std.log.scoped(.ssh_capi);
 
@@ -173,6 +191,22 @@ pub const ChannelCloseReason = enum(c_int) {
             .idle_timeout => .idle_timeout,
             .daemon_shutdown => .daemon_shutdown,
             _ => .unknown,
+        };
+    }
+
+    /// Map an embedder-supplied close reason to the wire-protocol
+    /// reason for a `channel_close` frame. `transport` and `unknown`
+    /// are libghostty-synthesized (no wire representation) and map
+    /// to `normal` — an embedder closing a channel "because the
+    /// transport dropped" still tells the peer a plain close.
+    fn toProtocol(self: ChannelCloseReason) protocol.ChannelCloseReason {
+        return switch (self) {
+            .normal, .transport, .unknown => .normal,
+            .peer_reset => .peer_reset,
+            .service_error => .service_error,
+            .policy_denied => .policy_denied,
+            .idle_timeout => .idle_timeout,
+            .daemon_shutdown => .daemon_shutdown,
         };
     }
 };
@@ -361,6 +395,25 @@ pub const SshHandle = struct {
     /// the Entry is freed before our close path runs.
     release_target: ?[]u8 = null,
     release_jump: ?[]u8 = null,
+    /// Client-side channel multiplexer for this connection — backs
+    /// `ghostty_ssh_open_channel` and the channel write/eof/close
+    /// entry points.
+    ///
+    /// Part 5 (this commit) wires the C-API ↔ ClientMux bridge but
+    /// does NOT itself construct a production ClientMux: the mux
+    /// needs an fd, and a live SSH connection has none (frames ride
+    /// a libssh2 channel, not a kernel fd). Production frame routing
+    /// — a per-Entry ClientMux fed by `sshThreadMain` — lands in
+    /// Part 6 (task #23). Until then this stays null on real
+    /// connections and `ghostty_ssh_open_channel` reports a clear
+    /// "transport not wired" close. Unit tests inject a
+    /// socketpair-backed ClientMux directly via `setClientMuxForTest`.
+    client_mux: ?*ClientMux = null,
+    /// True when this handle owns `client_mux` and must deinit+free
+    /// it on teardown. False when the mux is borrowed (the future
+    /// per-Entry production mux is owned by the Entry, not the
+    /// handle). Tests that inject a mux set this per their harness.
+    client_mux_owned: bool = false,
     /// Live channels rooted on this connection. Used to validate the
     /// "free channels before ssh" invariant and to broadcast TRANSPORT
     /// closes on reconnect.
@@ -417,11 +470,30 @@ pub const SshHandle = struct {
 
     fn deinit(self: *SshHandle) void {
         std.debug.assert(self.channels.count() == 0);
+        // If we own the ClientMux (test-injected; production muxes
+        // are Entry-owned per Part 6), deinit + free it. Channels
+        // are already empty by the assert above, so the mux's own
+        // teardown has nothing left to close.
+        if (self.client_mux_owned) {
+            if (self.client_mux) |mux| {
+                mux.deinit();
+                self.alloc.destroy(mux);
+            }
+        }
         if (self.release_target) |t| self.alloc.free(t);
         if (self.release_jump) |j| self.alloc.free(j);
         self.config.deinit(self.alloc);
         self.channels.deinit(self.alloc);
         self.alloc.destroy(self);
+    }
+
+    /// Test-only: attach a borrowed-or-owned ClientMux to this handle
+    /// so `ghostty_ssh_open_channel` has a real transport to drive.
+    /// Production code reaches the per-Entry mux instead (Part 6 /
+    /// task #23). `owned` selects whether `deinit` frees the mux.
+    fn setClientMuxForTest(self: *SshHandle, mux: *ClientMux, owned: bool) void {
+        self.client_mux = mux;
+        self.client_mux_owned = owned;
     }
 
     /// Dispatch a state change to the embedder's `on_state`. Safe to
@@ -535,8 +607,13 @@ pub const ChannelHandle = struct {
     /// True after the embedder has called ghostty_channel_close (or an
     /// on_close has been fired). Writes after this return SIZE_MAX.
     closed: std.atomic.Value(bool) = .{ .raw = false },
-    /// channel_id allocated by the (future) client mux. Until the
-    /// mux is wired this stays at `invalid_channel_id`.
+    /// ClientMux this channel rides. Cached from the SshHandle at
+    /// open time. Null when the channel was created without a mux
+    /// (production pre-Part-6, or a stub path) — write/eof/close
+    /// then no-op or report terminal failure.
+    client_mux: ?*ClientMux = null,
+    /// channel_id allocated by the ClientMux at open time. Stays at
+    /// `invalid_channel_id` until `ClientMux.openChannel` succeeds.
     channel_id: u32 = protocol.invalid_channel_id,
 
     pub const ChannelState = enum(u32) {
@@ -582,6 +659,92 @@ pub const ChannelHandle = struct {
         self.mutex.unlock();
         if (cb) |f| f(ud, reason, message);
     }
+
+    // =====================================================================
+    // ClientMux bridge — these five functions match the
+    // `ClientMux.Callbacks` vtable shape. The mux passes the
+    // `*ChannelHandle` back as `ctx`; each bridge fn translates the
+    // mux event into the embedder's C `ghostty_channel_callbacks_t`.
+    // All fire on the mux dispatch thread (the worker-thread contract
+    // documented in the header).
+    // =====================================================================
+
+    fn muxOnOpened(ctx: ?*anyopaque, ack: []const u8, peer_window_units: u16) void {
+        const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
+        self.state.store(@intFromEnum(ChannelState.open), .release);
+        self.mutex.lock();
+        const cb = self.callbacks.on_opened;
+        const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+        if (cb) |f| {
+            const ack_ptr: ?*const anyopaque = if (ack.len == 0) null else ack.ptr;
+            // peer_window is advertised in 4 KiB units on the wire;
+            // the C API surfaces a byte count.
+            const window_bytes: u32 = @as(u32, peer_window_units) *| 4096;
+            f(ud, ack_ptr, ack.len, window_bytes);
+        }
+    }
+
+    fn muxOnData(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        const cb = self.callbacks.on_data;
+        const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+        if (cb) |f| {
+            const ptr: ?*const anyopaque = if (bytes.len == 0) null else bytes.ptr;
+            f(ud, ptr, bytes.len);
+        }
+    }
+
+    fn muxOnCredit(ctx: ?*anyopaque, credit_bytes: u32) void {
+        const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        const cb = self.callbacks.on_window_credit;
+        const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+        if (cb) |f| f(ud, credit_bytes);
+    }
+
+    fn muxOnEof(ctx: ?*anyopaque) void {
+        const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        const cb = self.callbacks.on_eof;
+        const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+        if (cb) |f| f(ud);
+    }
+
+    fn muxOnClose(
+        ctx: ?*anyopaque,
+        reason: protocol.ChannelCloseReason,
+        message: []const u8,
+    ) void {
+        const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
+        // Surface the close message as a NUL-terminated C string.
+        // ClientMux's `message` slice is borrowed for this call only;
+        // copy into a stack buffer that outlives the embedder
+        // callback. ChannelClose messages are short reason strings.
+        var msg_buf: [256]u8 = undefined;
+        const msg_ptr: ?[*:0]const u8 = blk: {
+            if (message.len == 0) break :blk null;
+            const n = @min(message.len, msg_buf.len - 1);
+            @memcpy(msg_buf[0..n], message[0..n]);
+            msg_buf[n] = 0;
+            break :blk @ptrCast(&msg_buf[0]);
+        };
+        self.emitClose(ChannelCloseReason.fromProtocol(reason), msg_ptr);
+    }
+
+    /// The `ClientMux.Callbacks` vtable for a ChannelHandle. Static —
+    /// the per-channel identity travels via the `ctx` pointer.
+    const mux_callbacks: ClientMux.Callbacks = .{
+        .on_opened = muxOnOpened,
+        .on_data = muxOnData,
+        .on_credit = muxOnCredit,
+        .on_eof = muxOnEof,
+        .on_close = muxOnClose,
+    };
 };
 
 // =========================================================================
@@ -650,6 +813,23 @@ fn managerFromAppPtr(app: ?*anyopaque) ?*SshConnectionManager {
     const app_ptr = app orelse return null;
     const embedded_app: *apprt_embedded.App = @ptrCast(@alignCast(app_ptr));
     return &embedded_app.core_app.ssh_connection_manager;
+}
+
+/// Map a C `ghostty_channel_service_e` to the wire-protocol
+/// `protocol.ChannelService`. Returns null for values that cannot
+/// open a non-terminal channel: `invalid` (the zero sentinel) and
+/// `terminal` (which rides the legacy session frames via
+/// attach_surface, not the channel mux).
+fn protocolServiceFromC(service: ChannelService) ?protocol.ChannelService {
+    return switch (service) {
+        .invalid, .terminal => null,
+        .tcp_connect => .tcp_connect,
+        .port_listener => .port_listener,
+        .file_transfer => .file_transfer,
+        .browser_proxy => .browser_proxy,
+        .process_exec => .process_exec,
+        .custom => .custom,
+    };
 }
 
 // =========================================================================
@@ -975,9 +1155,16 @@ export fn ghostty_ssh_free(ssh: ?*SshHandle) void {
     h.deinit();
 }
 
-/// Implements `ghostty_ssh_open_channel`. Until the client-side mux
-/// helper lands (TODO(client-mux)), this returns a handle that
-/// immediately reports on_close(SERVICE_ERROR, "client mux not wired").
+/// Implements `ghostty_ssh_open_channel`. Opens a channel through
+/// the connection's `ClientMux`: the returned ChannelHandle is the
+/// `ctx` the mux passes back to the bridge callbacks, which forward
+/// to the embedder's `ghostty_channel_callbacks_t`.
+///
+/// When the connection has no ClientMux (production builds before
+/// Part 6 wires `sshThreadMain` → per-Entry ClientMux; see task
+/// #23), the channel cannot reach a daemon — the handle is still
+/// allocated, but immediately reports `on_close(SERVICE_ERROR)` so
+/// embedders observe the dead-channel edge instead of hanging.
 export fn ghostty_ssh_open_channel(
     ssh: ?*SshHandle,
     service: ChannelService,
@@ -985,69 +1172,143 @@ export fn ghostty_ssh_open_channel(
     params_len: usize,
     callbacks: ?*const ChannelCallbacks,
 ) ?*ChannelHandle {
-    _ = params;
-    _ = params_len;
     const h = ssh orelse return null;
     const cbs = callbacks orelse return null;
     if (h.closed.load(.acquire)) return null;
+
+    const proto_service = protocolServiceFromC(service) orelse {
+        log.warn("ghostty_ssh_open_channel: invalid service {}", .{service});
+        return null;
+    };
 
     const ch = ChannelHandle.init(h.alloc, h, service, cbs) catch |err| {
         log.warn("ghostty_ssh_open_channel: alloc failed: {}", .{err});
         return null;
     };
 
-    // Synthesize an immediate failure until the mux is wired so
-    // embedders' code paths exercise the on_close edge.
-    ch.emitClose(.service_error, null);
+    // No transport yet → synthesize the dead-channel close so the
+    // embedder's on_close edge fires immediately. Production frame
+    // routing lands in Part 6 (task #23).
+    const mux = h.client_mux orelse {
+        ch.emitClose(.service_error, null);
+        return ch;
+    };
+    ch.client_mux = mux;
+
+    // Service params are borrowed for the call; ClientMux.openChannel
+    // copies them into the channel_open frame before returning.
+    const params_slice: []const u8 = if (params) |p|
+        @as([*]const u8, @ptrCast(p))[0..params_len]
+    else
+        &.{};
+
+    const channel_id = mux.openChannel(
+        proto_service,
+        .{},
+        0, // initial_window: 0 → ClientMux uses the negotiated default
+        params_slice,
+        ChannelHandle.mux_callbacks,
+        ch,
+    ) catch |err| {
+        log.warn("ghostty_ssh_open_channel: ClientMux.openChannel failed: {}", .{err});
+        ch.emitClose(.service_error, null);
+        return ch;
+    };
+    ch.channel_id = channel_id;
     return ch;
 }
 
-/// Implements `ghostty_channel_write`.
+/// Implements `ghostty_channel_write`. Routes to
+/// `ClientMux.writeChannel`, returning the number of bytes accepted
+/// (credit-bounded — 0 means "no credit, wait for on_window_credit").
+/// SIZE_MAX signals a terminal error: a closed channel, a channel
+/// that never reached a live mux, or an unknown channel id.
 export fn ghostty_channel_write(
     channel: ?*ChannelHandle,
     bytes: ?*const anyopaque,
     len: usize,
 ) usize {
-    _ = bytes;
     const ch = channel orelse return std.math.maxInt(usize);
     if (ch.closed.load(.acquire)) return std.math.maxInt(usize);
     if (len == 0) return 0;
-    // TODO(client-mux): real credit-based write path will hand off to
-    // ClientMux.writeChannel(ch.channel_id, bytes[0..len]) and return
-    // the number of bytes accepted. For now, every non-empty write
-    // reports terminal failure (SIZE_MAX, per the header contract:
-    // "channel closed; caller should expect on_close shortly"). This
-    // pairs with the synthetic on_close(SERVICE_ERROR) fired from
-    // ghostty_ssh_open_channel so embedders see the channel is dead
-    // immediately instead of parking on credit that will never arrive.
-    return std.math.maxInt(usize);
+
+    // No mux / never opened → terminal error.
+    const mux = ch.client_mux orelse return std.math.maxInt(usize);
+    if (ch.channel_id == protocol.invalid_channel_id) return std.math.maxInt(usize);
+
+    const slice: []const u8 = if (bytes) |p|
+        @as([*]const u8, @ptrCast(p))[0..len]
+    else
+        return std.math.maxInt(usize);
+
+    return mux.writeChannel(ch.channel_id, slice) catch |err| {
+        // UnknownChannel (mux already tore it down), OutOfMemory, or
+        // an fd write error — all are terminal for the channel from
+        // the embedder's perspective.
+        log.debug("ghostty_channel_write: {}", .{err});
+        return std.math.maxInt(usize);
+    };
 }
 
-/// Implements `ghostty_channel_eof`.
+/// Implements `ghostty_channel_eof`. Routes to `ClientMux.channelEof`.
 export fn ghostty_channel_eof(channel: ?*ChannelHandle) void {
     const ch = channel orelse return;
     if (ch.closed.load(.acquire)) return;
-    // TODO(client-mux): ClientMux.channelEof(ch.channel_id)
     ch.state.store(@intFromEnum(ChannelHandle.ChannelState.local_eof), .release);
+
+    const mux = ch.client_mux orelse return;
+    if (ch.channel_id == protocol.invalid_channel_id) return;
+    mux.channelEof(ch.channel_id) catch |err| {
+        log.debug("ghostty_channel_eof: {}", .{err});
+    };
 }
 
-/// Implements `ghostty_channel_close`.
+/// Implements `ghostty_channel_close`. Sends a `channel_close` frame
+/// via `ClientMux.channelClose` (which does NOT fire the mux's
+/// on_close — the embedder initiated this), then fires the
+/// embedder's on_close locally via emitClose so the C API contract
+/// ("close triggers an on_close callback") still holds. emitClose
+/// is idempotent, so a racing daemon-side close is harmless.
 export fn ghostty_channel_close(
     channel: ?*ChannelHandle,
     reason: ChannelCloseReason,
 ) void {
     const ch = channel orelse return;
-    // TODO(client-mux): emit channel_close frame via ClientMux.
-    // The `message` arg to emitClose is NULL today; round-tripping a
-    // reason string from the embedder + back through on_close is a
-    // follow-up alongside the real channel_close-frame plumbing.
+
+    if (ch.client_mux) |mux| {
+        if (ch.channel_id != protocol.invalid_channel_id) {
+            mux.channelClose(ch.channel_id, reason.toProtocol(), "") catch |err| {
+                // UnknownChannel just means the mux already tore it
+                // down (e.g. a daemon-side close raced us) — the
+                // emitClose below is still the right local signal.
+                log.debug("ghostty_channel_close: {}", .{err});
+            };
+        }
+    }
+    // TODO: round-tripping an embedder-supplied reason string back
+    // through on_close is a follow-up — `message` stays NULL.
     ch.emitClose(reason, null);
 }
 
-/// Implements `ghostty_channel_free`.
+/// Implements `ghostty_channel_free`. If the channel is still live
+/// in the ClientMux, tear it down there FIRST — otherwise the mux
+/// would retain a `ctx` pointer to the ChannelHandle we're about to
+/// destroy, and a later inbound frame for that id would fire a
+/// bridge callback on freed memory.
 export fn ghostty_channel_free(channel: ?*ChannelHandle) void {
     const ch = channel orelse return;
-    if (!ch.closed.load(.acquire)) ch.emitClose(.normal, null);
+    if (!ch.closed.load(.acquire)) {
+        // channelClose removes the channel from the mux's registry
+        // (so no further bridge callback can reach this handle) and
+        // does not fire the mux on_close; emitClose delivers the
+        // embedder-facing close.
+        if (ch.client_mux) |mux| {
+            if (ch.channel_id != protocol.invalid_channel_id) {
+                mux.channelClose(ch.channel_id, .normal, "") catch {};
+            }
+        }
+        ch.emitClose(.normal, null);
+    }
     ch.deinit();
 }
 
@@ -2044,3 +2305,429 @@ test "submit_password / cancel_password — no-op without an entry" {
     ghostty_ssh_submit_password(handle, 1, "ignored");
     ghostty_ssh_cancel_password(handle, 1);
 }
+
+// =========================================================================
+// Part 5 tests — C-API ↔ ClientMux bridge over a socketpair.
+//
+// Mirrors the DaemonClientPair pattern from channel_mux.zig: a daemon
+// `Mux` (with an echo service) on one fd, a `ClientMux` on the other,
+// the ClientMux injected into a real SshHandle. Drives the C entry
+// points and asserts bytes round-trip through ghostty_channel_write →
+// daemon echo → the embedder's on_data callback.
+// =========================================================================
+
+const posix = std.posix;
+const channel_mux_test = struct {
+    const Mux = channel_mux.Mux;
+    const Registry = channel_mux.Registry;
+    const Service = channel_mux.Service;
+    const ServiceError = channel_mux.ServiceError;
+    const Channel = channel_mux.Channel;
+};
+
+/// Test echo service for the daemon side — bounces every inbound
+/// channel_data frame straight back. Mirrors channel_mux.zig's
+/// roundtrip_vtable but local to this test block.
+const EchoState = struct {
+    mux: *channel_mux_test.Mux,
+    channel: ?*channel_mux_test.Channel = null,
+};
+
+fn echoOpen(
+    _: ?*anyopaque,
+    mux: *channel_mux_test.Mux,
+    _: u32,
+    _: []const u8,
+    _: []u8,
+) channel_mux_test.ServiceError!channel_mux.Service.OpenResult {
+    const state = try mux.alloc.create(EchoState);
+    state.* = .{ .mux = mux };
+    return .{ .state = state };
+}
+
+fn echoOnOpened(state_ptr: ?*anyopaque, ch: *channel_mux_test.Channel) void {
+    const state: *EchoState = @ptrCast(@alignCast(state_ptr orelse return));
+    state.channel = ch;
+}
+
+fn echoOnData(state_ptr: ?*anyopaque, bytes: []const u8) channel_mux_test.ServiceError!void {
+    const state: *EchoState = @ptrCast(@alignCast(state_ptr orelse return));
+    const ch = state.channel orelse return;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const sent = state.mux.sendChannelData(ch, bytes[off..]) catch
+            return error.ServiceError;
+        if (sent == 0) {
+            _ = state.mux.waitForCredit(ch, 1 * std.time.ns_per_s);
+            continue;
+        }
+        off += sent;
+    }
+}
+
+fn echoOnControl(_: ?*anyopaque, _: u8, _: []const u8) channel_mux_test.ServiceError!void {}
+fn echoOnEof(_: ?*anyopaque) void {}
+fn echoOnClose(state_ptr: ?*anyopaque, _: protocol.ChannelCloseReason, _: []const u8) void {
+    const state: *EchoState = @ptrCast(@alignCast(state_ptr orelse return));
+    state.mux.alloc.destroy(state);
+}
+
+const echo_vtable: channel_mux.Service.VTable = .{
+    .open = echoOpen,
+    .on_opened = echoOnOpened,
+    .on_data = echoOnData,
+    .on_control = echoOnControl,
+    .on_eof = echoOnEof,
+    .on_close = echoOnClose,
+};
+
+const echo_service_id: u8 = @intFromEnum(protocol.ChannelService.tcp_connect);
+
+/// Read one full frame (header + payload) from `fd`. Caller frees
+/// `payload`.
+fn capiReadFrame(alloc: Allocator, fd: posix.fd_t) !struct {
+    header: protocol.Header,
+    payload: []u8,
+} {
+    var header_buf: [protocol.header_size]u8 = undefined;
+    var off: usize = 0;
+    while (off < header_buf.len) {
+        const n = try posix.read(fd, header_buf[off..]);
+        if (n == 0) return error.UnexpectedEof;
+        off += n;
+    }
+    const header = try protocol.Header.parseFromBuf(&header_buf);
+    const payload = try alloc.alloc(u8, header.len);
+    errdefer alloc.free(payload);
+    off = 0;
+    while (off < payload.len) {
+        const n = try posix.read(fd, payload[off..]);
+        if (n == 0) return error.UnexpectedEof;
+        off += n;
+    }
+    return .{ .header = header, .payload = payload };
+}
+
+/// Harness: daemon `Mux` + `ClientMux` over a socketpair, the
+/// ClientMux injected into a real SshHandle, with a background
+/// thread pumping the daemon side.
+const CapiClientPair = struct {
+    a: posix.fd_t, // daemon end
+    b: posix.fd_t, // client end
+    alloc: Allocator,
+    registry: *channel_mux_test.Registry,
+    mux: *channel_mux_test.Mux,
+    client: *ClientMux,
+    daemon_thread: ?std.Thread = null,
+    daemon_stop: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn init(alloc: Allocator) !*CapiClientPair {
+        var fds: [2]posix.fd_t = undefined;
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SocketPairFailed;
+
+        const reg = try alloc.create(channel_mux_test.Registry);
+        reg.* = channel_mux_test.Registry.init(alloc);
+        try reg.register(.{
+            .id = echo_service_id,
+            .name = "echo",
+            .vtable = &echo_vtable,
+        });
+
+        const mux = try alloc.create(channel_mux_test.Mux);
+        mux.* = channel_mux_test.Mux.init(alloc, fds[0], reg);
+
+        const client = try alloc.create(ClientMux);
+        client.* = ClientMux.init(alloc, fds[1]);
+
+        const self = try alloc.create(CapiClientPair);
+        self.* = .{
+            .a = fds[0],
+            .b = fds[1],
+            .alloc = alloc,
+            .registry = reg,
+            .mux = mux,
+            .client = client,
+        };
+        return self;
+    }
+
+    fn startDaemonPump(self: *CapiClientPair) !void {
+        self.daemon_thread = try std.Thread.spawn(.{}, daemonPump, .{self});
+    }
+
+    fn daemonPump(self: *CapiClientPair) void {
+        while (!self.daemon_stop.load(.acquire)) {
+            const frame = capiReadFrame(self.alloc, self.a) catch return;
+            defer self.alloc.free(frame.payload);
+            self.mux.dispatch(frame.header.kind, frame.payload) catch return;
+        }
+    }
+
+    /// Pump a single inbound frame from the client fd into the
+    /// ClientMux dispatch — the test stands in for the production
+    /// SSH read thread (task #23).
+    fn pumpClientOne(self: *CapiClientPair) !void {
+        const frame = try capiReadFrame(self.alloc, self.b);
+        defer self.alloc.free(frame.payload);
+        try self.client.dispatch(frame.header.kind, frame.payload);
+    }
+
+    fn deinit(self: *CapiClientPair) void {
+        self.daemon_stop.store(true, .release);
+        posix.shutdown(self.a, .both) catch {};
+        if (self.daemon_thread) |t| t.join();
+        // client + mux are deinit'd by the SshHandle teardown when the
+        // mux was injected as owned; here we own them directly.
+        self.mux.deinit();
+        self.registry.deinit();
+        posix.close(self.a);
+        posix.close(self.b);
+        self.alloc.destroy(self.mux);
+        self.alloc.destroy(self.registry);
+        self.alloc.destroy(self);
+    }
+};
+
+test "open_channel + write — byte roundtrip through the ClientMux bridge" {
+    const alloc = testing.allocator;
+    const pair = try CapiClientPair.init(alloc);
+    defer pair.deinit();
+    try pair.startDaemonPump();
+
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+
+    // Inject the test ClientMux (borrowed — CapiClientPair.deinit
+    // owns it, so `owned = false`).
+    handle.setClientMuxForTest(pair.client, false);
+
+    // Channel observer — records the bridge's on_data / on_opened.
+    var ch_obs = ChannelObserver{ .alloc = alloc };
+    defer ch_obs.deinit();
+    const ch_cbs = ch_obs.callbacks();
+
+    const ch = ghostty_ssh_open_channel(
+        handle,
+        .tcp_connect,
+        null,
+        0,
+        &ch_cbs,
+    ).?;
+    defer ghostty_channel_free(ch);
+    try testing.expect(ch.channel_id != protocol.invalid_channel_id);
+
+    // The daemon replies channel_opened — pump it into the ClientMux,
+    // which fires the bridge's muxOnOpened → embedder's on_opened.
+    try pair.pumpClientOne();
+    try testing.expect(ch_obs.opened);
+    try testing.expect(ch_obs.peer_window_bytes > 0);
+
+    // Write bytes. Pre-ack the channel may have 0 credit until the
+    // channel_opened grant landed above; loop until accepted.
+    const greeting = "hello over the C API mux";
+    var written: usize = 0;
+    while (written < greeting.len) {
+        const n = ghostty_channel_write(ch, greeting[written..].ptr, greeting.len - written);
+        try testing.expect(n != std.math.maxInt(usize));
+        written += n;
+        if (n == 0) {
+            // No credit — pump an inbound frame (channel_window or the
+            // initial grant) and retry.
+            try pair.pumpClientOne();
+        }
+    }
+
+    // The daemon echo bounces the bytes; pump client frames until the
+    // observer has the full payload.
+    while (ch_obs.dataLen() < greeting.len) {
+        try pair.pumpClientOne();
+    }
+    try testing.expectEqualStrings(greeting, ch_obs.data.items);
+}
+
+test "channel_close — routes through ClientMux and fires on_close" {
+    const alloc = testing.allocator;
+    const pair = try CapiClientPair.init(alloc);
+    defer pair.deinit();
+    try pair.startDaemonPump();
+
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+    handle.setClientMuxForTest(pair.client, false);
+
+    var ch_obs = ChannelObserver{ .alloc = alloc };
+    defer ch_obs.deinit();
+    const ch_cbs = ch_obs.callbacks();
+    const ch = ghostty_ssh_open_channel(handle, .tcp_connect, null, 0, &ch_cbs).?;
+    defer ghostty_channel_free(ch);
+    const id = ch.channel_id;
+    try testing.expect(id != protocol.invalid_channel_id);
+    try pair.pumpClientOne(); // channel_opened
+
+    // Embedder-initiated close: routes to ClientMux.channelClose AND
+    // fires the embedder's on_close locally.
+    ghostty_channel_close(ch, .normal);
+    try testing.expect(ch_obs.closed);
+    try testing.expectEqual(@as(?ChannelCloseReason, .normal), ch_obs.close_reason);
+    // The mux must no longer know the channel.
+    try testing.expect(!pair.client.channels.contains(id));
+}
+
+test "open_channel — no mux reports on_close(SERVICE_ERROR)" {
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+    // No client_mux injected — open_channel must synthesize the close.
+    var ch_obs = ChannelObserver{ .alloc = testing.allocator };
+    defer ch_obs.deinit();
+    const ch_cbs = ch_obs.callbacks();
+    const ch = ghostty_ssh_open_channel(handle, .tcp_connect, null, 0, &ch_cbs).?;
+    defer ghostty_channel_free(ch);
+    try testing.expect(ch_obs.closed);
+    try testing.expectEqual(@as(?ChannelCloseReason, .service_error), ch_obs.close_reason);
+    // Writes against a never-opened channel report terminal failure.
+    try testing.expectEqual(std.math.maxInt(usize), ghostty_channel_write(ch, "x".ptr, 1));
+}
+
+test "open_channel — rejects the terminal + invalid service ids" {
+    var cap: Capture = .{};
+    const cfg = Config{
+        .target = "alice@example.com",
+        .jump = null,
+        .identity_file = null,
+        .keepalive_interval_ms = 0,
+        .max_reconnect_attempts = 5,
+        .reconnect_interval_ms = 1000,
+        .host_key_policy = .tofu,
+        .scrollback_limit_bytes = 0,
+    };
+    const ssh_cbs = cap.cbs();
+    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
+    defer ghostty_ssh_free(handle);
+    var ch_obs = ChannelObserver{ .alloc = testing.allocator };
+    defer ch_obs.deinit();
+    const ch_cbs = ch_obs.callbacks();
+    // `terminal` rides the legacy session frames, not the channel mux.
+    try testing.expect(ghostty_ssh_open_channel(handle, .terminal, null, 0, &ch_cbs) == null);
+    // `invalid` is the zero sentinel.
+    try testing.expect(ghostty_ssh_open_channel(handle, .invalid, null, 0, &ch_cbs) == null);
+}
+
+/// Channel-callback observer for the Part 5 tests — records every
+/// bridge callback so tests can assert on the round-trip.
+const ChannelObserver = struct {
+    alloc: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    opened: bool = false,
+    peer_window_bytes: u32 = 0,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+    credit_total: u64 = 0,
+    eof: bool = false,
+    closed: bool = false,
+    close_reason: ?ChannelCloseReason = null,
+
+    fn deinit(self: *ChannelObserver) void {
+        self.data.deinit(self.alloc);
+    }
+
+    fn dataLen(self: *ChannelObserver) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.data.items.len;
+    }
+
+    fn onOpened(
+        ud: ?*anyopaque,
+        _: ?*const anyopaque,
+        _: usize,
+        initial_peer_window: u32,
+    ) callconv(.c) void {
+        const self: *ChannelObserver = @ptrCast(@alignCast(ud.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.opened = true;
+        self.peer_window_bytes = initial_peer_window;
+    }
+
+    fn onData(ud: ?*anyopaque, bytes: ?*const anyopaque, len: usize) callconv(.c) void {
+        const self: *ChannelObserver = @ptrCast(@alignCast(ud.?));
+        if (bytes == null or len == 0) return;
+        const slice = @as([*]const u8, @ptrCast(bytes.?))[0..len];
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.data.appendSlice(self.alloc, slice) catch {};
+    }
+
+    fn onCredit(ud: ?*anyopaque, credit_bytes: u32) callconv(.c) void {
+        const self: *ChannelObserver = @ptrCast(@alignCast(ud.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.credit_total += credit_bytes;
+    }
+
+    fn onEof(ud: ?*anyopaque) callconv(.c) void {
+        const self: *ChannelObserver = @ptrCast(@alignCast(ud.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.eof = true;
+    }
+
+    fn onClose(
+        ud: ?*anyopaque,
+        reason: ChannelCloseReason,
+        _: ?[*:0]const u8,
+    ) callconv(.c) void {
+        const self: *ChannelObserver = @ptrCast(@alignCast(ud.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.close_reason = reason;
+    }
+
+    fn callbacks(self: *ChannelObserver) ChannelCallbacks {
+        return .{
+            .on_opened = onOpened,
+            .on_data = onData,
+            .on_window_credit = onCredit,
+            .on_eof = onEof,
+            .on_close = onClose,
+            .userdata = self,
+        };
+    }
+};
