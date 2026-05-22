@@ -820,6 +820,7 @@ const Daemon = struct {
                 .surface_count = @intCast(surface_count),
                 .alive_count = @intCast(alive_count),
                 .created_at = created_at,
+                .session_color = group.color,
                 .label = group.label,
             }) catch continue;
         }

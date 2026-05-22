@@ -389,7 +389,9 @@ extension Ghostty.SSHConnection {
             groupID: groupID,
             label: label,
             surfaceCount: entry.surface_count,
-            createdAt: created
+            createdAt: created,
+            status: Ghostty.SessionListStatus.from(entry.status),
+            color: entry.color
         ))
     }
 

@@ -531,6 +531,8 @@ pub const ListEntry = struct {
     alive_count: u16,
     created_at: i64,
     label: []const u8,
+    /// Session color badge: -1 = none, 0-7 = color index.
+    session_color: i8 = -1,
 };
 
 /// Payload for `list_response`:
@@ -541,12 +543,13 @@ pub const ListEntry = struct {
 ///     [2]  surface_count (u16 LE)
 ///     [2]  alive_count (u16 LE)
 ///     [8]  created_at (i64 LE)
+///     [1]  session_color (i8, -1 = none)
 ///     [2]  label_len (u16 LE)
 ///     [label_len] label
 pub const ListResponse = struct {
     entries: []const ListEntry,
 
-    pub const entry_header_size = uuid_size + 1 + 2 + 2 + 8 + 2;
+    pub const entry_header_size = uuid_size + 1 + 2 + 2 + 8 + 1 + 2;
 
     pub fn encode(self: ListResponse, alloc: Allocator) ![]u8 {
         var total: usize = 2; // entry_count
@@ -567,6 +570,8 @@ pub const ListResponse = struct {
             offset += 2;
             std.mem.writeInt(i64, buf[offset..][0..8], e.created_at, .little);
             offset += 8;
+            buf[offset] = @bitCast(e.session_color);
+            offset += 1;
             const label_len: u16 = @intCast(e.label.len);
             std.mem.writeInt(u16, buf[offset..][0..2], label_len, .little);
             offset += 2;
@@ -594,6 +599,8 @@ pub const ListResponse = struct {
             offset += 2;
             const created_at = std.mem.readInt(i64, payload[offset..][0..8], .little);
             offset += 8;
+            const session_color: i8 = @bitCast(payload[offset]);
+            offset += 1;
             const label_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
             offset += 2;
             if (label_len > payload.len - offset) return error.InvalidListPayload;
@@ -603,6 +610,7 @@ pub const ListResponse = struct {
                 .surface_count = surface_count,
                 .alive_count = alive_count,
                 .created_at = created_at,
+                .session_color = session_color,
                 .label = payload[offset..][0..label_len],
             };
             offset += label_len;
@@ -1492,6 +1500,7 @@ test "list response encode/parse" {
             .surface_count = 3,
             .alive_count = 2,
             .created_at = 1700000000,
+            .session_color = 5,
             .label = "my-session",
         },
         .{
@@ -1500,6 +1509,7 @@ test "list response encode/parse" {
             .surface_count = 1,
             .alive_count = 1,
             .created_at = 1700001000,
+            .session_color = -1,
             .label = "other",
         },
     };
@@ -1515,8 +1525,10 @@ test "list response encode/parse" {
     try testing.expectEqual(ListStatus.attached, parsed[0].status);
     try testing.expectEqual(@as(u16, 3), parsed[0].surface_count);
     try testing.expectEqual(@as(u16, 2), parsed[0].alive_count);
+    try testing.expectEqual(@as(i8, 5), parsed[0].session_color);
     try testing.expectEqualStrings("my-session", parsed[0].label);
     try testing.expectEqual(ListStatus.detached, parsed[1].status);
+    try testing.expectEqual(@as(i8, -1), parsed[1].session_color);
     try testing.expectEqualStrings("other", parsed[1].label);
 }
 

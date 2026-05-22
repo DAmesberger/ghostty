@@ -359,6 +359,46 @@ struct SSHTests {
         #expect(Ghostty.SSHChannel<Ghostty.TerminalService>.CloseReason.from(c) == swift)
     }
 
+    // MARK: - SessionListEntry color + status (Phase 6D expansion)
+
+    @Test
+    func sessionListEntryColorAndStatusRoundTrip() {
+        let entry = Ghostty.SessionListEntry(
+            groupID: UUID(),
+            label: "test",
+            surfaceCount: 2,
+            createdAt: Date(),
+            status: Ghostty.SessionListStatus.attached,
+            color: 3
+        )
+        #expect(entry.color == 3)
+        #expect(entry.status == Ghostty.SessionListStatus.attached)
+    }
+
+    @Test
+    func sessionListEntryDefaultsToDetachedNoColor() {
+        let entry = Ghostty.SessionListEntry(
+            groupID: UUID(),
+            label: "",
+            surfaceCount: 0,
+            createdAt: Date()
+        )
+        #expect(entry.color == -1)
+        #expect(entry.status == Ghostty.SessionListStatus.detached)
+    }
+
+    @Test(arguments: [
+        (GHOSTTY_SSH_SESSION_DETACHED, Ghostty.SessionListStatus.detached),
+        (GHOSTTY_SSH_SESSION_ATTACHED, Ghostty.SessionListStatus.attached),
+        (GHOSTTY_SSH_SESSION_DEAD,     Ghostty.SessionListStatus.dead),
+    ])
+    func sessionListStatusMapping(
+        _ c: ghostty_ssh_session_status_e,
+        _ swift: Ghostty.SessionListStatus
+    ) {
+        #expect(Ghostty.SessionListStatus.from(c) == swift)
+    }
+
     // MARK: - InboundChannel (Phase 6D Part 5)
 
     @Test
@@ -418,3 +458,4 @@ struct SSHTests {
 // MARK: - Equatable conformances for test convenience
 
 extension Ghostty.SSHChannel.CloseReason: Equatable {}
+extension Ghostty.SessionListStatus: Equatable {}

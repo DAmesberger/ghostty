@@ -1355,9 +1355,16 @@ typedef struct {
   void* userdata;
 } ghostty_channel_callbacks_t;
 
+// Lifecycle status of a session entry.
+typedef enum {
+  GHOSTTY_SSH_SESSION_DETACHED = 0, // alive, no client attached
+  GHOSTTY_SSH_SESSION_ATTACHED = 1, // alive, at least one viewer
+  GHOSTTY_SSH_SESSION_DEAD     = 2, // all surfaces have exited
+} ghostty_ssh_session_status_e;
+
 // Session list entry surfaced via ghostty_ssh_list_sessions. All
 // pointers are valid only for the callback's duration. surface_count
-// is the number of attached surfaces in the session.
+// is the number of surfaces (alive or dead) in the session group.
 typedef struct {
   // 16-byte group UUID, raw bytes (no NUL).
   const uint8_t* group_id;
@@ -1366,6 +1373,10 @@ typedef struct {
   uint32_t surface_count;
   // Wall-clock nanos when the session was created.
   int64_t created_at_ns;
+  // Lifecycle status of the session (detached/attached/dead).
+  ghostty_ssh_session_status_e status;
+  // Color badge index: -1 = none, 0-7 = color palette slot.
+  int8_t color;
 } ghostty_ssh_session_entry_t;
 
 //-------------------------------------------------------------------

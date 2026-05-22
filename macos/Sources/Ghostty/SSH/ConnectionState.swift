@@ -258,18 +258,49 @@ extension Ghostty {
         }
     }
 
+    /// Lifecycle status of a remote session, mirroring `ghostty_ssh_session_status_e`.
+    public enum SessionListStatus: Sendable {
+        /// Session is alive but no client is attached.
+        case detached
+        /// Session is alive and at least one viewer is attached.
+        case attached
+        /// All surfaces in the session have exited.
+        case dead
+
+        static func from(_ c: ghostty_ssh_session_status_e) -> SessionListStatus {
+            switch c {
+            case GHOSTTY_SSH_SESSION_ATTACHED: return .attached
+            case GHOSTTY_SSH_SESSION_DEAD: return .dead
+            default: return .detached
+            }
+        }
+    }
+
     /// An entry returned from `SSHConnection.listSessions()`.
     public struct SessionListEntry: Sendable {
         public let groupID: UUID
         public let label: String
         public let surfaceCount: UInt32
         public let createdAt: Date
+        /// Lifecycle status of the session.
+        public let status: SessionListStatus
+        /// Color badge index: -1 = none, 0-7 = color palette slot.
+        public let color: Int8
 
-        public init(groupID: UUID, label: String, surfaceCount: UInt32, createdAt: Date) {
+        public init(
+            groupID: UUID,
+            label: String,
+            surfaceCount: UInt32,
+            createdAt: Date,
+            status: SessionListStatus = .detached,
+            color: Int8 = -1
+        ) {
             self.groupID = groupID
             self.label = label
             self.surfaceCount = surfaceCount
             self.createdAt = createdAt
+            self.status = status
+            self.color = color
         }
     }
 

@@ -329,12 +329,29 @@ pub const ChannelCallbacks = extern struct {
     userdata: ?*anyopaque,
 };
 
+/// Mirror of `ghostty_ssh_session_status_e`.
+pub const SessionStatus = enum(c_int) {
+    detached = 0,
+    attached = 1,
+    dead = 2,
+
+    fn fromProtocol(s: protocol.ListStatus) SessionStatus {
+        return switch (s) {
+            .detached => .detached,
+            .attached => .attached,
+            .dead => .dead,
+        };
+    }
+};
+
 /// Mirror of `ghostty_ssh_session_entry_t`.
 pub const SessionEntry = extern struct {
     group_id: [*]const u8, // 16 bytes
     label: [*:0]const u8,
     surface_count: u32,
     created_at_ns: i64,
+    status: SessionStatus,
+    color: i8,
 };
 
 // =========================================================================
@@ -1655,6 +1672,8 @@ export fn ghostty_ssh_list_sessions(
                     .label = @ptrCast(&label_buf[0]),
                     .surface_count = list_entry.surface_count,
                     .created_at_ns = list_entry.created_at,
+                    .status = SessionStatus.fromProtocol(list_entry.status),
+                    .color = list_entry.session_color,
                 };
                 self.cb(self.userdata, &se);
             }
