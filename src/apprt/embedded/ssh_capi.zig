@@ -23,19 +23,16 @@
 //!     `_eof` / `_close` all route through a real ClientMux, and
 //!     the five `ChannelHandle.mux*` bridge callbacks forward mux
 //!     events to the embedder's `ghostty_channel_callbacks_t`.
-//!   * What's NOT wired in this build: a production ClientMux fed
-//!     by a live SSH connection. A ClientMux needs an fd; an SSH
-//!     connection carries its bytes over a libssh2 channel, not a
-//!     kernel fd, and that channel is driven solely by
-//!     `SshConnectionManager.sshThreadMain`. Routing inbound
-//!     channel-kind frames (27, 30-36) from `sshThreadMain` into a
-//!     per-Entry ClientMux — and giving the ClientMux an outbound
-//!     path onto the libssh2 channel — is Phase 6C / task #23.
-//!     Until then `SshHandle.client_mux` is null on real
-//!     connections, so `ghostty_ssh_open_channel` allocates the
-//!     handle then immediately reports `on_close(SERVICE_ERROR)`.
-//!     Unit tests inject a socketpair-backed ClientMux directly
-//!     (`setClientMuxForTest`) and exercise the full bridge.
+//!   * Production ClientMux wiring is now live. When the SSH
+//!     connection reaches `.connected`, `onStateListener` invokes
+//!     `wireMuxTransport` which spins up a
+//!     `SshChannelStreamTransport` against the daemon channel held
+//!     on the Entry and attaches a fresh `ClientMux` to the
+//!     SshHandle. `ghostty_ssh_open_channel`, `ghostty_channel_*`,
+//!     and inbound-channel callbacks all route through this mux.
+//!     Unit tests still inject a socketpair-backed ClientMux
+//!     directly via `setClientMuxForTest` to exercise the bridge
+//!     without standing up real libssh2.
 //!
 //! Still gated on a follow-up:
 //!
@@ -425,15 +422,16 @@ pub const SshHandle = struct {
     /// `ghostty_ssh_open_channel` and the channel write/eof/close
     /// entry points.
     ///
-    /// Part 5 (this commit) wires the C-API ↔ ClientMux bridge but
-    /// does NOT itself construct a production ClientMux: the mux
-    /// needs an fd, and a live SSH connection has none (frames ride
-    /// a libssh2 channel, not a kernel fd). Production frame routing
-    /// — a per-Entry ClientMux fed by `sshThreadMain` — lands in
-    /// Part 6 (task #23). Until then this stays null on real
-    /// connections and `ghostty_ssh_open_channel` reports a clear
-    /// "transport not wired" close. Unit tests inject a
-    /// socketpair-backed ClientMux directly via `setClientMuxForTest`.
+    /// Auto-wired by `onStateListener` when the SSH connection
+    /// reaches `.connected`: a second libssh2 channel is opened via
+    /// `SshConnectionManager.tryOpenChannel` and handed to
+    /// `wireMuxTransport`, which wraps it in a
+    /// `SshChannelStreamTransport` + `ClientMux`. The second channel
+    /// is dedicated to the mux protocol so it doesn't race with the
+    /// SSH thread's reads on `Entry.channel`. Non-null after the
+    /// `.connected` broadcast unless the channel open failed.
+    /// Unit tests inject a socketpair-backed ClientMux directly via
+    /// `setClientMuxForTest` to exercise the bridge without libssh2.
     client_mux: ?*ClientMux = null,
     /// True when this handle owns `client_mux` and must deinit+free
     /// it on teardown. False when the mux is borrowed (the future
@@ -592,10 +590,39 @@ pub const SshHandle = struct {
         }
     }
 
+    /// Tear down the production transport + ClientMux while keeping the
+    /// SshHandle alive (e.g. on reconnect or SSH drop before full close).
+    /// Broadcasts TRANSPORT close to any live channel handles, then
+    /// sequences transport.close() → mux.deinit() → alloc.destroy().
+    /// Safe to call when no transport is wired (no-op).
+    fn tearMuxTransport(self: *SshHandle) void {
+        // Broadcast TRANSPORT close to live channels BEFORE stopping the
+        // transport threads, so callbacks fire while the mux is still valid.
+        self.mutex.lock();
+        var snapshot = std.ArrayList(*ChannelHandle).empty;
+        defer snapshot.deinit(self.alloc);
+        var it = self.channels.iterator();
+        while (it.next()) |entry| snapshot.append(self.alloc, entry.value_ptr.*) catch {};
+        self.mutex.unlock();
+        for (snapshot.items) |ch| ch.emitClose(.transport, null);
+
+        const saved_transport = self.transport;
+        self.transport = null;
+        if (saved_transport) |t| t.close();
+
+        if (self.client_mux_owned) {
+            if (self.client_mux) |mux| {
+                mux.deinit();
+                self.alloc.destroy(mux);
+            }
+        }
+        self.client_mux = null;
+        self.client_mux_owned = false;
+        if (saved_transport) |t| self.alloc.destroy(t);
+    }
+
     /// Test-only: attach a borrowed-or-owned ClientMux to this handle
     /// so `ghostty_ssh_open_channel` has a real transport to drive.
-    /// Production code reaches the per-Entry mux instead (Part 6 /
-    /// task #23). `owned` selects whether `deinit` frees the mux.
     fn setClientMuxForTest(self: *SshHandle, mux: *ClientMux, owned: bool) void {
         self.client_mux = mux;
         self.client_mux_owned = owned;
@@ -777,6 +804,34 @@ pub const SshHandle = struct {
         // but a state already in flight on the SSH thread could race
         // past the unregister.
         if (self.closed.load(.acquire)) return;
+
+        switch (state) {
+            .connected => {
+                // Open a dedicated second channel for the ClientMux so it
+                // doesn't race with the SSH thread reading entry.channel.
+                // We are on the SSH thread here, so the libssh2 call is safe.
+                // wireMuxTransport is idempotent — reconnects that reach
+                // .connected again while a transport is live are no-ops.
+                if (self.transport == null) {
+                    if (self.entry) |entry| {
+                        if (SshConnectionManager.tryOpenChannel(entry)) |mux_chan| {
+                            self.wireMuxTransport(mux_chan);
+                        } else {
+                            log.warn("onStateListener: failed to open mux channel; " ++
+                                "inbound channels will not be available", .{});
+                        }
+                    }
+                }
+            },
+            .disconnected, .failed => {
+                // Tear down the existing transport so live channel handles
+                // receive a TRANSPORT close. The next .connected broadcast
+                // (from a reconnect) will re-wire it.
+                if (self.transport != null) self.tearMuxTransport();
+            },
+            else => {},
+        }
+
         self.emitStateFromConnectionState(state);
     }
 };
