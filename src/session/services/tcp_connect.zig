@@ -20,6 +20,7 @@
 //! Opened service_ack: empty (the channel works the moment ok is
 //! reported; resolved address details are not exposed today).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -303,6 +304,8 @@ fn dialTcp(alloc: Allocator, host: []const u8, port: u16) !posix.fd_t {
 }
 
 fn setTcpNoDelay(fd: posix.fd_t) !void {
+    // std.posix.TCP is `void` on iOS, so NODELAY is unavailable there.
+    if (comptime builtin.os.tag == .ios) return;
     const yes: c_int = 1;
     try posix.setsockopt(
         fd,

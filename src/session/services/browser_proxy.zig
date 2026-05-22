@@ -33,6 +33,7 @@
 //! Control ops (reserved for future use, ignored for v1):
 //!   * op=1 keep_alive_hint — peer says "don't reap this idle channel".
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -297,6 +298,10 @@ fn dialTcp(alloc: Allocator, host: []const u8, port: u16) !posix.fd_t {
 }
 
 fn setTcpNoDelay(fd: posix.fd_t) !void {
+    // std.posix.TCP is `void` on iOS, so NODELAY is unavailable there.
+    // Skip the optimisation on platforms that don't expose it; latency
+    // tuning is a daemon-side concern and iOS isn't a daemon target.
+    if (comptime builtin.os.tag == .ios) return;
     const yes: c_int = 1;
     try posix.setsockopt(
         fd,

@@ -238,6 +238,8 @@ fn pumpLoop(state: *AcceptedState) !void {
 // =========================================================================
 
 fn setTcpNoDelay(fd: posix.fd_t) !void {
+    // std.posix.TCP is `void` on iOS, so NODELAY is unavailable there.
+    if (comptime builtin.os.tag == .ios) return;
     const yes: c_int = 1;
     try posix.setsockopt(
         fd,
