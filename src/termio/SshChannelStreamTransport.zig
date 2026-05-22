@@ -135,6 +135,14 @@ pub fn init(alloc: Allocator, config: Config) !*SshChannelStreamTransport {
     rt.setName("ssh-chan-rx") catch {};
     self.reader_thread = rt;
 
+    // If the writer spawn fails, the reader is already live and holds a
+    // pointer to `self`. We must join it before errdefer fires alloc.destroy.
+    errdefer {
+        self.stopped.store(true, .release);
+        _ = posix.write(self.stop_pipe[1], "x") catch {};
+        if (self.reader_thread) |t| t.join();
+    }
+
     const wt = try std.Thread.spawn(.{}, writerLoop, .{self});
     wt.setName("ssh-chan-tx") catch {};
     self.writer_thread = wt;
@@ -287,12 +295,7 @@ fn writerLoop(self: *SshChannelStreamTransport) void {
             if (self.stopped.load(.acquire)) return;
 
             self.ssh_mutex.lock();
-            const wrc = ssh2.libssh2_channel_write_ex(
-                @ptrCast(self.config.channel.inner),
-                0,
-                @ptrCast(buf[written..n].ptr),
-                n - written,
-            );
+            const wrc = self.config.channel.writeNonBlock(buf[written..n]);
             self.ssh_mutex.unlock();
 
             if (wrc > 0) {
@@ -300,8 +303,7 @@ fn writerLoop(self: *SshChannelStreamTransport) void {
                 continue;
             }
             if (wrc == ssh2.LIBSSH2_ERROR_EAGAIN) {
-                // Poll until the channel is ready for writing.
-                pollForWrite(poll_sock, self.config.channel.ssh_session, self.stop_pipe[0]);
+                pollForWrite(poll_sock, self.stop_pipe[0]);
                 continue;
             }
             if (!self.stopped.load(.acquire)) {
@@ -333,14 +335,9 @@ fn pollForRead(sock: posix.fd_t, stop_fd: posix.fd_t) void {
     _ = c.poll(&fds, 2, 100);
 }
 
-fn pollForWrite(sock: posix.fd_t, session_ptr: anytype, stop_fd: posix.fd_t) void {
-    const dir = ssh2.libssh2_session_block_directions(@ptrCast(session_ptr));
-    var events: c_short = 0;
-    if (dir & ssh2.LIBSSH2_SESSION_BLOCK_INBOUND != 0) events |= c.POLLIN;
-    if (dir & ssh2.LIBSSH2_SESSION_BLOCK_OUTBOUND != 0) events |= c.POLLOUT;
-    if (events == 0) events = c.POLLOUT;
+fn pollForWrite(sock: posix.fd_t, stop_fd: posix.fd_t) void {
     var fds = [2]c.struct_pollfd{
-        .{ .fd = sock, .events = events, .revents = 0 },
+        .{ .fd = sock, .events = c.POLLOUT, .revents = 0 },
         .{ .fd = stop_fd, .events = c.POLLIN, .revents = 0 },
     };
     _ = c.poll(&fds, 2, 100);
@@ -407,9 +404,7 @@ test "SshChannelStreamTransport: integration round-trip via ssh localhost" {
     defer ssh_session.close();
 
     const user = posix.getenv("USER") orelse "root";
-    ssh_session.authAgent(user) catch
-        (ssh_session.authAuto(user) catch
-        return error.SkipZigTest);
+    ssh_session.authAuto(user) catch return error.SkipZigTest;
 
     // Run `cat` on the channel so writes echo back.
     var ch = ssh_session.openChannel() catch return error.SkipZigTest;

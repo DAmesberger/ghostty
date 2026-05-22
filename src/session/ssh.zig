@@ -612,6 +612,13 @@ pub const Channel = struct {
         }
     }
 
+    /// Non-blocking write. Returns bytes written, LIBSSH2_ERROR_EAGAIN if the
+    /// channel is not ready, or another negative error code on failure. Caller
+    /// must ensure the session is in non-blocking mode.
+    pub fn writeNonBlock(self: *Channel, buf: []const u8) isize {
+        return channelWrite(self.inner, buf.ptr, buf.len);
+    }
+
     /// Check if the remote end has sent EOF.
     pub fn eof(self: *Channel) bool {
         return ssh2.libssh2_channel_eof(self.inner) != 0;
