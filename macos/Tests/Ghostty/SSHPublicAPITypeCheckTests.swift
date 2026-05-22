@@ -87,4 +87,11 @@ final class SSHPublicAPITypeCheckTests: XCTestCase {
             attemptsMade: 3, reason: .exhausted)
         XCTAssertEqual(disconnect.attemptsMade, 3)
     }
+
+    func testSessionManagementMethodsVisible() {
+        // Verify renameSession and killSession are reachable as unbound method
+        // references (never called — just a compile-time reachability check).
+        let _: (Ghostty.SSHConnection) -> (UUID, String) -> Void = Ghostty.SSHConnection.renameSession
+        let _: (Ghostty.SSHConnection) -> (UUID) -> Void = Ghostty.SSHConnection.killSession
+    }
 }
