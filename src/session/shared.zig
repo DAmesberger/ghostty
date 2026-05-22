@@ -101,9 +101,75 @@ pub fn allViewersSupportsCompression(viewers: []const @import("remote_session.zi
 
 /// Zero-fill a buffer before freeing it, preventing sensitive data
 /// (passwords, keys) from lingering in deallocated memory.
+///
+/// Uses std.crypto.secureZero (volatile pointer barrier) so the compiler
+/// cannot treat the zero-fill as a dead store before deallocation.
+/// Calls rawFree directly to avoid Allocator.free's debug undefined-fill
+/// clobbering the zeros.
 pub fn secureZeroAndFree(alloc: Allocator, buf: []const u8) void {
-    @memset(@constCast(buf), 0);
-    alloc.free(@constCast(buf));
+    const mutable: []u8 = @constCast(buf);
+    std.crypto.secureZero(u8, mutable);
+    alloc.rawFree(mutable, .fromByteUnits(@alignOf(u8)), @returnAddress());
+}
+
+test "secureZeroAndFree zeroes buffer before free" {
+    // RecordingAllocator snapshots buffer contents just before forwarding
+    // free() to the backing allocator.  If the compiler elided the secure
+    // zero the snapshot would still contain the original non-zero pattern.
+    const RecordingAllocator = struct {
+        backing: Allocator,
+        snapshot: [256]u8 = undefined,
+        snapshot_len: usize = 0,
+
+        fn vtFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const copy_len = @min(buf.len, self.snapshot.len);
+            @memcpy(self.snapshot[0..copy_len], buf[0..copy_len]);
+            self.snapshot_len = copy_len;
+            self.backing.rawFree(buf, alignment, ret_addr);
+        }
+
+        fn vtAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+
+        fn vtResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawResize(buf, alignment, new_len, ret_addr);
+        }
+
+        fn vtRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawRemap(buf, alignment, new_len, ret_addr);
+        }
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = vtAlloc,
+                .resize = vtResize,
+                .remap = vtRemap,
+                .free = vtFree,
+            } };
+        }
+    };
+
+    const testing = std.testing;
+    var rec = RecordingAllocator{ .backing = testing.allocator };
+    const a = rec.allocator();
+
+    const len = 32;
+    const secret_pattern: u8 = 0xAB;
+    const buf = try a.alloc(u8, len);
+    @memset(buf, secret_pattern);
+
+    secureZeroAndFree(a, buf);
+
+    // All bytes in the snapshot must be zero — not the original 0xAB pattern.
+    try testing.expectEqual(len, rec.snapshot_len);
+    for (rec.snapshot[0..rec.snapshot_len]) |b| {
+        try testing.expectEqual(@as(u8, 0), b);
+    }
 }
 
 pub const ControlCommand = enum {
