@@ -14,7 +14,7 @@ extension Ghostty {
     ///
     /// The protocol is `Sendable` because services are passed across actor
     /// boundaries on the open path.
-    protocol ChannelService: Sendable {
+    public protocol ChannelService: Sendable {
         var cService: ghostty_channel_service_e { get }
         /// Bytes copied by libghostty during `ghostty_ssh_open_channel`. May
         /// be empty for services with no per-open parameters.
@@ -32,10 +32,10 @@ extension Ghostty {
     /// than `openChannel(TerminalService())` for new terminal sessions — the
     /// attach helper drives the legacy session-protocol open path that survives
     /// reconnects by `(groupID, surfaceID)`.
-    struct TerminalService: ChannelService {
-        init() {}
-        var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TERMINAL }
-        func encodeParams() throws -> Data { Data() }
+    public struct TerminalService: ChannelService {
+        public init() {}
+        public var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TERMINAL }
+        public func encodeParams() throws -> Data { Data() }
     }
 
     /// Open a raw TCP connection through the remote host.
@@ -43,24 +43,24 @@ extension Ghostty {
     /// Wire format (matches `src/session/services/tcp_connect.zig`):
     ///
     ///     [u16 LE host_len][host UTF-8 bytes][u16 LE port]
-    struct TCPConnectService: ChannelService {
+    public struct TCPConnectService: ChannelService {
         /// Max accepted host length on the daemon side. Mirrors
         /// `tcp_connect.zig`'s `max_host_len` — the daemon will reject
         /// `error.InvalidRequest` if this is exceeded; we mirror the limit
         /// so the wire stays clean.
-        static let maxHostLen: Int = 255
+        public static let maxHostLen: Int = 255
 
-        let host: String
-        let port: UInt16
+        public let host: String
+        public let port: UInt16
 
-        init(host: String, port: UInt16) {
+        public init(host: String, port: UInt16) {
             self.host = host
             self.port = port
         }
 
-        var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT }
+        public var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT }
 
-        func encodeParams() throws -> Data {
+        public func encodeParams() throws -> Data {
             let hostBytes = Array(host.utf8)
             guard hostBytes.count <= Self.maxHostLen else {
                 throw Ghostty.SSHError.openParamsTooLong(
@@ -83,20 +83,20 @@ extension Ghostty {
     /// integration test in task #6 must verify the layout matches.
     ///
     ///     [u16 LE bind_host_len][bind_host UTF-8 bytes][u16 LE port]
-    struct PortListenerService: ChannelService {
-        static let maxBindHostLen: Int = 255
+    public struct PortListenerService: ChannelService {
+        public static let maxBindHostLen: Int = 255
 
-        let bindHost: String
-        let port: UInt16
+        public let bindHost: String
+        public let port: UInt16
 
-        init(bindHost: String, port: UInt16) {
+        public init(bindHost: String, port: UInt16) {
             self.bindHost = bindHost
             self.port = port
         }
 
-        var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER }
+        public var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER }
 
-        func encodeParams() throws -> Data {
+        public func encodeParams() throws -> Data {
             let hostBytes = Array(bindHost.utf8)
             guard hostBytes.count <= Self.maxBindHostLen else {
                 throw Ghostty.SSHError.openParamsTooLong(
@@ -122,11 +122,11 @@ extension Ghostty {
     ///     ── upload-only trailer ──
     ///     [32-byte expected_sha256]  // all-zero = skip verification
     ///     [u64 LE total_size]        // 0 = unknown
-    struct FileTransferService: ChannelService {
-        static let maxPathLen: Int = 4096
-        static let sha256Length: Int = 32
+    public struct FileTransferService: ChannelService {
+        public static let maxPathLen: Int = 4096
+        public static let sha256Length: Int = 32
 
-        enum Operation: Sendable {
+        public enum Operation: Sendable {
             /// Upload a file to the remote daemon. `expectedSHA256`, when
             /// 32 bytes, is verified at completion; pass `nil` (or empty)
             /// to skip. `totalSize == 0` signals "unknown".
@@ -140,15 +140,15 @@ extension Ghostty {
             case download(remotePath: String)
         }
 
-        let operation: Operation
+        public let operation: Operation
 
-        init(operation: Operation) {
+        public init(operation: Operation) {
             self.operation = operation
         }
 
-        var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_FILE_TRANSFER }
+        public var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_FILE_TRANSFER }
 
-        func encodeParams() throws -> Data {
+        public func encodeParams() throws -> Data {
             var out = Data()
             switch operation {
             case let .upload(path, mode, expected, totalSize):
@@ -202,25 +202,25 @@ extension Ghostty {
     ///     [host UTF-8 bytes]
     ///     [u16 LE port]
     ///     [metadata UTF-8 bytes; may be empty]
-    struct BrowserProxyService: ChannelService {
-        static let maxHostLen: Int = 255
-        static let maxMetadataLen: Int = 8 * 1024
+    public struct BrowserProxyService: ChannelService {
+        public static let maxHostLen: Int = 255
+        public static let maxMetadataLen: Int = 8 * 1024
 
         /// Mirrors `browser_proxy.zig`'s `UpstreamKind` enum byte values
         /// (browser_proxy.zig:80-85). Raw value IS the wire-byte the daemon
         /// expects.
-        enum UpstreamKind: UInt8, Sendable {
+        public enum UpstreamKind: UInt8, Sendable {
             case direct = 0
             case httpConnectTarget = 1
             case socks5Target = 2
         }
 
-        let upstreamKind: UpstreamKind
-        let host: String
-        let port: UInt16
-        let metadata: Data
+        public let upstreamKind: UpstreamKind
+        public let host: String
+        public let port: UInt16
+        public let metadata: Data
 
-        init(
+        public init(
             upstreamKind: UpstreamKind,
             host: String,
             port: UInt16,
@@ -232,9 +232,9 @@ extension Ghostty {
             self.metadata = metadata
         }
 
-        var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_BROWSER_PROXY }
+        public var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_BROWSER_PROXY }
 
-        func encodeParams() throws -> Data {
+        public func encodeParams() throws -> Data {
             let hostBytes = Array(host.utf8)
             guard hostBytes.count <= Self.maxHostLen else {
                 throw Ghostty.SSHError.openParamsTooLong(

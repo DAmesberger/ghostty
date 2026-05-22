@@ -25,29 +25,29 @@ extension Ghostty {
     /// wrapper hops every callback through `AsyncStream` continuations and
     /// `MainActor`-isolated property updates, so the public API can be
     /// called from any concurrency context.
-    final class SSHConnection: @unchecked Sendable {
+    public final class SSHConnection: @unchecked Sendable {
         // MARK: Configuration
 
-        struct Config: Sendable {
+        public struct Config: Sendable {
             /// "user@host[:port]".
-            let target: String
+            public let target: String
             /// Comma-separated jump-host chain. Empty = direct connect.
-            let jump: String
+            public let jump: String
             /// Path to an identity file. Empty = let libssh2 try the agent +
             /// default identities under ~/.ssh.
-            let identityFile: String
+            public let identityFile: String
             /// SSH keepalive interval; 0 uses libghostty default (15 s).
-            let keepaliveIntervalMs: UInt32
+            public let keepaliveIntervalMs: UInt32
             /// Reconnect attempts after an unexpected drop. 0 disables auto-
             /// reconnect entirely; UINT32_MAX gives the libghostty default.
-            let maxReconnectAttempts: UInt32
+            public let maxReconnectAttempts: UInt32
             /// Initial backoff; doubles per attempt, capped at 60 s. 0 uses
             /// libghostty default (1000 ms).
-            let reconnectIntervalMs: UInt32
+            public let reconnectIntervalMs: UInt32
             /// Soft cap on per-surface scrollback bytes; 0 = daemon default.
-            let scrollbackLimitBytes: UInt32
+            public let scrollbackLimitBytes: UInt32
 
-            init(
+            public init(
                 target: String,
                 jump: String = "",
                 identityFile: String = "",
@@ -69,16 +69,16 @@ extension Ghostty {
         // MARK: Public surface
 
         /// All connection state transitions, including the initial `connecting`.
-        let state: AsyncStream<ConnectionState>
+        public let state: AsyncStream<ConnectionState>
 
         /// The most recent state snapshot. Read this on `MainActor` for a
         /// stable value; off-actor reads are safe but may observe a value
         /// that was just superseded.
-        @MainActor private(set) var currentState: ConnectionState = .connecting
+        @MainActor public private(set) var currentState: ConnectionState = .connecting
 
         /// Combine bridge over `state`. The subject is fed alongside the
         /// `AsyncStream` so consumers always see a value on subscribe.
-        var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
+        public var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
             stateSubject.eraseToAnyPublisher()
         }
 
@@ -114,7 +114,7 @@ extension Ghostty {
         /// no-CoreApp stub path (synchronous CONNECTING emit, no real
         /// `SshConnectionManager`), which is what unit tests exercise.
         /// Production callers always pass a real `ghostty_app_t`.
-        init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t?) throws {
+        public init(config: Config, hostKey: HostKeyHandler = .strict, app: ghostty_app_t?) throws {
             self.hostKeyHandler = hostKey
             self.stateSubject = CurrentValueSubject(.connecting)
             self.handle = nil
@@ -200,7 +200,7 @@ extension Ghostty {
         /// Open a typed channel. Returns once the C-side open call is in-
         /// flight; subscribe to the channel's `events` stream for the
         /// `opened` event (success) or `closed` event (failure).
-        func openChannel<S: ChannelService>(_ service: S) throws -> SSHChannel<S> {
+        public func openChannel<S: ChannelService>(_ service: S) throws -> SSHChannel<S> {
             let params = try service.encodeParams()
 
             // Construct the wrapper + box up front and wire the box to the
@@ -242,7 +242,7 @@ extension Ghostty {
 
         /// Attach (or re-attach) a terminal surface over this connection.
         /// Pass `nil` for either UUID to let libghostty generate one.
-        func attachSurface(
+        public func attachSurface(
             groupID: UUID?,
             surfaceID: UUID?,
             size: TerminalSize,
@@ -286,7 +286,7 @@ extension Ghostty {
             return channel
         }
 
-        func listSessions() async throws -> [SessionListEntry] {
+        public func listSessions() async throws -> [SessionListEntry] {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[SessionListEntry], Swift.Error>) in
                 let collector = SessionListCollector(continuation: cont)
                 let ptr = Unmanaged.passRetained(collector).toOpaque()
@@ -300,11 +300,11 @@ extension Ghostty {
             }
         }
 
-        func requestReconnect() {
+        public func requestReconnect() {
             ghostty_ssh_request_reconnect(requireHandle())
         }
 
-        func cancelReconnect() {
+        public func cancelReconnect() {
             ghostty_ssh_cancel_reconnect(requireHandle())
         }
 
