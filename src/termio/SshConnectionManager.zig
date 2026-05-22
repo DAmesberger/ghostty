@@ -970,7 +970,8 @@ fn reopenSurfaces(entry: *Entry) void {
 
 /// Try to open a multiplexed channel, restarting the daemon if needed.
 /// Copies remote_bin_path under surfaces_mutex to avoid racing with setupConnection.
-fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
+/// Public so the C-API layer can open a dedicated mux channel from the SSH thread.
+pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     const alloc = entry.alloc;
 
     // Copy remote_bin_path under mutex — setupConnection writes it from another thread.
