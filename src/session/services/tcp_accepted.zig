@@ -22,6 +22,7 @@
 //! service_open_params layout (daemon-local, never on the wire):
 //!   [4]  fd  i32 LE   — the accepted socket fd, already owned by us
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
