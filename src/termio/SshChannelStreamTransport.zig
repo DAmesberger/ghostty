@@ -115,8 +115,7 @@ pub fn init(alloc: Allocator, config: Config) !*SshChannelStreamTransport {
         posix.close(fds[1]);
     }
 
-    var stop_fds: [2]posix.fd_t = undefined;
-    try posix.pipe(&stop_fds);
+    const stop_fds = try posix.pipe();
     errdefer {
         posix.close(stop_fds[0]);
         posix.close(stop_fds[1]);
@@ -206,14 +205,10 @@ fn readerLoop(self: *SshChannelStreamTransport) void {
         if (self.stopped.load(.acquire)) return;
 
         // Non-blocking read from the libssh2 channel.
+        // Use Channel.readNonBlock to stay in ssh.zig's cimport namespace.
         self.ssh_mutex.lock();
-        const rc = ssh2.libssh2_channel_read_ex(
-            self.config.channel.inner,
-            0,
-            @ptrCast(&buf),
-            buf.len,
-        );
-        const eof = ssh2.libssh2_channel_eof(self.config.channel.inner) != 0;
+        const rc = self.config.channel.readNonBlock(&buf);
+        const eof = self.config.channel.eof();
         self.ssh_mutex.unlock();
 
         if (rc > 0) {
@@ -293,7 +288,7 @@ fn writerLoop(self: *SshChannelStreamTransport) void {
 
             self.ssh_mutex.lock();
             const wrc = ssh2.libssh2_channel_write_ex(
-                self.config.channel.inner,
+                @ptrCast(self.config.channel.inner),
                 0,
                 @ptrCast(buf[written..n].ptr),
                 n - written,
@@ -338,8 +333,8 @@ fn pollForRead(sock: posix.fd_t, stop_fd: posix.fd_t) void {
     _ = c.poll(&fds, 2, 100);
 }
 
-fn pollForWrite(sock: posix.fd_t, session_ptr: *ssh2.LIBSSH2_SESSION, stop_fd: posix.fd_t) void {
-    const dir = ssh2.libssh2_session_block_directions(session_ptr);
+fn pollForWrite(sock: posix.fd_t, session_ptr: anytype, stop_fd: posix.fd_t) void {
+    const dir = ssh2.libssh2_session_block_directions(@ptrCast(session_ptr));
     var events: c_short = 0;
     if (dir & ssh2.LIBSSH2_SESSION_BLOCK_INBOUND != 0) events |= c.POLLIN;
     if (dir & ssh2.LIBSSH2_SESSION_BLOCK_OUTBOUND != 0) events |= c.POLLOUT;
@@ -395,4 +390,81 @@ test "SshChannelStreamTransport: protocol frame parse roundtrip" {
         try std.testing.expectEqual(kind, parsed.kind);
         try std.testing.expectEqual(@as(u32, 42), parsed.len);
     }
+}
+
+test "SshChannelStreamTransport: integration round-trip via ssh localhost" {
+    // Requires passwordless SSH to localhost. Skips gracefully when sshd
+    // is not accessible or key-based auth is not configured.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+
+    ssh_mod.globalInit();
+    defer ssh_mod.globalDeinit();
+
+    var ssh_session = ssh_mod.SshSession.connect(alloc, "127.0.0.1", 22) catch
+        return error.SkipZigTest;
+    defer ssh_session.close();
+
+    const user = posix.getenv("USER") orelse "root";
+    ssh_session.authAgent(user) catch
+        (ssh_session.authAuto(user) catch
+        return error.SkipZigTest);
+
+    // Run `cat` on the channel so writes echo back.
+    var ch = ssh_session.openChannel() catch return error.SkipZigTest;
+    ch.exec("cat") catch {
+        ch.close();
+        return error.SkipZigTest;
+    };
+
+    // Non-blocking so transport threads can poll without deadlocking.
+    ssh_session.setBlocking(0);
+
+    const DisconnectCtx = struct {
+        fired: bool = false,
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+    };
+    var dctx: DisconnectCtx = .{};
+    const on_dc: DisconnectHandler = struct {
+        fn f(ctx: ?*anyopaque, _: DisconnectReason) void {
+            const d: *DisconnectCtx = @ptrCast(@alignCast(ctx.?));
+            d.mutex.lock();
+            defer d.mutex.unlock();
+            d.fired = true;
+            d.cond.signal();
+        }
+    }.f;
+
+    const transport = try SshChannelStreamTransport.init(alloc, .{
+        .channel = ch,
+        .on_disconnect = on_dc,
+        .ctx = &dctx,
+    });
+    defer transport.deinit();
+
+    const mfd = transport.muxFd();
+
+    // Write a payload via mux_fd — the writer thread forwards it through
+    // the libssh2 channel to `cat`, which echoes it back.
+    const payload = "ping-transport\n";
+    var sent: usize = 0;
+    while (sent < payload.len) {
+        const n = try posix.write(mfd, payload[sent..]);
+        sent += n;
+    }
+
+    // Read back the echo via mux_fd — the reader thread fetches it from
+    // the libssh2 channel and writes it to the socketpair.
+    var buf: [64]u8 = undefined;
+    var received: usize = 0;
+    const deadline = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
+    while (received < payload.len and std.time.nanoTimestamp() < deadline) {
+        const n = posix.read(mfd, buf[received..]) catch break;
+        if (n == 0) break;
+        received += n;
+    }
+
+    try std.testing.expectEqualSlices(u8, payload, buf[0..received]);
 }
