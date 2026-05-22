@@ -2,6 +2,7 @@ const std = @import("std");
 const inputpkg = @import("../input.zig");
 const state = &@import("../global.zig").state;
 const c = @import("../main_c.zig");
+const cli = @import("../cli.zig");
 
 const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
@@ -62,6 +63,26 @@ export fn ghostty_config_load_cli_args(self: *Config) void {
 export fn ghostty_config_load_default_files(self: *Config) void {
     self.loadDefaultFiles(state.alloc) catch |err| {
         log.err("error loading config err={}", .{err});
+    };
+}
+
+/// Load the configuration from an in-memory string in the same syntax
+/// as a config file. The optional `source_path` is used purely for
+/// diagnostic messages (e.g. when the embedder needs to attribute
+/// inline-config errors to a synthetic path); pass null for anonymous
+/// sources. Restored for embedder use (cmux loadInlineGhosttyConfig)
+/// after upstream removed the API in commit 70c175e2a.
+export fn ghostty_config_load_string(
+    self: *Config,
+    str: [*]const u8,
+    len: usize,
+    source_path: ?[*:0]const u8,
+) void {
+    const path: []const u8 = if (source_path) |p| std.mem.span(p) else "";
+    var reader: std.Io.Reader = .fixed(str[0..len]);
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = path };
+    self.loadIter(state.alloc, &iter) catch |err| {
+        log.err("error loading config from string err={}", .{err});
     };
 }
 
