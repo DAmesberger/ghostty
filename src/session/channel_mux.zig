@@ -1181,6 +1181,9 @@ pub const ClientMux = struct {
     /// Guards `fd` writes, the channels map, and every channel field
     /// mutated outside the dispatch thread (notably `out_credit`).
     mutex: std.Thread.Mutex = .{},
+    /// Optional handler for daemon-originated `channel_open` frames.
+    /// When null, all inbound opens are rejected with `service_not_supported`.
+    on_inbound: ?InboundHandler = null,
 
     /// Per-channel embedder callbacks. All fire from the dispatch
     /// thread; the embedder is responsible for hopping to its own
@@ -1200,6 +1203,32 @@ pub const ClientMux = struct {
         /// Channel torn down. After this returns the channel id is
         /// invalid; the embedder must drop its handle.
         on_close: *const fn (ctx: ?*anyopaque, reason: protocol.ChannelCloseReason, message: []const u8) void,
+    };
+
+    /// Handler for daemon-originated `channel_open` frames. If set on
+    /// the `ClientMux`, inbound opens are dispatched here instead of
+    /// being rejected with `service_not_supported`.
+    pub const InboundHandler = struct {
+        ctx: ?*anyopaque,
+        /// Called once per inbound `channel_open`. The handler must either:
+        ///   * Return non-null `Callbacks` — accepting the channel. The mux
+        ///     allocates a Channel, registers it, sends `channel_opened(.ok)`,
+        ///     and fires `cbs.on_opened`. The `ctx` supplied as the third
+        ///     argument becomes the per-channel context passed to every
+        ///     subsequent callback.
+        ///   * Return null — rejecting the channel. The mux sends
+        ///     `channel_opened(.service_not_supported)` and nothing is
+        ///     allocated.
+        ///
+        /// `params` is borrowed for the duration of this call — copy if
+        /// retention is needed. Fires on the dispatch thread; MUST NOT block.
+        open: *const fn (
+            ctx: ?*anyopaque,
+            channel_id: u32,
+            service: protocol.ChannelService,
+            params: []const u8,
+            channel_ctx_out: *?*anyopaque,
+        ) ?Callbacks,
     };
 
     pub fn init(alloc: Allocator, fd: posix.fd_t) ClientMux {
@@ -1564,23 +1593,108 @@ pub const ClientMux = struct {
     }
 
     /// Inbound `channel_open` on the client side. Daemon-originated
-    /// channels (e.g. port_listener accepts) arrive this way, but the
-    /// client has no service registry to instantiate them against yet,
-    /// so we reject with `service_not_supported`.
-    /// TODO(daemon-originated-on-client): route to a client-side
-    /// service registry.
+    /// channels (e.g. port_listener accepts) arrive this way. If
+    /// `on_inbound` is set and the handler accepts, a Channel is
+    /// allocated and registered; otherwise the open is rejected with
+    /// `service_not_supported`.
     fn handleInboundOpen(self: *ClientMux, payload: []const u8) !void {
         const open = protocol.ChannelOpen.parse(payload) catch {
             log.warn("client: malformed channel_open frame", .{});
             return;
         };
-        log.debug(
-            "client: rejecting daemon-originated channel_open id={x} service={d}",
-            .{ open.channel_id, @intFromEnum(open.service) },
+
+        // Reject duplicate channel ids.
+        self.mutex.lock();
+        const duplicate = self.channels.contains(open.channel_id);
+        self.mutex.unlock();
+        if (duplicate) {
+            log.warn("client: duplicate inbound channel_id={x}", .{open.channel_id});
+            try self.sendInboundOpened(open.channel_id, .invalid_request, null, null);
+            return;
+        }
+
+        const handler = self.on_inbound orelse {
+            log.debug(
+                "client: rejecting daemon-originated channel_open id={x} service={d} (no handler)",
+                .{ open.channel_id, @intFromEnum(open.service) },
+            );
+            try self.sendInboundOpened(open.channel_id, .service_not_supported, null, null);
+            return;
+        };
+
+        // Resolve window for the inbound channel.
+        const requested_units = if (open.initial_window == 0)
+            self.negotiated_default_window_units
+        else
+            @min(open.initial_window, self.negotiated_max_window_units);
+        const window_bytes: usize = @as(usize, requested_units) * 4 * 1024;
+
+        // Offer the open to the handler. Handler returns null to reject.
+        var channel_ctx: ?*anyopaque = null;
+        const cbs_opt = handler.open(
+            handler.ctx,
+            open.channel_id,
+            open.service,
+            open.service_params,
+            &channel_ctx,
         );
+        const cbs = cbs_opt orelse {
+            log.debug(
+                "client: handler rejected daemon-originated channel_open id={x}",
+                .{open.channel_id},
+            );
+            try self.sendInboundOpened(open.channel_id, .service_not_supported, null, null);
+            return;
+        };
+
+        // Handler accepted — allocate and register the channel.
+        const ch = try self.alloc.create(Channel);
+        ch.* = .{
+            .id = open.channel_id,
+            .service_id = @intFromEnum(open.service),
+            .origin = .remote,
+            .service_state = null,
+            .vtable = null,
+            .client_callbacks = cbs,
+            .client_ctx = channel_ctx,
+            // Inbound: we grant the daemon an outbound window (in_credit)
+            // and start with zero outbound credit ourselves until the
+            // daemon sees our channel_opened and grants a window back via
+            // on_opened (peer_window).
+            .out_credit = 0,
+            .in_credit = window_bytes,
+            .initial_window_bytes = window_bytes,
+            .in_unacked = 0,
+            .flags = open.flags,
+        };
+        ch.assertBackendInvariant();
+        errdefer self.alloc.destroy(ch);
+        self.mutex.lock();
+        const put_err = self.channels.put(self.alloc, open.channel_id, ch);
+        self.mutex.unlock();
+        try put_err;
+
+        // Acknowledge acceptance to the daemon.
+        try self.sendInboundOpened(open.channel_id, .ok, ch.flags, requested_units);
+
+        // Fire on_opened with empty ack and the window we just granted.
+        cbs.on_opened(channel_ctx, "", requested_units);
+    }
+
+    /// Send a `channel_opened` reply for a daemon-initiated open. Helper
+    /// shared between the accept and reject paths.
+    fn sendInboundOpened(
+        self: *ClientMux,
+        channel_id: u32,
+        status: protocol.ChannelOpenStatus,
+        flags: ?protocol.ChannelOpenFlags,
+        peer_window: ?u16,
+    ) !void {
         const opened = protocol.ChannelOpened{
-            .channel_id = open.channel_id,
-            .status = .service_not_supported,
+            .channel_id = channel_id,
+            .status = status,
+            .flags = flags orelse .{},
+            .peer_window = peer_window orelse 0,
         };
         const encoded = try opened.encode(self.alloc);
         defer self.alloc.free(encoded);
@@ -2593,4 +2707,186 @@ test "ClientMux channel id allocation skips the daemon-direction range" {
         const frame = try readFrameAlloc(testing.allocator, fds[0]);
         testing.allocator.free(frame.payload);
     }
+}
+
+// =========================================================================
+// InboundHandler tests (Phase 6D Part 1)
+// =========================================================================
+
+test "ClientMux InboundHandler: accepts daemon-originated channel and fires on_opened" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var client = ClientMux.init(testing.allocator, fds[1]);
+    defer client.deinit();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    const Handler = struct {
+        obs: *ClientObserver,
+
+        fn open(
+            ctx: ?*anyopaque,
+            _: u32,
+            _: protocol.ChannelService,
+            _: []const u8,
+            ch_ctx: *?*anyopaque,
+        ) ?ClientMux.Callbacks {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            ch_ctx.* = self.obs;
+            return ClientObserver.callbacks();
+        }
+    };
+    var handler = Handler{ .obs = &observer };
+    client.on_inbound = .{
+        .ctx = &handler,
+        .open = Handler.open,
+    };
+
+    // Synthesize a daemon-originated channel_open arriving at the client.
+    const daemon_channel_id = protocol.channel_id_daemon_bit | 42;
+    const open = protocol.ChannelOpen{
+        .channel_id = daemon_channel_id,
+        .service = .port_listener,
+        .initial_window = 4,
+    };
+    const open_buf = try open.encode(testing.allocator);
+    defer testing.allocator.free(open_buf);
+    try client.dispatch(.channel_open, open_buf);
+
+    // The client must have replied with channel_opened status=ok.
+    const reply = try readFrameAlloc(testing.allocator, fds[0]);
+    defer testing.allocator.free(reply.payload);
+    try testing.expectEqual(protocol.Kind.channel_opened, reply.header.kind);
+    const opened = try protocol.ChannelOpened.parse(reply.payload);
+    try testing.expectEqual(protocol.ChannelOpenStatus.ok, opened.status);
+    try testing.expectEqual(daemon_channel_id, opened.channel_id);
+
+    // The channel must have been registered.
+    try testing.expect(client.channels.contains(daemon_channel_id));
+
+    // on_opened must have fired.
+    try testing.expect(observer.opened);
+}
+
+test "ClientMux InboundHandler: handler returning null sends service_not_supported" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var client = ClientMux.init(testing.allocator, fds[1]);
+    defer client.deinit();
+
+    const Handler = struct {
+        fn open(
+            _: ?*anyopaque,
+            _: u32,
+            _: protocol.ChannelService,
+            _: []const u8,
+            _: *?*anyopaque,
+        ) ?ClientMux.Callbacks {
+            return null; // always reject
+        }
+    };
+    client.on_inbound = .{ .ctx = null, .open = Handler.open };
+
+    const daemon_channel_id = protocol.channel_id_daemon_bit | 7;
+    const open = protocol.ChannelOpen{
+        .channel_id = daemon_channel_id,
+        .service = .tcp_connect,
+    };
+    const open_buf = try open.encode(testing.allocator);
+    defer testing.allocator.free(open_buf);
+    try client.dispatch(.channel_open, open_buf);
+
+    const reply = try readFrameAlloc(testing.allocator, fds[0]);
+    defer testing.allocator.free(reply.payload);
+    const opened_reply = try protocol.ChannelOpened.parse(reply.payload);
+    try testing.expectEqual(protocol.ChannelOpenStatus.service_not_supported, opened_reply.status);
+    try testing.expect(!client.channels.contains(daemon_channel_id));
+}
+
+test "ClientMux InboundHandler: inbound channel receives subsequent data" {
+    // Use raw socketpair fds so we can drive both sides manually with no
+    // background pump (avoids a race on pair.a between the pump thread and
+    // our manual readFrameAlloc calls).
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const reg = try testing.allocator.create(Registry);
+    reg.* = Registry.init(testing.allocator);
+    defer {
+        reg.deinit();
+        testing.allocator.destroy(reg);
+    }
+    try reg.register(.{
+        .id = roundtrip_service_id,
+        .name = "roundtrip",
+        .vtable = &roundtrip_vtable,
+    });
+    var daemon_mux = Mux.init(testing.allocator, fds[0], reg);
+    defer daemon_mux.deinit();
+    var client_mux = ClientMux.init(testing.allocator, fds[1]);
+    defer client_mux.deinit();
+
+    var observer: ClientObserver = .{ .alloc = testing.allocator };
+    defer observer.deinit();
+
+    const Handler = struct {
+        obs: *ClientObserver,
+
+        fn open(
+            ctx: ?*anyopaque,
+            _: u32,
+            _: protocol.ChannelService,
+            _: []const u8,
+            ch_ctx: *?*anyopaque,
+        ) ?ClientMux.Callbacks {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            ch_ctx.* = self.obs;
+            return ClientObserver.callbacks();
+        }
+    };
+    var handler = Handler{ .obs = &observer };
+    client_mux.on_inbound = .{ .ctx = &handler, .open = Handler.open };
+
+    // Daemon originates a channel toward the client. `openChannelFromDaemon`
+    // runs the roundtrip service's `open`, allocates a daemon-direction id,
+    // and sends `channel_open` to fds[1] (client side).
+    const id = try daemon_mux.openChannelFromDaemon(roundtrip_service_id, "", "", 4);
+
+    // Route the `channel_open` frame to the client mux.
+    const open_frame = try readFrameAlloc(testing.allocator, fds[1]);
+    defer testing.allocator.free(open_frame.payload);
+    try client_mux.dispatch(open_frame.header.kind, open_frame.payload);
+
+    // Route the `channel_opened` reply to the daemon mux (updates out_credit).
+    const opened_frame = try readFrameAlloc(testing.allocator, fds[0]);
+    defer testing.allocator.free(opened_frame.payload);
+    try daemon_mux.dispatch(opened_frame.header.kind, opened_frame.payload);
+
+    // Client channel must be registered; on_opened must have fired.
+    try testing.expect(client_mux.channels.contains(id));
+    try testing.expect(observer.opened);
+
+    // Daemon sends data to the client channel.
+    const ch = daemon_mux.channels.get(id).?;
+    const sent = try daemon_mux.sendChannelData(ch, "hello-inbound");
+    try testing.expectEqual(@as(usize, "hello-inbound".len), sent);
+
+    // Route the `channel_data` frame to the client mux.
+    const data_frame = try readFrameAlloc(testing.allocator, fds[1]);
+    defer testing.allocator.free(data_frame.payload);
+    try client_mux.dispatch(data_frame.header.kind, data_frame.payload);
+
+    try testing.expectEqualStrings("hello-inbound", observer.data.items);
 }

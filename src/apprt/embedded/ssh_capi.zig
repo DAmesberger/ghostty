@@ -80,8 +80,10 @@ const Allocator = std.mem.Allocator;
 const protocol = @import("../../session/protocol.zig");
 const session_shared = @import("../../session/shared.zig");
 const channel_mux = @import("../../session/channel_mux.zig");
+const ssh_mod = @import("../../session/ssh.zig");
 const SshConnectionManager = @import("../../termio/SshConnectionManager.zig");
 const apprt_embedded = @import("../embedded.zig");
+const SshChannelStreamTransport = @import("../../termio/SshChannelStreamTransport.zig");
 
 const ClientMux = channel_mux.ClientMux;
 
@@ -294,6 +296,13 @@ pub const Config = extern struct {
 pub const SshCallbacks = extern struct {
     on_state: ?*const fn (userdata: ?*anyopaque, state: *const State) callconv(.c) void,
     on_host_key: ?*const fn (userdata: ?*anyopaque, hk: *const HostKey) callconv(.c) void,
+    on_inbound_channel: ?*const fn (
+        userdata: ?*anyopaque,
+        channel: ?*ChannelHandle,
+        service: ChannelService,
+        params: ?*const anyopaque,
+        params_len: usize,
+    ) callconv(.c) ?*ChannelHandle,
     userdata: ?*anyopaque,
 };
 
@@ -414,6 +423,12 @@ pub const SshHandle = struct {
     /// per-Entry production mux is owned by the Entry, not the
     /// handle). Tests that inject a mux set this per their harness.
     client_mux_owned: bool = false,
+    /// Production transport that bridges the libssh2 channel ↔
+    /// ClientMux. Non-null only after `wireMuxTransport` successfully
+    /// instantiates a `SshChannelStreamTransport`. Owned by this
+    /// handle; torn down in `deinit` (transport stop → mux deinit →
+    /// channel close are all handled by `SshChannelStreamTransport.deinit`).
+    transport: ?*SshChannelStreamTransport = null,
     /// Live channels rooted on this connection. Used to validate the
     /// "free channels before ssh" invariant and to broadcast TRANSPORT
     /// closes on reconnect.
@@ -470,21 +485,94 @@ pub const SshHandle = struct {
 
     fn deinit(self: *SshHandle) void {
         std.debug.assert(self.channels.count() == 0);
-        // If we own the ClientMux (test-injected; production muxes
-        // are Entry-owned per Part 6), deinit + free it. Channels
-        // are already empty by the assert above, so the mux's own
-        // teardown has nothing left to close.
+
+        // Production transport teardown sequence:
+        //   1. Stop transport threads (they hold references to mux_fd).
+        //   2. Deinit + free the ClientMux (closes any remaining channels).
+        //   3. Free the transport struct itself (also closes libssh2 channel).
+        // We call close() instead of deinit() so we can control step order.
+        const saved_transport = self.transport;
+        self.transport = null;
+        if (saved_transport) |t| {
+            t.close(); // join threads + close fds (mux_fd, ssh_fd, stop_pipe)
+        }
+
+        // ClientMux deinit/free (applies to both transport-backed and test-injected).
+        // Channels are already empty by the assert above.
         if (self.client_mux_owned) {
             if (self.client_mux) |mux| {
                 mux.deinit();
                 self.alloc.destroy(mux);
             }
         }
+        self.client_mux = null;
+        self.client_mux_owned = false;
+
+        // Free the transport struct memory now that mux_fd is confirmed closed.
+        if (saved_transport) |t| {
+            self.alloc.destroy(t);
+        }
         if (self.release_target) |t| self.alloc.free(t);
         if (self.release_jump) |j| self.alloc.free(j);
         self.config.deinit(self.alloc);
         self.channels.deinit(self.alloc);
         self.alloc.destroy(self);
+    }
+
+    /// Wire the production ClientMux + SshChannelStreamTransport onto this
+    /// handle using an already-opened libssh2 channel. Called from the
+    /// SSH thread when the connection reaches `connected` state.
+    ///
+    /// Lifecycle (enforced by teardown in `deinit`):
+    ///   transport.close() (join threads + close fds)
+    ///   → ClientMux.deinit() (fire on_close callbacks)
+    ///   → alloc.destroy(transport) (frees transport memory)
+    ///
+    /// Safe to call multiple times; a second call is a no-op when
+    /// `self.transport != null` (the previous transport is still live).
+    pub fn wireMuxTransport(
+        self: *SshHandle,
+        ssh_channel: ssh_mod.Channel,
+    ) void {
+        if (self.transport != null) return; // already wired
+
+        const mux = self.alloc.create(ClientMux) catch |err| {
+            log.warn("wireMuxTransport: alloc ClientMux failed: {}", .{err});
+            return;
+        };
+
+        // Allocate transport first so we can get the mux_fd.
+        const t = SshChannelStreamTransport.init(self.alloc, .{
+            .channel = ssh_channel,
+            .on_disconnect = onTransportDisconnect,
+            .ctx = self,
+        }) catch |err| {
+            log.warn("wireMuxTransport: transport init failed: {}", .{err});
+            self.alloc.destroy(mux);
+            return;
+        };
+
+        mux.* = ClientMux.init(self.alloc, t.muxFd());
+        self.installInboundHandler(mux);
+        self.client_mux = mux;
+        self.client_mux_owned = true;
+        self.transport = t;
+    }
+
+    /// Fired by the transport reader thread when the SSH channel EOF's
+    /// or encounters a read/write error. Broadcast TRANSPORT close to
+    /// every live channel handle so the embedder can respond.
+    fn onTransportDisconnect(ctx: ?*anyopaque, _: SshChannelStreamTransport.DisconnectReason) void {
+        const self: *SshHandle = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        var snapshot = std.ArrayList(*ChannelHandle).empty;
+        defer snapshot.deinit(self.alloc);
+        var it = self.channels.iterator();
+        while (it.next()) |entry| snapshot.append(self.alloc, entry.value_ptr.*) catch {};
+        self.mutex.unlock();
+        for (snapshot.items) |ch| {
+            ch.emitClose(.transport, null);
+        }
     }
 
     /// Test-only: attach a borrowed-or-owned ClientMux to this handle
@@ -494,6 +582,89 @@ pub const SshHandle = struct {
     fn setClientMuxForTest(self: *SshHandle, mux: *ClientMux, owned: bool) void {
         self.client_mux = mux;
         self.client_mux_owned = owned;
+        self.installInboundHandler(mux);
+    }
+
+    /// Install the C-API ↔ ClientMux inbound handler on `mux`, wiring
+    /// `on_inbound_channel` from `self.callbacks`. Safe to call multiple
+    /// times; the mux overwrites its previous handler on each call.
+    fn installInboundHandler(self: *SshHandle, mux: *ClientMux) void {
+        self.mutex.lock();
+        const has_cb = self.callbacks.on_inbound_channel != null;
+        self.mutex.unlock();
+        if (!has_cb) return;
+        mux.on_inbound = .{
+            .ctx = self,
+            .open = inboundOpen,
+        };
+    }
+
+    /// `ClientMux.InboundHandler.open` bridge. Allocates a `ChannelHandle`,
+    /// calls the embedder's `on_inbound_channel`, and either returns the
+    /// handle's `mux_callbacks` (accepted) or null (rejected + freed).
+    fn inboundOpen(
+        ctx: ?*anyopaque,
+        channel_id: u32,
+        service: protocol.ChannelService,
+        params: []const u8,
+        channel_ctx_out: *?*anyopaque,
+    ) ?ClientMux.Callbacks {
+        const self: *SshHandle = @ptrCast(@alignCast(ctx.?));
+        if (self.closed.load(.acquire)) return null;
+
+        // Map wire service to C-API enum. Unrecognised or invalid ids
+        // surface as `custom` so the embedder still sees the open.
+        const c_service: ChannelService = switch (@intFromEnum(service)) {
+            1 => .tcp_connect,
+            2 => .port_listener,
+            3 => .file_transfer,
+            4 => .browser_proxy,
+            5 => .process_exec,
+            255 => .custom,
+            else => .custom,
+        };
+
+        // Pre-allocate a ChannelHandle with empty callbacks. The embedder
+        // will supply real callbacks if it accepts.
+        const empty_cbs: ChannelCallbacks = .{
+            .on_opened = null,
+            .on_data = null,
+            .on_window_credit = null,
+            .on_eof = null,
+            .on_close = null,
+            .userdata = null,
+        };
+        const ch = ChannelHandle.init(self.alloc, self, c_service, &empty_cbs) catch |err| {
+            log.warn("inboundOpen: alloc failed: {}", .{err});
+            return null;
+        };
+
+        // Grab callback under mutex.
+        self.mutex.lock();
+        const cb = self.callbacks.on_inbound_channel;
+        const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+
+        const cb_fn = cb orelse {
+            ch.deinit();
+            return null;
+        };
+
+        // params is borrowed for this call; the embedder must copy if needed.
+        const params_ptr: ?*const anyopaque = if (params.len > 0) params.ptr else null;
+        const result = cb_fn(ud, ch, c_service, params_ptr, params.len);
+
+        if (result == null) {
+            // Embedder rejected — free the pre-allocated handle.
+            ch.deinit();
+            return null;
+        }
+        // Embedder accepted and owns `ch`. Wire the mux callbacks vtable
+        // so the mux dispatches frames to the C-API bridge.
+        ch.client_mux = self.client_mux;
+        ch.channel_id = channel_id;
+        channel_ctx_out.* = ch;
+        return ChannelHandle.mux_callbacks;
     }
 
     /// Dispatch a state change to the embedder's `on_state`. Safe to
@@ -615,6 +786,12 @@ pub const ChannelHandle = struct {
     /// channel_id allocated by the ClientMux at open time. Stays at
     /// `invalid_channel_id` until `ClientMux.openChannel` succeeds.
     channel_id: u32 = protocol.invalid_channel_id,
+    /// For inbound (daemon-originated) channels: the peer window grant
+    /// (in 4 KiB units) from the `channel_opened` reply we sent.  Stored
+    /// so `ghostty_channel_set_callbacks` can replay the `on_opened`
+    /// event with the correct initial credit after the embedder wires
+    /// real callbacks. 0 = not an inbound channel / not yet set.
+    inbound_peer_window: u16 = 0,
 
     pub const ChannelState = enum(u32) {
         opening = 0,
@@ -675,6 +852,13 @@ pub const ChannelHandle = struct {
         self.mutex.lock();
         const cb = self.callbacks.on_opened;
         const ud = self.callbacks.userdata;
+        // For inbound channels, the callbacks may be null here (they are
+        // set later via ghostty_channel_set_callbacks). Stash the peer
+        // window so set_callbacks can replay on_opened with the correct
+        // credit grant.
+        if (cb == null and self.inbound_peer_window == 0) {
+            self.inbound_peer_window = peer_window_units;
+        }
         self.mutex.unlock();
         if (cb) |f| {
             const ack_ptr: ?*const anyopaque = if (ack.len == 0) null else ack.ptr;
@@ -1288,6 +1472,38 @@ export fn ghostty_channel_close(
     // TODO: round-tripping an embedder-supplied reason string back
     // through on_close is a follow-up — `message` stays NULL.
     ch.emitClose(reason, null);
+}
+
+/// Implements `ghostty_channel_set_callbacks`. Replaces the callbacks on
+/// a pre-allocated inbound channel handle and replays `on_opened` with the
+/// initial peer window if the channel is already in the `open` state (i.e.
+/// the mux fired `on_opened` before the embedder called this function).
+/// Safe from any thread; the callbacks field is guarded by `mutex`.
+export fn ghostty_channel_set_callbacks(
+    channel: ?*ChannelHandle,
+    callbacks: ?*const ChannelCallbacks,
+) void {
+    const ch = channel orelse return;
+    const cbs = callbacks orelse return;
+
+    // Snap the inbound_peer_window while installing callbacks so we can
+    // replay on_opened below without re-entering the mutex.
+    ch.mutex.lock();
+    ch.callbacks = cbs.*;
+    const peer_window = ch.inbound_peer_window;
+    const on_opened = cbs.on_opened;
+    const ud = cbs.userdata;
+    ch.mutex.unlock();
+
+    // Replay on_opened if the channel is already open (i.e. the mux fired
+    // on_opened before callbacks were installed). This delivers the initial
+    // credit grant so the embedder's write path has outbound credit.
+    if (on_opened != null and peer_window > 0 and
+        ch.state.load(.acquire) == @intFromEnum(ChannelHandle.ChannelState.open))
+    {
+        const window_bytes: u32 = @as(u32, peer_window) *| 4096;
+        on_opened.?(ud, null, 0, window_bytes);
+    }
 }
 
 /// Implements `ghostty_channel_free`. If the channel is still live

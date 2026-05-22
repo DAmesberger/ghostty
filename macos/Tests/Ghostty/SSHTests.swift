@@ -359,6 +359,60 @@ struct SSHTests {
         #expect(Ghostty.SSHChannel<Ghostty.TerminalService>.CloseReason.from(c) == swift)
     }
 
+    // MARK: - InboundChannel (Phase 6D Part 5)
+
+    @Test
+    func inboundChannelParamsAndServiceID() {
+        let params = Data([0x01, 0x02, 0x03])
+        let inbound = Ghostty.InboundChannel(
+            handleBits: 0,
+            serviceID: UInt8(GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER.rawValue),
+            params: params
+        )
+        #expect(inbound.serviceID == UInt8(GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER.rawValue))
+        #expect(inbound.params == params)
+    }
+
+    @Test
+    func inboundChannelRejectIsIdempotent() {
+        let inbound = Ghostty.InboundChannel(
+            handleBits: 0,  // null handle — reject() calls ghostty_channel_free(nil) which is a no-op
+            serviceID: 1,
+            params: Data()
+        )
+        inbound.reject()  // first call should claim
+        inbound.reject()  // second call should be a no-op (claimed already)
+    }
+
+    @Test
+    func inboundChannelAcceptRejectsServiceMismatch() {
+        // Use a non-null but fake handle — we can't actually call ghostty_channel_free
+        // on a fake pointer in this pure-Swift test, so we use a null handle (0).
+        // The accept path calls ghostty_channel_free(nil) on mismatch, which is a no-op.
+        let inbound = Ghostty.InboundChannel(
+            handleBits: 0,
+            serviceID: UInt8(GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT.rawValue),
+            params: Data()
+        )
+        // Try to accept as PortListenerService — service ID mismatch must return nil.
+        let channel = inbound.accept(using: Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22))
+        #expect(channel == nil)
+    }
+
+    @Test
+    func inboundChannelDoubleAcceptReturnsNil() {
+        let inbound = Ghostty.InboundChannel(
+            handleBits: 0,
+            serviceID: UInt8(GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER.rawValue),
+            params: Data()
+        )
+        // First accept: will succeed (or fail for service mismatch) and claims the state.
+        let _ = inbound.accept(using: Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22))
+        // Second accept: state already claimed — must return nil.
+        let second = inbound.accept(using: Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22))
+        #expect(second == nil)
+    }
+
 }
 
 // MARK: - Equatable conformances for test convenience

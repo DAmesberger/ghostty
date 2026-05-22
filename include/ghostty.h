@@ -1302,9 +1302,26 @@ typedef struct {
 // on_host_key: invoked once during CONNECTING when host-key verification
 //   is required. The connection blocks until
 //   ghostty_ssh_submit_host_key_decision is called.
+// on_inbound_channel: called when the daemon opens a channel toward the
+//   client (e.g. a port_listener accept arriving at the embedder). The
+//   embedder MUST either:
+//     * Return the supplied `channel` handle (accepting it and taking
+//       ownership — call ghostty_channel_free when done), OR
+//     * Return NULL (rejecting; the mux sends service_not_supported to
+//       the daemon and frees the pre-allocated handle internally).
+//   `params` and `params_len` carry service-specific bytes (borrowed for
+//   the callback duration — memcpy if retention is needed).
+//   Threading: fires on a libghostty worker thread. MUST NOT block.
+//   May be NULL, in which case all daemon-originated channels are
+//   rejected with service_not_supported.
 typedef struct {
   void (*on_state)(void* userdata, const ghostty_ssh_state_t* state);
   void (*on_host_key)(void* userdata, const ghostty_ssh_host_key_t* hk);
+  ghostty_channel_t (*on_inbound_channel)(void* userdata,
+                                          ghostty_channel_t channel,
+                                          ghostty_channel_service_e service,
+                                          const void* params,
+                                          size_t params_len);
   void* userdata;
 } ghostty_ssh_callbacks_t;
 
@@ -1610,6 +1627,15 @@ void ghostty_channel_close(ghostty_channel_t channel,
 
 // Release the channel handle. Implicitly closes if still open.
 void ghostty_channel_free(ghostty_channel_t channel);
+
+// Attach callbacks to a channel handle that was pre-allocated by
+// libghostty for an inbound (daemon-originated) open — i.e. the handle
+// delivered by on_inbound_channel. MUST be called at most once, before
+// returning the handle from on_inbound_channel. Calling it on a handle
+// that already has callbacks (e.g. one returned by ghostty_ssh_open_channel)
+// is undefined behaviour and may be asserted in debug builds.
+void ghostty_channel_set_callbacks(ghostty_channel_t channel,
+                                   const ghostty_channel_callbacks_t* callbacks);
 
 // Attach a terminal surface over the SSH connection. Sugar over
 // ghostty_ssh_open_channel(..., TERMINAL, ...) — internally drives

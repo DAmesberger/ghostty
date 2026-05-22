@@ -71,6 +71,15 @@ extension Ghostty {
         /// All connection state transitions, including the initial `connecting`.
         public let state: AsyncStream<ConnectionState>
 
+        /// Delivers channels that the daemon opened toward the client, e.g.
+        /// port_listener accepts. Each `InboundChannel` value must be either
+        /// accepted (by calling `accept(as:)`) or rejected (by calling
+        /// `reject()`) before iterating the next element — the mux blocks
+        /// acceptance of the next inbound open until the embedder decides.
+        ///
+        /// The stream finishes when the connection is deallocated.
+        public let inboundChannels: AsyncStream<InboundChannel>
+
         /// The most recent state snapshot. Read this on `MainActor` for a
         /// stable value; off-actor reads are safe but may observe a value
         /// that was just superseded.
@@ -95,6 +104,7 @@ extension Ghostty {
         let stateContinuation: AsyncStream<ConnectionState>.Continuation
         let stateSubject: CurrentValueSubject<ConnectionState, Never>
         let hostKeyHandler: HostKeyHandler
+        let inboundContinuation: AsyncStream<InboundChannel>.Continuation
 
         /// Strong-ref box backing the C userdata pointer. Held by `self` —
         /// released in `deinit` after the C handle is freed so trampolines
@@ -122,6 +132,12 @@ extension Ghostty {
             var stateCont: AsyncStream<ConnectionState>.Continuation!
             self.state = AsyncStream<ConnectionState>(bufferingPolicy: .unbounded) { stateCont = $0 }
             self.stateContinuation = stateCont
+
+            var inboundCont: AsyncStream<InboundChannel>.Continuation!
+            self.inboundChannels = AsyncStream<InboundChannel>(bufferingPolicy: .unbounded) {
+                inboundCont = $0
+            }
+            self.inboundContinuation = inboundCont
 
             let box = ConnectionBox()
             self.userdataBox = box
@@ -153,6 +169,7 @@ extension Ghostty {
                         var cbs = ghostty_ssh_callbacks_t(
                             on_state: SSHConnection.cOnState,
                             on_host_key: SSHConnection.cOnHostKey,
+                            on_inbound_channel: SSHConnection.cOnInboundChannel,
                             userdata: Unmanaged.passUnretained(box).toOpaque()
                         )
                         return ghostty_ssh_open(app, &cCfg, &cbs)
@@ -176,6 +193,7 @@ extension Ghostty {
             // (the weak ref is cleared before the C handle goes away).
             userdataBox.detach()
             stateContinuation.finish()
+            inboundContinuation.finish()
             // `handle` is nil only when init threw before ghostty_ssh_open
             // succeeded — in that case there is nothing to free and the
             // handle counter was never incremented.
@@ -336,6 +354,83 @@ extension Ghostty {
                 self.currentState = state
             }
         }
+
+        /// Called from the `on_inbound_channel` trampoline. Yields an
+        /// `InboundChannel` into `inboundChannels` so the embedder can
+        /// accept or reject. Must NOT block — the continuation is
+        /// non-blocking (`.unbounded` buffer policy).
+        func emitInbound(_ inbound: InboundChannel) {
+            inboundContinuation.yield(inbound)
+        }
+    }
+
+    // MARK: - InboundChannel
+
+    /// A daemon-originated channel delivered via `SSHConnection.inboundChannels`.
+    ///
+    /// The embedder must call exactly one of `accept(as:)` or `reject()`.
+    /// The underlying C handle is valid until one of those methods is called.
+    public struct InboundChannel: Sendable {
+        /// Raw service id byte from the wire (matches `ghostty_channel_service_e`).
+        public let serviceID: UInt8
+        /// Service-specific parameter bytes, copied at delivery time.
+        public let params: Data
+
+        // State machine: nil = pending, true = accepted, false = rejected.
+        // Sendable because UnsafeMutableRawPointer is round-tripped through UInt.
+        private let handleBits: UInt
+        private let stateMachine: InboundChannelState
+
+        init(handleBits: UInt, serviceID: UInt8, params: Data) {
+            self.handleBits = handleBits
+            self.serviceID = serviceID
+            self.params = params
+            self.stateMachine = InboundChannelState()
+        }
+
+        /// Accept the channel with an embedder-constructed service descriptor.
+        /// Returns `nil` if the service id in `service` doesn't match the
+        /// wire `serviceID`, or if the channel was already accepted or rejected.
+        ///
+        /// Ownership: on success the returned `SSHChannel` takes ownership of
+        /// the underlying C handle. On `nil` return the channel is rejected and
+        /// freed internally.
+        public func accept<S: ChannelService>(using service: S) -> SSHChannel<S>? {
+            guard stateMachine.claim() else { return nil }
+            // Verify that the service the embedder chose matches the wire service.
+            let expectedID = UInt8(service.cService.rawValue)
+            guard serviceID == expectedID else {
+                let h = ghostty_channel_t(bitPattern: handleBits)
+                ghostty_channel_free(h)
+                return nil
+            }
+            let channel = SSHChannel<S>(service: service)
+            let channelBox = ChannelBox()
+            channelBox.attach(channel)
+            channel.userdataBox = channelBox
+
+            let h = ghostty_channel_t(bitPattern: handleBits)
+            // Install the Swift callbacks on the pre-allocated C handle so
+            // subsequent mux events (data, close, window) route to this box.
+            var cbs = ghostty_channel_callbacks_t(
+                on_opened: Ghostty.SSHConnection.cOnChannelOpened,
+                on_data: Ghostty.SSHConnection.cOnChannelData,
+                on_window_credit: Ghostty.SSHConnection.cOnChannelWindowCredit,
+                on_eof: Ghostty.SSHConnection.cOnChannelEOF,
+                on_close: Ghostty.SSHConnection.cOnChannelClose,
+                userdata: Unmanaged.passUnretained(channelBox).toOpaque()
+            )
+            ghostty_channel_set_callbacks(h, &cbs)
+            channel.handle = h
+            return channel
+        }
+
+        /// Reject the channel. The daemon receives `service_not_supported`.
+        public func reject() {
+            guard stateMachine.claim() else { return }
+            let h = ghostty_channel_t(bitPattern: handleBits)
+            ghostty_channel_free(h)
+        }
     }
 }
 
@@ -349,6 +444,22 @@ final class SessionListCollector {
 
     init(continuation: CheckedContinuation<[Ghostty.SessionListEntry], Swift.Error>) {
         self.continuation = continuation
+    }
+}
+
+// MARK: - InboundChannel state
+
+/// Thread-safe one-shot claim for `InboundChannel.accept/reject`.
+final class InboundChannelState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// Returns true and claims on first call; false on every subsequent call.
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
 

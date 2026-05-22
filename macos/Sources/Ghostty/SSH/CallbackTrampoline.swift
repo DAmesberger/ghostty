@@ -200,6 +200,55 @@ extension Ghostty.SSHConnection {
         conn.emitState(translated)
     }
 
+    /// Called when the daemon opens a channel toward the client. Wraps the
+    /// pre-allocated C handle in an `InboundChannel` value and yields it into
+    /// `SSHConnection.inboundChannels`. MUST NOT block — `AsyncStream.yield`
+    /// with `.unbounded` policy is non-blocking.
+    ///
+    /// Returns the handle unchanged if the embedder accepts (it then calls
+    /// `ghostty_channel_set_callbacks` in `accept(using:)` before returning
+    /// from `on_inbound_channel`). Returns nil to reject.
+    static let cOnInboundChannel: @convention(c) (
+        UnsafeMutableRawPointer?,
+        ghostty_channel_t?,
+        ghostty_channel_service_e,
+        UnsafeRawPointer?,
+        Int
+    ) -> ghostty_channel_t? = { userdata, channelHandle, service, paramsPtr, paramsLen in
+        guard let ud = userdata, let ch = channelHandle else { return nil }
+        let box = Unmanaged<ConnectionBox>.fromOpaque(ud).takeUnretainedValue()
+        guard let conn = box.resolved() else {
+            // Connection wrapper is gone — reject.
+            return nil
+        }
+
+        let serviceID = UInt8(service.rawValue)
+        let params: Data
+        if let p = paramsPtr, paramsLen > 0 {
+            params = Data(bytes: p, count: paramsLen)
+        } else {
+            params = Data()
+        }
+
+        // Round-trip the handle through UInt — ghostty_channel_t is
+        // UnsafeMutableRawPointer which is intentionally non-Sendable.
+        let handleBits = UInt(bitPattern: ch)
+        let inbound = Ghostty.InboundChannel(
+            handleBits: handleBits,
+            serviceID: serviceID,
+            params: params
+        )
+
+        // Yield non-blocking into the stream. The embedder drains it and
+        // calls accept/reject — the C side doesn't wait for that decision;
+        // the handle lifetime is the embedder's responsibility once returned.
+        conn.emitInbound(inbound)
+
+        // Return the handle to accept it (embedder will call
+        // ghostty_channel_set_callbacks before it's registered in the mux).
+        return ch
+    }
+
     static let cOnHostKey: @convention(c) (
         UnsafeMutableRawPointer?,
         UnsafePointer<ghostty_ssh_host_key_t>?
