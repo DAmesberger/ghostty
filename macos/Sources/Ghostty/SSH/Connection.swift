@@ -326,6 +326,26 @@ extension Ghostty {
             ghostty_ssh_cancel_reconnect(requireHandle())
         }
 
+        /// Rename a remote session. Fire-and-forget; no-op if the session is unknown.
+        public func renameSession(groupID: UUID, label: String) {
+            var bytes = groupID.uuid
+            withUnsafeBytes(of: &bytes) { raw in
+                let ptr = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                label.withCString { labelPtr in
+                    ghostty_ssh_rename_session(requireHandle(), ptr, labelPtr)
+                }
+            }
+        }
+
+        /// Kill a remote session and all its surfaces. Fire-and-forget; no-op if unknown.
+        public func killSession(groupID: UUID) {
+            var bytes = groupID.uuid
+            withUnsafeBytes(of: &bytes) { raw in
+                let ptr = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                ghostty_ssh_kill_session(requireHandle(), ptr)
+            }
+        }
+
         // MARK: Helpers
 
         /// Run `body` with a pointer to the 16 raw bytes of `uuid`, or

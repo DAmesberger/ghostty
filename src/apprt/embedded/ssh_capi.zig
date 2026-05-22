@@ -2369,6 +2369,7 @@ const PasswordCapture = struct {
         return .{
             .on_state = onState,
             .on_host_key = null,
+            .on_inbound_channel = null,
             .userdata = self,
         };
     }
