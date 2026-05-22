@@ -27,6 +27,7 @@ pub const HeadlessStreamHandler = @import("termio/HeadlessStreamHandler.zig");
 pub const Remote = @import("termio/Remote.zig");
 pub const SshConnectionManager = @import("termio/SshConnectionManager.zig");
 pub const SubprocessStreamTransport = @import("termio/SubprocessStreamTransport.zig");
+pub const SshChannelStreamTransport = @import("termio/SshChannelStreamTransport.zig");
 pub const Options = @import("termio/Options.zig");
 pub const Termio = @import("termio/Termio.zig");
 pub const Thread = @import("termio/Thread.zig");
