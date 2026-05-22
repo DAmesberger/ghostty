@@ -111,9 +111,8 @@ extension Ghostty {
 
             // Free is safe to call after close; libghostty handles both.
             guard let h = handle else { return }
-            let api = LibghosttySSHAPI.current
             Task.detached {
-                api.channelFree(h)
+                ghostty_channel_free(h)
             }
         }
 
@@ -152,7 +151,7 @@ extension Ghostty {
 
                 let written = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
                     let base = raw.baseAddress!.advanced(by: offset)
-                    let n = LibghosttySSHAPI.current.channelWrite(h, base, attempt)
+                    let n = ghostty_channel_write(h, base, attempt)
                     return n
                 }
 
@@ -171,13 +170,13 @@ extension Ghostty {
 
         /// Half-close the local end of the channel.
         func sendEOF() {
-            LibghosttySSHAPI.current.channelEof(requireHandle())
+            ghostty_channel_eof(requireHandle())
         }
 
         /// Close the channel with a NORMAL reason. The `closed` event will
         /// arrive on `events` after the close round-trip.
         func close() {
-            LibghosttySSHAPI.current.channelClose(requireHandle(), GHOSTTY_CHANNEL_CLOSE_NORMAL)
+            ghostty_channel_close(requireHandle(), GHOSTTY_CHANNEL_CLOSE_NORMAL)
         }
     }
 }

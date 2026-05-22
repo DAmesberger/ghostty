@@ -155,7 +155,7 @@ extension Ghostty {
                             on_host_key: SSHConnection.cOnHostKey,
                             userdata: Unmanaged.passUnretained(box).toOpaque()
                         )
-                        return LibghosttySSHAPI.current.sshOpen(app, &cCfg, &cbs)
+                        return ghostty_ssh_open(app, &cCfg, &cbs)
                     }
                 }
             }
@@ -166,10 +166,6 @@ extension Ghostty {
                 throw SSHError.openFailed
             }
             self.handle = h
-            // Register the live handle so the test harness can't swap the
-            // LibghosttySSHAPI table out from under it. Balanced by the
-            // decrement in deinit after sshFree.
-            LibghosttySSHAPI.incrementHandleCount()
             // ghostty_ssh_open synchronously emits the initial CONNECTING
             // state before returning, so by the time we reach here it has
             // already been yielded into `state`.
@@ -184,11 +180,9 @@ extension Ghostty {
             // succeeded — in that case there is nothing to free and the
             // handle counter was never incremented.
             guard let h = handle else { return }
-            let api = LibghosttySSHAPI.current
             Task.detached {
-                api.sshClose(h)
-                api.sshFree(h)
-                LibghosttySSHAPI.decrementHandleCount()
+                ghostty_ssh_close(h)
+                ghostty_ssh_free(h)
             }
         }
 
@@ -229,7 +223,7 @@ extension Ghostty {
                     on_close: SSHConnection.cOnChannelClose,
                     userdata: Unmanaged.passUnretained(channelBox).toOpaque()
                 )
-                return LibghosttySSHAPI.current.sshOpenChannel(
+                return ghostty_ssh_open_channel(
                     requireHandle(),
                     service.cService,
                     raw.baseAddress,
@@ -270,7 +264,7 @@ extension Ghostty {
                             on_close: SSHConnection.cOnChannelClose,
                             userdata: Unmanaged.passUnretained(channelBox).toOpaque()
                         )
-                        return LibghosttySSHAPI.current.sshAttachSurface(
+                        return ghostty_ssh_attach_surface(
                             requireHandle(),
                             groupPtr,
                             surfacePtr,
@@ -296,7 +290,7 @@ extension Ghostty {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[SessionListEntry], Swift.Error>) in
                 let collector = SessionListCollector(continuation: cont)
                 let ptr = Unmanaged.passRetained(collector).toOpaque()
-                let ok = LibghosttySSHAPI.current.sshListSessions(
+                let ok = ghostty_ssh_list_sessions(
                     requireHandle(), SSHConnection.cOnSessionEntry, ptr)
                 if !ok {
                     // Take it back and drop on the floor.
@@ -307,11 +301,11 @@ extension Ghostty {
         }
 
         func requestReconnect() {
-            LibghosttySSHAPI.current.sshRequestReconnect(requireHandle())
+            ghostty_ssh_request_reconnect(requireHandle())
         }
 
         func cancelReconnect() {
-            LibghosttySSHAPI.current.sshCancelReconnect(requireHandle())
+            ghostty_ssh_cancel_reconnect(requireHandle())
         }
 
         // MARK: Helpers

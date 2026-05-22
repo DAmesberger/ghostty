@@ -225,8 +225,7 @@ extension Ghostty.SSHConnection {
             knownMismatch: hk.known_mismatch,
             submit: { accept, persist in
                 let h = ghostty_ssh_t(bitPattern: handleBits)
-                Ghostty.LibghosttySSHAPI.current.sshSubmitHostKeyDecision(
-                    h, token, accept, persist)
+                ghostty_ssh_submit_host_key_decision(h, token, accept, persist)
             }
         )
 
@@ -270,12 +269,12 @@ extension Ghostty.SSHConnection {
                 submit: { pw in
                     let h = ghostty_ssh_t(bitPattern: handleBits)
                     pw.withCString { ptr in
-                        Ghostty.LibghosttySSHAPI.current.sshSubmitPassword(h, token, ptr)
+                        ghostty_ssh_submit_password(h, token, ptr)
                     }
                 },
                 cancel: {
                     let h = ghostty_ssh_t(bitPattern: handleBits)
-                    Ghostty.LibghosttySSHAPI.current.sshCancelPassword(h, token)
+                    ghostty_ssh_cancel_password(h, token)
                 }
             ))
         case GHOSTTY_SSH_STATE_UPLOADING:
