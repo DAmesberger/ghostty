@@ -40,6 +40,10 @@ wasm_shared: bool = true,
 /// Ghostty exe properties
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
+/// XDG state subdirectory where crash reports are written. Embedders
+/// (e.g. cmux) override this via `-Dcrash-report-subdir=...` to route
+/// crashes to their own namespace.
+crash_report_subdir: []const u8 = "ghostty/crash",
 
 /// Binary properties
 pie: bool = false,
@@ -287,6 +291,20 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
             .build = vsn.short_hash,
         };
     };
+
+    //---------------------------------------------------------------
+    // Crash report subdirectory
+
+    config.crash_report_subdir = b.option(
+        []const u8,
+        "crash-report-subdir",
+        "XDG state subdirectory where crash reports are stored.",
+    ) orelse "ghostty/crash";
+    if (config.crash_report_subdir.len == 0 or
+        std.fs.path.isAbsolute(config.crash_report_subdir))
+    {
+        @panic("crash-report-subdir must be a non-empty relative path");
+    }
 
     //---------------------------------------------------------------
     // Binary Properties
