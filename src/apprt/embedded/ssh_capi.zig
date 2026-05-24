@@ -1274,6 +1274,9 @@ const SetupWorker = struct {
     fn run(self: *SetupWorker) void {
         const handle = self.handle;
         const entry = self.entry;
+        log.info("setupConnection: worker spawned target={s}", .{
+            entry.ctx.ssh_target,
+        });
         defer {
             // Capture handle.alloc by value BEFORE the fetchSub so we
             // never dereference handle.* afterwards (ghostty_ssh_close
@@ -1328,6 +1331,9 @@ const SetupWorker = struct {
         // up. Redundant if another concurrent attacher already
         // broadcast — `wireMuxTransport` and the listener-side
         // handling are both idempotent on already-wired state.
+        log.info("setupConnection: ready, broadcasting .connected target={s}", .{
+            entry.ctx.ssh_target,
+        });
         SshConnectionManager.broadcastConnectionState(entry, .connected);
     }
 };
@@ -1555,10 +1561,15 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
         h.entry = null;
     }
 
-    h.emitState(.{ .kind = .disconnected, .payload = .{ .disconnect = .{
-        .attempts_made = 0,
-        .reason = .cancelled,
-    } } });
+    // Do NOT fire a synthetic `.disconnected` here. `ghostty_ssh_close`
+    // is embedder-initiated (typically from a Swift `SSHConnection.deinit`),
+    // so the embedder has no need for the notification AND its callback
+    // context may already be torn down. The Swift M6 smoke captured a
+    // SIGSEGV via this exact path: `SSHConnection.deinit` triggered
+    // `ghostty_ssh_close`, which emitted `.disconnected`, which called
+    // `cOnState` → `ConnectionBox.resolved()`, which `objc_msgSend`'d a
+    // freed box. Channel-close + listener-unregister already happened
+    // above; nothing else needs to fire.
 }
 
 /// Implements `ghostty_ssh_free`.
