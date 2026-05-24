@@ -1569,11 +1569,15 @@ export fn ghostty_ssh_free(ssh: ?*SshHandle) void {
 /// `ctx` the mux passes back to the bridge callbacks, which forward
 /// to the embedder's `ghostty_channel_callbacks_t`.
 ///
-/// When the connection has no ClientMux (production builds before
-/// Part 6 wires `sshThreadMain` → per-Entry ClientMux; see task
-/// #23), the channel cannot reach a daemon — the handle is still
-/// allocated, but immediately reports `on_close(SERVICE_ERROR)` so
-/// embedders observe the dead-channel edge instead of hanging.
+/// `client_mux` is auto-wired by `onStateListener` the moment the
+/// underlying SSH connection broadcasts `.connected` (which the M1
+/// `setupConnection` worker drives, see `spawnSetupWorker`). Embedders
+/// MUST wait for the `.connected` state on `ghostty_ssh_callbacks_t`
+/// before opening channels; calling this before the listener fires
+/// returns a handle that immediately reports `on_close(SERVICE_ERROR)`.
+/// This is a contract check rather than a production failure mode —
+/// the early-out exists so the embedder observes a clean dead-channel
+/// edge instead of a hung callback.
 export fn ghostty_ssh_open_channel(
     ssh: ?*SshHandle,
     service: ChannelService,
@@ -1595,9 +1599,10 @@ export fn ghostty_ssh_open_channel(
         return null;
     };
 
-    // No transport yet → synthesize the dead-channel close so the
-    // embedder's on_close edge fires immediately. Production frame
-    // routing lands in Part 6 (task #23).
+    // Connection still bringing up its mux — embedder called this
+    // before the `.connected` state arrived (see docstring). Synthesize
+    // the dead-channel close so the embedder observes a clean edge
+    // instead of a hung handle.
     const mux = h.client_mux orelse {
         ch.emitClose(.service_error, null);
         return ch;
