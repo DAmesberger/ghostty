@@ -149,6 +149,19 @@ pub const Entry = struct {
     quit_pipe: [2]posix.fd_t = .{ -1, -1 },
     write_pipe: [2]posix.fd_t = .{ -1, -1 },
 
+    /// Serialises ALL libssh2 calls on this Entry's underlying session.
+    /// Acquired by `sshThreadMain` around every libssh2 call AND by any
+    /// `SshChannelStreamTransport` running against a mux channel on the
+    /// same session (via `Config.external_mutex`). libssh2 is not
+    /// thread-safe; without this lock, concurrent reads/writes on
+    /// different channels of the same session corrupt the shared
+    /// transport-level state inside libssh2 (the original M1-revealed
+    /// crash was a memmove on a freed transport buffer in
+    /// `_libssh2_transport_read`). Never held across a blocking wait —
+    /// the SSH thread releases it before `posix.poll`, the transport
+    /// threads release before their `pollForRead`/`pollForWrite` helpers.
+    libssh2_mutex: std.Thread.Mutex = .{},
+
     // Registered sessions (keyed by group_id) for frame dispatch
     sessions: std.AutoArrayHashMap(Uuid, *Session),
     surfaces_mutex: std.Thread.Mutex = .{},
@@ -643,12 +656,21 @@ pub fn sshThreadMain(entry: *Entry) void {
     entry.keepalive_active = false;
 
     while (true) {
-        // 1. Process SSH transport (needed for tunneled sessions)
+        // 1. Process SSH transport (needed for tunneled sessions).
+        //    libssh2 is single-threaded per-session; the per-Entry mutex
+        //    serialises this with any SshChannelStreamTransport running
+        //    on a mux channel of the same session (see Entry.libssh2_mutex).
+        entry.libssh2_mutex.lock();
         sess.pollTransport(1);
+        entry.libssh2_mutex.unlock();
 
-        // 2. Drain reads (non-blocking tight loop)
+        // 2. Drain reads (non-blocking tight loop). Re-acquire per
+        //    iteration so a transport-reader thread can make progress
+        //    between our reads instead of starving on a long burst.
         while (true) {
+            entry.libssh2_mutex.lock();
             const rc = channel.readNonBlock(&read_buf);
+            entry.libssh2_mutex.unlock();
             if (rc > 0) {
                 frame_buf.appendSlice(
                     entry.alloc,
@@ -658,20 +680,31 @@ pub fn sshThreadMain(entry: *Entry) void {
         }
 
         // Check channel EOF (remote ghostty exited — all sessions dead)
-        if (channel.eof()) {
+        entry.libssh2_mutex.lock();
+        const channel_is_eof = channel.eof();
+        entry.libssh2_mutex.unlock();
+        if (channel_is_eof) {
             log.info("ssh channel EOF", .{});
             notifyAllSurfaces(entry);
             return;
         }
 
-        // Process complete protocol frames (updates entry.last_keepalive_received)
+        // Process complete protocol frames (updates entry.last_keepalive_received).
+        // processFrames is in-memory only — never calls libssh2 — so the
+        // mutex stays released here, letting the transport thread make
+        // progress while we dispatch frames.
         processFrames(&frame_buf, entry);
 
-        // 3. Drain write queue
+        // 3. Drain write queue. sendFrame issues 1-2 libssh2 writes; the
+        //    lock is re-taken per request so the transport thread gets
+        //    interleaved time between bursts.
         {
             entry.write_queue_mu.lock();
             for (entry.write_queue.items) |req| {
-                sendFrame(channel, req.kind, req.target_id, req.data) catch |err| {
+                entry.libssh2_mutex.lock();
+                const send_err = sendFrame(channel, req.kind, req.target_id, req.data);
+                entry.libssh2_mutex.unlock();
+                send_err catch |err| {
                     log.warn("ssh write failed: {}", .{err});
                 };
                 entry.alloc.free(req.data);
@@ -686,7 +719,10 @@ pub fn sshThreadMain(entry: *Entry) void {
         // 4. Keepalive: send ping if interval elapsed, detect stale via pong
         const now = std.time.nanoTimestamp();
         if (now - last_keepalive_sent >= session.protocol.keepalive_interval_ns) {
-            sendFrame(channel, .ping, 0, "") catch |err| {
+            entry.libssh2_mutex.lock();
+            const ping_err = sendFrame(channel, .ping, 0, "");
+            entry.libssh2_mutex.unlock();
+            ping_err catch |err| {
                 log.warn("ping send failed: {}", .{err});
             };
             last_keepalive_sent = now;
@@ -721,7 +757,10 @@ pub fn sshThreadMain(entry: *Entry) void {
 
         // 5. Compute poll events based on libssh2 block directions
         pollfds[0].events = posix.POLL.IN;
-        if (sess.needsWrite()) pollfds[0].events |= posix.POLL.OUT;
+        entry.libssh2_mutex.lock();
+        const sess_needs_write = sess.needsWrite();
+        entry.libssh2_mutex.unlock();
+        if (sess_needs_write) pollfds[0].events |= posix.POLL.OUT;
 
         // 6. Compute poll timeout: wake up in time to send the next ping
         const elapsed_since_send = now - last_keepalive_sent;
@@ -743,7 +782,10 @@ pub fn sshThreadMain(entry: *Entry) void {
             // Drain write queue one final time so close frames are sent
             entry.write_queue_mu.lock();
             for (entry.write_queue.items) |req| {
-                sendFrame(channel, req.kind, req.target_id, req.data) catch |err| {
+                entry.libssh2_mutex.lock();
+                const send_err = sendFrame(channel, req.kind, req.target_id, req.data);
+                entry.libssh2_mutex.unlock();
+                send_err catch |err| {
                     log.warn("final write failed: {}", .{err});
                 };
                 entry.alloc.free(req.data);
@@ -755,8 +797,10 @@ pub fn sshThreadMain(entry: *Entry) void {
             // In non-blocking mode, channel.write() may leave data in
             // libssh2's internal buffer. Switch to blocking and poll
             // until the transport has no more outbound data.
+            entry.libssh2_mutex.lock();
             sess.setBlocking(1);
             sess.pollTransport(500);
+            entry.libssh2_mutex.unlock();
 
             return;
         }

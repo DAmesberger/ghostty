@@ -65,6 +65,17 @@ pub const Config = struct {
     /// Called once the read loop exits. Fires on the reader thread.
     on_disconnect: DisconnectHandler,
     ctx: ?*anyopaque = null,
+    /// Optional pointer to a mutex shared with OTHER libssh2 users on the
+    /// same session (e.g. the per-Entry `sshThreadMain` reading on the
+    /// session's primary multiplex channel). When provided, this mutex
+    /// REPLACES the transport's internal `ssh_mutex` so every libssh2 call
+    /// against the underlying session — from any thread, on any channel —
+    /// is serialised through one lock. Required whenever the session is
+    /// shared across the SSH I/O thread + this transport's reader/writer
+    /// threads (the libghostty C-API path: see `Entry.libssh2_mutex`).
+    /// Null = transport's own ssh_mutex is the only synchroniser (legacy
+    /// test path where the test owns the whole session).
+    external_mutex: ?*std.Thread.Mutex = null,
 };
 
 pub const DisconnectHandler = *const fn (ctx: ?*anyopaque, reason: DisconnectReason) void;
@@ -89,7 +100,9 @@ ssh_fd: posix.fd_t,
 /// here, read end is watched by the reader poll loop.
 stop_pipe: [2]posix.fd_t,
 
-/// Serialises all libssh2 calls. Never held across a blocking wait.
+/// Serialises libssh2 calls when no `external_mutex` is supplied (legacy
+/// test path). When `config.external_mutex != null`, this field is unused
+/// and `ssh2Mutex` returns the shared mutex instead.
 ssh_mutex: std.Thread.Mutex = .{},
 
 reader_thread: ?std.Thread = null,
@@ -98,6 +111,14 @@ writer_thread: ?std.Thread = null,
 /// Set by `close` before waking the threads. Atomic so threads can
 /// check without acquiring a mutex.
 stopped: std.atomic.Value(bool) = .init(false),
+
+/// Pick the right mutex for libssh2 serialisation: the externally-
+/// provided per-session lock when one was supplied (production), else
+/// the internal one (tests). Inlined so the indirection is invisible
+/// in profiles.
+inline fn ssh2Mutex(self: *SshChannelStreamTransport) *std.Thread.Mutex {
+    return self.config.external_mutex orelse &self.ssh_mutex;
+}
 
 pub fn init(alloc: Allocator, config: Config) !*SshChannelStreamTransport {
     if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
@@ -214,10 +235,11 @@ fn readerLoop(self: *SshChannelStreamTransport) void {
 
         // Non-blocking read from the libssh2 channel.
         // Use Channel.readNonBlock to stay in ssh.zig's cimport namespace.
-        self.ssh_mutex.lock();
+        const ssh2_mu = self.ssh2Mutex();
+        ssh2_mu.lock();
         const rc = self.config.channel.readNonBlock(&buf);
         const eof = self.config.channel.eof();
-        self.ssh_mutex.unlock();
+        ssh2_mu.unlock();
 
         if (rc > 0) {
             // Got bytes — write them all to the socketpair.
@@ -294,9 +316,10 @@ fn writerLoop(self: *SshChannelStreamTransport) void {
         while (written < n) {
             if (self.stopped.load(.acquire)) return;
 
-            self.ssh_mutex.lock();
+            const ssh2_mu = self.ssh2Mutex();
+            ssh2_mu.lock();
             const wrc = self.config.channel.writeNonBlock(buf[written..n]);
-            self.ssh_mutex.unlock();
+            ssh2_mu.unlock();
 
             if (wrc > 0) {
                 written += @intCast(wrc);

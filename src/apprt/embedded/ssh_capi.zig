@@ -557,11 +557,19 @@ pub const SshHandle = struct {
             return;
         };
 
-        // Allocate transport first so we can get the mux_fd.
+        // Allocate transport first so we can get the mux_fd. Pass the
+        // per-Entry libssh2 mutex so the transport's reader/writer
+        // threads serialise with `sshThreadMain` on the same session.
+        // Without this, two threads concurrently calling
+        // `libssh2_channel_read_ex` on the SAME session crash inside
+        // `_libssh2_transport_read` (the M1-revealed race; see
+        // `Entry.libssh2_mutex` docstring in SshConnectionManager.zig).
+        const external_mu: ?*std.Thread.Mutex = if (self.entry) |e| &e.libssh2_mutex else null;
         const t = SshChannelStreamTransport.init(self.alloc, .{
             .channel = ssh_channel,
             .on_disconnect = onTransportDisconnect,
             .ctx = self,
+            .external_mutex = external_mu,
         }) catch |err| {
             log.warn("wireMuxTransport: transport init failed: {}", .{err});
             self.alloc.destroy(mux);
