@@ -78,6 +78,7 @@ const protocol = @import("../../session/protocol.zig");
 const session_shared = @import("../../session/shared.zig");
 const channel_mux = @import("../../session/channel_mux.zig");
 const ssh_mod = @import("../../session/ssh.zig");
+const session_client = @import("../../session/client.zig");
 const SshConnectionManager = @import("../../termio/SshConnectionManager.zig");
 const apprt_embedded = @import("../embedded.zig");
 const SshChannelStreamTransport = @import("../../termio/SshChannelStreamTransport.zig");
@@ -1192,9 +1193,139 @@ export fn ghostty_ssh_open(
             return null;
         };
         handle.listener_registered = true;
+
+        // Spawn the SSH setup worker. attachRemoteSurface BLOCKS — it
+        // runs the libssh2 handshake, possibly waits on a password
+        // condvar, and uploads/launches the remote daemon. The C-API
+        // contract is non-blocking, so this work lives on a worker
+        // thread (same `active_workers` pattern as
+        // `ghostty_ssh_list_sessions`). The worker also coordinates
+        // with concurrent attachers (a GTK terminal sharing the same
+        // host, another C-API handle) via the Entry's `conn_state`
+        // atomic, mirroring `termio/Remote.zig:threadEnter`. On
+        // success it broadcasts `.connected` so this handle's
+        // listener fires `wireMuxTransport` and the channel mux
+        // becomes available.
+        const attach_cfg = session_client.AttachConfig{
+            .max_reconnect_attempts = entry.max_reconnect_attempts,
+            .reconnect_backoff = entry.reconnect_backoff,
+            .reconnect_interval_ms = entry.reconnect_interval_ms,
+            .scrollback_limit = entry.scrollback_limit,
+        };
+
+        if (!spawnSetupWorker(handle, mgr, entry, attach_cfg)) {
+            log.warn("ghostty_ssh_open: setup worker spawn failed", .{});
+            SshConnectionManager.unregisterStateListener(entry, handle);
+            handle.listener_registered = false;
+            mgr.release(target_slice, jump_slice);
+            handle.manager = null;
+            handle.entry = null;
+            handle.emitState(.{ .kind = .failed, .payload = .{ .fail = .{
+                .reason = .unknown,
+                .message = null,
+            } } });
+            return null;
+        }
     }
 
     return handle;
+}
+
+/// Worker that drives `session_client.attachRemoteSurface` off the
+/// embedder's thread so `ghostty_ssh_open` stays non-blocking. Holds
+/// no allocation of its own beyond the captured pointers; the
+/// `active_workers` counter on the handle gates `ghostty_ssh_close`'s
+/// entry release so the captured `entry` pointer stays valid for the
+/// full run.
+const SetupWorker = struct {
+    handle: *SshHandle,
+    manager: *SshConnectionManager,
+    entry: *SshConnectionManager.Entry,
+    cfg: session_client.AttachConfig,
+
+    fn run(self: *SetupWorker) void {
+        const handle = self.handle;
+        const entry = self.entry;
+        defer {
+            // Capture handle.alloc by value BEFORE the fetchSub so we
+            // never dereference handle.* afterwards (ghostty_ssh_close
+            // may race ahead the moment active_workers hits 0). Same
+            // UAF discipline as `ghostty_ssh_list_sessions`.
+            const alloc = handle.alloc;
+            _ = handle.active_workers.fetchSub(1, .acq_rel);
+            alloc.destroy(self);
+        }
+
+        // Race-prevention via the per-Entry atomic. Mirror of the
+        // pattern in `termio/Remote.zig:threadEnter` so the GTK and
+        // libghostty paths agree on first-attacher election.
+        const prev = entry.conn_state.cmpxchgStrong(
+            .uninitialized,
+            .connecting,
+            .seq_cst,
+            .seq_cst,
+        );
+        if (prev == null) {
+            // Won the race — drive the full setup. `attachRemoteSurface`
+            // already broadcasts intermediate states (UPLOADING, SETUP,
+            // PASSWORD_REQUIRED, FAILED) via `pushAttachState`; only the
+            // final `.connected` broadcast is our responsibility per the
+            // helper's docstring.
+            session_client.attachRemoteSurface(
+                handle.alloc,
+                self.manager,
+                entry,
+                null,
+                self.cfg,
+            ) catch |err| {
+                log.warn("ghostty_ssh_open: setupConnection failed: {}", .{err});
+                entry.conn_state.store(.failed, .seq_cst);
+                return;
+            };
+            entry.conn_state.store(.ready, .seq_cst);
+        } else {
+            // Lost the race — another attacher is bringing up the
+            // connection. Poll the atomic until it settles. If the
+            // handle is closed mid-wait, bail without broadcasting.
+            while (true) {
+                if (handle.closed.load(.acquire)) return;
+                const state = entry.conn_state.load(.seq_cst);
+                if (state == .ready) break;
+                if (state == .failed) return;
+                std.Thread.sleep(1_000_000); // 1ms
+            }
+        }
+
+        // Signal the listener registry that this connection is fully
+        // up. Redundant if another concurrent attacher already
+        // broadcast — `wireMuxTransport` and the listener-side
+        // handling are both idempotent on already-wired state.
+        SshConnectionManager.broadcastConnectionState(entry, .connected);
+    }
+};
+
+fn spawnSetupWorker(
+    handle: *SshHandle,
+    manager: *SshConnectionManager,
+    entry: *SshConnectionManager.Entry,
+    cfg: session_client.AttachConfig,
+) bool {
+    const worker = handle.alloc.create(SetupWorker) catch return false;
+    worker.* = .{
+        .handle = handle,
+        .manager = manager,
+        .entry = entry,
+        .cfg = cfg,
+    };
+    _ = handle.active_workers.fetchAdd(1, .acq_rel);
+    const thread = std.Thread.spawn(.{}, SetupWorker.run, .{worker}) catch {
+        _ = handle.active_workers.fetchSub(1, .acq_rel);
+        handle.alloc.destroy(worker);
+        return false;
+    };
+    thread.setName("ssh-capi-setup") catch {};
+    thread.detach();
+    return true;
 }
 
 /// Implements `ghostty_ssh_submit_password`. Validates the token
@@ -1325,6 +1456,17 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
     const h = ssh orelse return;
     if (h.closed.swap(true, .acq_rel)) return;
 
+    // If the setup worker is parked on the password condvar, wake it
+    // so it can observe the cancellation and exit. Without this the
+    // close path would block in the worker-wait loop below until the
+    // SSH handshake timeout fired.
+    if (h.entry) |entry| {
+        entry.auth_state.mutex.lock();
+        entry.auth_state.cancelled = true;
+        entry.auth_state.cond.broadcast();
+        entry.auth_state.mutex.unlock();
+    }
+
     // Unregister the listener BEFORE we tear down channels so any
     // late state broadcasts from the SSH thread (e.g. as the Entry
     // notices the channel drop) don't race with the close cascade.
@@ -1333,6 +1475,17 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
             SshConnectionManager.unregisterStateListener(entry, h);
         }
         h.listener_registered = false;
+    }
+
+    // Drain in-flight setup workers before releasing the entry. The
+    // setup worker captured `entry` by raw pointer; releasing the
+    // manager ref while the worker is still inside attachRemoteSurface
+    // would UAF the moment the worker touched any entry field. The
+    // worker watches `closed` itself, so this loop is bounded by the
+    // remaining libssh2 handshake/upload step rather than the full
+    // auth wait.
+    while (h.active_workers.load(.acquire) > 0) {
+        std.Thread.sleep(1_000_000); // 1ms
     }
 
     // Snapshot the channel list under the mutex, then close each
@@ -3058,8 +3211,6 @@ test "onStateListener wires client_mux on .connected via tryOpenChannel" {
     // alloc, ctx.session, ctx.alloc, ctx.ssh_target, ctx.jump, and
     // remote_bin_path (under surfaces_mutex). The sessions map is never
     // touched by tryOpenChannel so we can leave it empty.
-    const session_client = @import("../../session/client.zig");
-
     const entry = try alloc.create(SshConnectionManager.Entry);
     defer {
         // Don't call entry.ctx.deinit() — we close ssh_session above via defer.
