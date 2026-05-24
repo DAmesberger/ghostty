@@ -1085,6 +1085,18 @@ pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     entry.surfaces_mutex.unlock();
     defer alloc.free(remote_bin_path);
 
+    // tryOpenChannel can be called concurrently with `sshThreadMain`
+    // on the same Entry (e.g. from `onStateListener` running on the
+    // M1 SetupWorker's thread after broadcasting `.connected`). The
+    // libssh2 calls inside `openMultiplexChannel` and
+    // `ensureRemoteDaemon` MUST serialise with the SSH thread's calls
+    // on the same session, otherwise concurrent `libssh2_channel_*`
+    // and transport-level reads/writes corrupt internal lists (we hit
+    // this as a SEGV inside `_libssh2_list_first` ← `_libssh2_packet_ask`
+    // ← `_libssh2_channel_free` during the M6 smoke).
+    entry.libssh2_mutex.lock();
+    defer entry.libssh2_mutex.unlock();
+
     // First attempt
     if (session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path)) |ch| {
         return ch;
