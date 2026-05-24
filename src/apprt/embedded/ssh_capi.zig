@@ -1991,6 +1991,20 @@ const AttachWorker = struct {
         };
         defer entry.alloc.free(open_payload);
 
+        // M6 instrumentation: log every Open we send so the daemon-side
+        // diagnosis can cross-reference against an early `.eof` response.
+        log.info("attach_surface: Open enqueue target={d} type={s} group_zero={} surface_zero={} rows={d} cols={d} scrollback={d} label_len={d} payload_len={d}", .{
+            target_id,
+            @tagName(open_type),
+            session_shared.isZeroUuid(self.group_id),
+            session_shared.isZeroUuid(self.surface_id),
+            self.rows,
+            self.cols,
+            entry.scrollback_limit,
+            self.label.len,
+            open_payload.len,
+        });
+
         // enqueueWrite duplicates the payload; free is safe after.
         SshConnectionManager.enqueueWrite(entry, .open, target_id, open_payload);
 

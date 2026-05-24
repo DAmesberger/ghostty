@@ -1139,6 +1139,33 @@ fn dispatchCAPIFrame(
     kind: session.protocol.Kind,
     payload: []const u8,
 ) bool {
+    // M6 instrumentation: log every frame routed to a CAPI surface so we
+    // can see EXACTLY what the daemon sends after an `Open` frame. The
+    // M6 smoke test surfaced an early-`.eof` race where the daemon closes
+    // the surface before any `.data_out` arrives — without this log we
+    // can't distinguish "daemon rejected the Open" from "daemon accepted
+    // then killed". Use `log.info` (not debug) so it shows up in stderr
+    // without setting a debug filter.
+    {
+        var hex_buf: [96]u8 = undefined;
+        const hex_len = blk: {
+            const n = @min(payload.len, hex_buf.len / 2);
+            const hex_digits = "0123456789abcdef";
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                hex_buf[i * 2] = hex_digits[(payload[i] >> 4) & 0x0f];
+                hex_buf[i * 2 + 1] = hex_digits[payload[i] & 0x0f];
+            }
+            break :blk n * 2;
+        };
+        log.info("capi.frame kind={s} target={d} len={d} hex={s}{s}", .{
+            @tagName(kind),
+            target_id,
+            payload.len,
+            hex_buf[0..hex_len],
+            if (payload.len > hex_buf.len / 2) "..." else "",
+        });
+    }
     entry.capi_mutex.lock();
     const cbs: CAPISurfaceCallbacks = blk: {
         const surface = entry.capi_surfaces.getPtr(target_id) orelse {
