@@ -80,6 +80,54 @@ pub const WriteRequest = struct {
     data: []const u8, // owned by entry allocator, freed after send
 };
 
+/// Callbacks for a C-API surface registered on an Entry. The embedded
+/// libghostty path uses these to receive daemon-side frames for a
+/// remote PTY without going through the Termio-bound SurfaceSlot
+/// machinery (the C-API consumer owns the terminal renderer itself).
+///
+/// All callbacks fire on the SSH I/O thread. The bytes passed to
+/// `on_data` are borrowed for the duration of the call only — the
+/// embedder must copy if it needs to retain them past the callback
+/// return. `group_id`/`surface_id` for `on_opened` are valid for the
+/// duration of the callback only (caller's stack); copy if needed.
+///
+/// Callbacks use the Zig calling convention rather than `.c` because
+/// slices have no stable in-memory representation across the C ABI.
+/// The libghostty C-API layer wraps these in extern-C trampolines.
+pub const CAPISurfaceCallbacks = struct {
+    ctx: ?*anyopaque,
+    /// Payload from a `data_out` frame (raw PTY bytes from the remote).
+    on_data: *const fn (ctx: ?*anyopaque, bytes: []const u8) void,
+    /// Parsed `opened` frame — the remote daemon successfully created
+    /// or attached the surface. Embedders must copy the UUIDs if they
+    /// need them past the call.
+    on_opened: ?*const fn (
+        ctx: ?*anyopaque,
+        group_id: *const [16]u8,
+        surface_id: *const [16]u8,
+        history_rows: u32,
+    ) void = null,
+    /// Remote PTY exited (daemon-side `.eof` frame for this surface).
+    on_exit: ?*const fn (
+        ctx: ?*anyopaque,
+        exit_code: i32,
+    ) void = null,
+};
+
+/// Per-surface state held by the C-API registry on an Entry. Lives
+/// alongside `Entry.sessions` (which holds the Termio-bound surfaces);
+/// target_ids are globally unique across both registries thanks to
+/// `allocateTarget`, so a given frame's target dispatches to at most
+/// one path.
+pub const CAPISurface = struct {
+    target_id: u16,
+    /// Group + surface UUIDs originally requested. Overwritten when an
+    /// `opened` frame supplies the daemon-authoritative values.
+    group_id: Uuid,
+    surface_id: Uuid,
+    callbacks: CAPISurfaceCallbacks,
+};
+
 pub const EntryState = enum(u8) {
     uninitialized,
     connecting,
@@ -104,6 +152,14 @@ pub const Entry = struct {
     // Registered sessions (keyed by group_id) for frame dispatch
     sessions: std.AutoArrayHashMap(Uuid, *Session),
     surfaces_mutex: std.Thread.Mutex = .{},
+
+    /// Parallel registry of C-API surfaces (terminal channels opened via
+    /// `ghostty_ssh_attach_surface`). Keyed by globally-unique target_id
+    /// allocated via `allocateTarget`, so a frame target hits at most
+    /// one registry. Frames are dispatched by `dispatchCAPIFrame` in
+    /// `processFrames` before falling through to the Termio path.
+    capi_surfaces: std.AutoArrayHashMapUnmanaged(u16, CAPISurface) = .empty,
+    capi_mutex: std.Thread.Mutex = .{},
 
     // Write queue (thread-safe)
     write_queue_mu: std.Thread.Mutex = .{},
@@ -200,6 +256,7 @@ pub fn deinit(self: *SshConnectionManager) void {
         }
         entry.write_queue.deinit(entry.alloc);
         deinitSessions(entry);
+        entry.capi_surfaces.deinit(entry.alloc);
         entry.ssh_listeners.deinit(entry.alloc);
         entry.ctx.deinit();
         self.alloc.destroy(entry);
@@ -538,6 +595,7 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
         if (entry.remote_bin_path.len > 0) self.alloc.free(entry.remote_bin_path);
         if (entry.channel) |*ch| ch.close();
         deinitSessions(entry);
+        entry.capi_surfaces.deinit(entry.alloc);
         entry.ssh_listeners.deinit(entry.alloc);
         entry.ctx.deinit();
         self.alloc.destroy(entry);
@@ -994,6 +1052,80 @@ pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     return session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path) catch null;
 }
 
+/// Register a C-API terminal surface on the given Entry. The
+/// `surface.target_id` MUST come from a prior `allocateTarget` call so
+/// it doesn't collide with Termio-bound `SurfaceSlot.target_id`s.
+/// Returns `error.OutOfMemory` if the registry can't grow.
+pub fn registerCAPISurface(entry: *Entry, surface: CAPISurface) !void {
+    entry.capi_mutex.lock();
+    defer entry.capi_mutex.unlock();
+    try entry.capi_surfaces.put(entry.alloc, surface.target_id, surface);
+}
+
+/// Unregister a previously-registered C-API surface. After this
+/// returns, the SSH I/O thread will not fire any callback on the
+/// surface (the registry lookup happens under `capi_mutex`). Idempotent.
+pub fn unregisterCAPISurface(entry: *Entry, target_id: u16) void {
+    entry.capi_mutex.lock();
+    defer entry.capi_mutex.unlock();
+    _ = entry.capi_surfaces.swapRemove(target_id);
+}
+
+/// Snapshot a CAPI surface's callbacks (and update its UUIDs on
+/// `opened`) under `capi_mutex`, then dispatch outside the lock so
+/// callbacks can safely re-enter SshConnectionManager APIs (e.g.
+/// enqueueWrite, unregister). Returns `true` if the frame was consumed
+/// by a CAPI surface (the Termio path must NOT also dispatch it),
+/// `false` if no matching surface exists.
+fn dispatchCAPIFrame(
+    entry: *Entry,
+    target_id: u16,
+    kind: session.protocol.Kind,
+    payload: []const u8,
+) bool {
+    entry.capi_mutex.lock();
+    const cbs: CAPISurfaceCallbacks = blk: {
+        const surface = entry.capi_surfaces.getPtr(target_id) orelse {
+            entry.capi_mutex.unlock();
+            return false;
+        };
+        // For `opened`, parse and update the stored UUIDs *under* the
+        // lock so a concurrent registrant doesn't observe stale ids.
+        // Then snapshot the callbacks and dispatch outside the lock.
+        if (kind == .opened) {
+            if (session.protocol.Opened.parseHeader(payload)) |parsed| {
+                surface.group_id = parsed.group_id;
+                surface.surface_id = parsed.surface_id;
+            } else |_| {
+                // Fall through with original ids — dispatch still fires.
+            }
+        }
+        break :blk surface.callbacks;
+    };
+    entry.capi_mutex.unlock();
+
+    switch (kind) {
+        .data_out => cbs.on_data(cbs.ctx, payload),
+        .opened => {
+            const parsed = session.protocol.Opened.parseHeader(payload) catch return true;
+            if (cbs.on_opened) |f| {
+                f(cbs.ctx, &parsed.group_id, &parsed.surface_id, parsed.history_rows);
+            }
+        },
+        .eof => {
+            // Daemon-side surface exited. Map to on_exit(0).
+            if (cbs.on_exit) |f| f(cbs.ctx, 0);
+        },
+        else => {
+            // Unhandled but consumed — don't fall through to the
+            // Termio dispatch. Scrollback, layout, viewer_state, etc.
+            // are session-level frames the CAPI embedder isn't
+            // wired up for yet (M4 follow-up).
+        },
+    }
+    return true;
+}
+
 fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
     while (frame_buf.items.len >= session.protocol.header_size) {
         const header = session.protocol.Header.parseFromBuf(
@@ -1042,6 +1174,16 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
             continue;
         }
 
+        // CAPI fast-path: target IDs are globally allocated, so a per-
+        // target hit here means the frame is for a C-API consumer and
+        // the Termio dispatch must be skipped.
+        if (frame_target != 0) {
+            if (dispatchCAPIFrame(entry, frame_target, kind, payload)) {
+                shiftBuffer(frame_buf, total);
+                continue;
+            }
+        }
+
         // Hold surfaces_mutex during dispatch to prevent use-after-free
         // on surface io pointers (unregisterSurface acquires the same lock).
         entry.surfaces_mutex.lock();
@@ -1059,6 +1201,31 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
             }
         }
         entry.surfaces_mutex.unlock();
+
+        // Broadcast (target=0) frames also fan out to every registered
+        // CAPI surface. The per-target case (frame_target != 0) is
+        // already handled by the fast-path above; reaching here for a
+        // non-zero target means no matching CAPI surface, so we can
+        // skip the CAPI fan-out without risk of double-dispatch.
+        if (frame_target == 0) {
+            entry.capi_mutex.lock();
+            // Snapshot all registered CAPI target_ids under the lock,
+            // then dispatch outside it (dispatchCAPIFrame itself takes
+            // the same lock — re-entering would deadlock).
+            var ids_buf: [32]u16 = undefined;
+            var ids_len: usize = 0;
+            var it = entry.capi_surfaces.iterator();
+            while (it.next()) |kv| {
+                if (ids_len >= ids_buf.len) break;
+                ids_buf[ids_len] = kv.key_ptr.*;
+                ids_len += 1;
+            }
+            entry.capi_mutex.unlock();
+
+            for (ids_buf[0..ids_len]) |tid| {
+                _ = dispatchCAPIFrame(entry, tid, kind, payload);
+            }
+        }
 
         shiftBuffer(frame_buf, total);
     }
@@ -1455,4 +1622,179 @@ fn waitForManualReconnect(entry: *Entry) bool {
             }
         }
     }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+const testing = std.testing;
+
+const CAPITestCtx = struct {
+    data_calls: u32 = 0,
+    last_data: std.ArrayListUnmanaged(u8) = .empty,
+    opened_calls: u32 = 0,
+    last_group: Uuid = std.mem.zeroes(Uuid),
+    last_surface: Uuid = std.mem.zeroes(Uuid),
+    last_history: u32 = 0,
+    exit_calls: u32 = 0,
+    last_exit: i32 = -1,
+    alloc: Allocator,
+
+    fn onData(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *CAPITestCtx = @ptrCast(@alignCast(ctx.?));
+        self.data_calls += 1;
+        self.last_data.appendSlice(self.alloc, bytes) catch {};
+    }
+    fn onOpened(
+        ctx: ?*anyopaque,
+        group_id: *const [16]u8,
+        surface_id: *const [16]u8,
+        history_rows: u32,
+    ) void {
+        const self: *CAPITestCtx = @ptrCast(@alignCast(ctx.?));
+        self.opened_calls += 1;
+        @memcpy(&self.last_group, group_id);
+        @memcpy(&self.last_surface, surface_id);
+        self.last_history = history_rows;
+    }
+    fn onExit(ctx: ?*anyopaque, exit_code: i32) void {
+        const self: *CAPITestCtx = @ptrCast(@alignCast(ctx.?));
+        self.exit_calls += 1;
+        self.last_exit = exit_code;
+    }
+
+    fn deinit(self: *CAPITestCtx) void {
+        self.last_data.deinit(self.alloc);
+    }
+};
+
+/// Mock Entry just for CAPI dispatch — bypasses libssh2 / pipes /
+/// channel since dispatchCAPIFrame never touches them. Allocates only
+/// the fields the dispatch path reads (capi_surfaces, capi_mutex,
+/// alloc).
+fn makeMockEntryForCAPI(alloc: Allocator) Entry {
+    return Entry{
+        .alloc = alloc,
+        .ctx = .{
+            .alloc = alloc,
+            .ssh_target = "mock@host",
+            .jump = null,
+        },
+        .remote_bin_path = &.{},
+        .ref_count = 1,
+        .sessions = std.AutoArrayHashMap(Uuid, *Session).init(alloc),
+    };
+}
+
+test "registerCAPISurface + dispatchCAPIFrame routes data_out to the callback" {
+    const alloc = testing.allocator;
+    var entry = makeMockEntryForCAPI(alloc);
+    defer {
+        entry.sessions.deinit();
+        entry.capi_surfaces.deinit(alloc);
+    }
+
+    var ctx = CAPITestCtx{ .alloc = alloc };
+    defer ctx.deinit();
+
+    var gid: Uuid = std.mem.zeroes(Uuid);
+    var sid: Uuid = std.mem.zeroes(Uuid);
+    gid[0] = 0x11;
+    sid[0] = 0x22;
+
+    try registerCAPISurface(&entry, .{
+        .target_id = 7,
+        .group_id = gid,
+        .surface_id = sid,
+        .callbacks = .{
+            .ctx = &ctx,
+            .on_data = CAPITestCtx.onData,
+            .on_opened = CAPITestCtx.onOpened,
+            .on_exit = CAPITestCtx.onExit,
+        },
+    });
+
+    const payload = "hello";
+    try testing.expect(dispatchCAPIFrame(&entry, 7, .data_out, payload));
+    try testing.expectEqual(@as(u32, 1), ctx.data_calls);
+    try testing.expectEqualStrings("hello", ctx.last_data.items);
+}
+
+test "dispatchCAPIFrame returns false for an unregistered target" {
+    const alloc = testing.allocator;
+    var entry = makeMockEntryForCAPI(alloc);
+    defer {
+        entry.sessions.deinit();
+        entry.capi_surfaces.deinit(alloc);
+    }
+    try testing.expect(!dispatchCAPIFrame(&entry, 99, .data_out, "x"));
+}
+
+test "dispatchCAPIFrame parses opened and forwards to on_opened" {
+    const alloc = testing.allocator;
+    var entry = makeMockEntryForCAPI(alloc);
+    defer {
+        entry.sessions.deinit();
+        entry.capi_surfaces.deinit(alloc);
+    }
+
+    var ctx = CAPITestCtx{ .alloc = alloc };
+    defer ctx.deinit();
+
+    try registerCAPISurface(&entry, .{
+        .target_id = 3,
+        .group_id = std.mem.zeroes(Uuid),
+        .surface_id = std.mem.zeroes(Uuid),
+        .callbacks = .{
+            .ctx = &ctx,
+            .on_data = CAPITestCtx.onData,
+            .on_opened = CAPITestCtx.onOpened,
+            .on_exit = CAPITestCtx.onExit,
+        },
+    });
+
+    // Build a real Opened frame.
+    var gid: Uuid = std.mem.zeroes(Uuid);
+    var sid: Uuid = std.mem.zeroes(Uuid);
+    gid[0] = 0xAA;
+    sid[0] = 0xBB;
+    const payload = try (session.protocol.Opened{
+        .group_id = gid,
+        .surface_id = sid,
+        .history_rows = 42,
+        .label = "",
+    }).encode(alloc);
+    defer alloc.free(payload);
+
+    try testing.expect(dispatchCAPIFrame(&entry, 3, .opened, payload));
+    try testing.expectEqual(@as(u32, 1), ctx.opened_calls);
+    try testing.expectEqual(@as(u8, 0xAA), ctx.last_group[0]);
+    try testing.expectEqual(@as(u8, 0xBB), ctx.last_surface[0]);
+    try testing.expectEqual(@as(u32, 42), ctx.last_history);
+}
+
+test "unregisterCAPISurface prevents subsequent dispatch" {
+    const alloc = testing.allocator;
+    var entry = makeMockEntryForCAPI(alloc);
+    defer {
+        entry.sessions.deinit();
+        entry.capi_surfaces.deinit(alloc);
+    }
+
+    var ctx = CAPITestCtx{ .alloc = alloc };
+    defer ctx.deinit();
+
+    try registerCAPISurface(&entry, .{
+        .target_id = 5,
+        .group_id = std.mem.zeroes(Uuid),
+        .surface_id = std.mem.zeroes(Uuid),
+        .callbacks = .{
+            .ctx = &ctx,
+            .on_data = CAPITestCtx.onData,
+        },
+    });
+    unregisterCAPISurface(&entry, 5);
+    try testing.expect(!dispatchCAPIFrame(&entry, 5, .data_out, "abc"));
+    try testing.expectEqual(@as(u32, 0), ctx.data_calls);
 }
