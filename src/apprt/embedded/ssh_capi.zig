@@ -888,10 +888,26 @@ pub const SshHandle = struct {
                     log.info("onStateListener: .connected — transport already wired (reconnect)", .{});
                 }
             },
-            .disconnected, .failed => {
-                // Tear down the existing transport so live channel handles
-                // receive a TRANSPORT close. The next .connected broadcast
-                // (from a reconnect) will re-wire it.
+            .reconnecting, .disconnected, .failed => {
+                // Tear down the existing transport NOW, BEFORE
+                // `attemptReconnect` deinits the underlying libssh2
+                // session. Without this, the next time something invokes
+                // tearMuxTransport (e.g. on the eventual `.disconnected`
+                // broadcast), libssh2_channel_close runs against a freed
+                // session pointer and SIGSEGVs inside
+                // `_libssh2_transport_send`. Captured in
+                // 2026-05-26-154718.ips: user disconnects the tunnel →
+                // sshThreadMain stale detection → attemptReconnect
+                // entry.ctx.deinit (frees session) → reconnect fails →
+                // broadcast .disconnected → tearMuxTransport →
+                // libssh2_channel_close UAF.
+                //
+                // Tearing down on `.reconnecting` is safe because the
+                // listener fires INSIDE attemptReconnect BEFORE it calls
+                // entry.ctx.deinit (see SshConnectionManager.attemptReconnect:
+                // the `.reconnecting` broadcast happens first, then the
+                // session teardown). The next `.connected` broadcast
+                // re-wires the transport via the .connected case above.
                 if (self.transport != null) self.tearMuxTransport();
             },
             else => {},
