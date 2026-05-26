@@ -111,6 +111,21 @@ extension Ghostty {
         /// can no longer fire.
         let userdataBox: ConnectionBox
 
+        /// Serial queue for libghostty C cleanup of this connection AND all
+        /// its channels. Channels reach it via their `connection` strong
+        /// reference (`SSHChannel.connection`). FIFO ordering combined with
+        /// the channel-retains-connection ARC chain guarantees every
+        /// `ghostty_channel_free` enqueued by an `SSHChannel.deinit` runs
+        /// before the `ghostty_ssh_close`+`_free` enqueued by this
+        /// connection's deinit — which is the invariant the Zig side
+        /// asserts at `ssh_capi.zig:1604-1611` (`ghostty_ssh_free`'s
+        /// "live channels" check). Per-connection rather than module-wide
+        /// so a slow close of one host doesn't stall cleanup of another.
+        let cleanupQueue = DispatchQueue(
+            label: "com.ghostty.ssh.connection.cleanup",
+            qos: .utility
+        )
+
         // MARK: Init
 
         /// Open an SSH connection. Returns immediately once `ghostty_ssh_open`
@@ -198,7 +213,14 @@ extension Ghostty {
             // succeeded — in that case there is nothing to free and the
             // handle counter was never incremented.
             guard let h = handle else { return }
-            Task.detached {
+            // Dispatch onto the shared serial cleanup queue rather than an
+            // unordered `Task.detached`. By ARC: every `SSHChannel<_>`
+            // referencing this connection has already deinit'd (because each
+            // strongly retains `self` via `SSHChannel.connection`), and each
+            // of those deinits enqueued its `ghostty_channel_free` onto the
+            // same queue. FIFO ordering on the serial queue therefore
+            // guarantees `h.channels.count() == 0` when this block runs.
+            cleanupQueue.async {
                 ghostty_ssh_close(h)
                 ghostty_ssh_free(h)
             }
@@ -225,7 +247,7 @@ extension Ghostty {
             // wrapper's continuations BEFORE the C open call returns — that
             // way any callback that fires immediately after open finds an
             // attached forwarder.
-            let channel = SSHChannel<S>(service: service)
+            let channel = SSHChannel<S>(service: service, connection: self)
             let channelBox = ChannelBox()
             channelBox.attach(channel)
             // The channel retains the box for the duration of the C handle's
@@ -266,7 +288,7 @@ extension Ghostty {
             size: TerminalSize,
             label: String
         ) throws -> SSHChannel<TerminalService> {
-            let channel = SSHChannel<TerminalService>(service: TerminalService())
+            let channel = SSHChannel<TerminalService>(service: TerminalService(), connection: self)
             let channelBox = ChannelBox()
             channelBox.attach(channel)
             channel.userdataBox = channelBox
@@ -400,12 +422,19 @@ extension Ghostty {
         // Sendable because UnsafeMutableRawPointer is round-tripped through UInt.
         private let handleBits: UInt
         private let stateMachine: InboundChannelState
+        /// Strong ref to the parent connection so the resulting `SSHChannel`
+        /// (on `accept`) can inherit it, mirroring the C-side parent-child
+        /// lifetime in Swift ARC. The reference also keeps the connection
+        /// alive while the inbound is sitting in the `inboundChannels`
+        /// AsyncStream waiting for the embedder to decide.
+        private let connection: SSHConnection
 
-        init(handleBits: UInt, serviceID: UInt8, params: Data) {
+        init(handleBits: UInt, serviceID: UInt8, params: Data, connection: SSHConnection) {
             self.handleBits = handleBits
             self.serviceID = serviceID
             self.params = params
             self.stateMachine = InboundChannelState()
+            self.connection = connection
         }
 
         /// Accept the channel with an embedder-constructed service descriptor.
@@ -424,7 +453,7 @@ extension Ghostty {
                 ghostty_channel_free(h)
                 return nil
             }
-            let channel = SSHChannel<S>(service: service)
+            let channel = SSHChannel<S>(service: service, connection: connection)
             let channelBox = ChannelBox()
             channelBox.attach(channel)
             channel.userdataBox = channelBox

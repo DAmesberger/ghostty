@@ -20,6 +20,19 @@ extension Ghostty {
 
         public let service: S
 
+        /// Strong reference to the parent connection.
+        ///
+        /// The C-side ChannelHandle is registered in its parent SshHandle's
+        /// `channels` map and depends on the parent for its lifetime
+        /// (`ChannelHandle.deinit` calls `self.ssh.unregisterChannel(self)`).
+        /// Holding the parent here makes that lifetime dependency explicit:
+        /// ARC guarantees `SSHConnection.deinit` cannot run while any
+        /// `SSHChannel<_>` referencing it is alive, which combined with the
+        /// shared `cleanupQueue` (serial, FIFO) below guarantees every
+        /// `ghostty_channel_free` runs before `ghostty_ssh_close`/`_free` for
+        /// that connection.
+        let connection: SSHConnection
+
         public let output: AsyncStream<Data>
         public let events: AsyncStream<Event>
 
@@ -84,9 +97,10 @@ extension Ghostty {
         // MARK: Init
 
         /// Internal — only `SSHConnection` constructs channels.
-        init(service: S) {
+        init(service: S, connection: SSHConnection) {
             self.handle = nil
             self.service = service
+            self.connection = connection
 
             var outCont: AsyncStream<Data>.Continuation!
             self.output = AsyncStream<Data>(bufferingPolicy: .unbounded) { outCont = $0 }
@@ -110,8 +124,16 @@ extension Ghostty {
             eventContinuation.finish()
 
             // Free is safe to call after close; libghostty handles both.
+            // Dispatch onto the connection's serial cleanup queue rather than
+            // an unordered `Task.detached`: combined with the
+            // channel-retains-connection ARC chain above, FIFO ordering of
+            // this queue guarantees every channel free runs before the
+            // connection's `ghostty_ssh_close`/`_free` enqueued by
+            // `SSHConnection.deinit`. Without that ordering,
+            // `ghostty_ssh_free` panics in Debug when `h.channels` is
+            // non-empty (`ssh_capi.zig:1604-1611`).
             guard let h = handle else { return }
-            Task.detached {
+            connection.cleanupQueue.async {
                 ghostty_channel_free(h)
             }
         }

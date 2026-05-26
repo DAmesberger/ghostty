@@ -236,7 +236,8 @@ extension Ghostty.SSHConnection {
         let inbound = Ghostty.InboundChannel(
             handleBits: handleBits,
             serviceID: serviceID,
-            params: params
+            params: params,
+            connection: conn
         )
 
         // Yield non-blocking into the stream. The embedder drains it and

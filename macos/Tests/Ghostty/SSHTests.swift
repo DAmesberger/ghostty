@@ -401,38 +401,53 @@ struct SSHTests {
 
     // MARK: - InboundChannel (Phase 6D Part 5)
 
+    /// Build a stub SSHConnection (no real network / libssh2) for tests
+    /// that need to thread a connection through `InboundChannel`. Uses the
+    /// `app: nil` stub path which `ghostty_ssh_open` explicitly supports
+    /// for test harnesses (see `ssh_capi.zig:1151-1154`).
+    private static func makeStubConnection() throws -> Ghostty.SSHConnection {
+        try Ghostty.SSHConnection(
+            config: .init(target: "test@localhost"),
+            hostKey: .strict,
+            app: nil
+        )
+    }
+
     @Test
-    func inboundChannelParamsAndServiceID() {
+    func inboundChannelParamsAndServiceID() throws {
         let params = Data([0x01, 0x02, 0x03])
         let inbound = Ghostty.InboundChannel(
             handleBits: 0,
             serviceID: UInt8(GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER.rawValue),
-            params: params
+            params: params,
+            connection: try Self.makeStubConnection()
         )
         #expect(inbound.serviceID == UInt8(GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER.rawValue))
         #expect(inbound.params == params)
     }
 
     @Test
-    func inboundChannelRejectIsIdempotent() {
+    func inboundChannelRejectIsIdempotent() throws {
         let inbound = Ghostty.InboundChannel(
             handleBits: 0,  // null handle — reject() calls ghostty_channel_free(nil) which is a no-op
             serviceID: 1,
-            params: Data()
+            params: Data(),
+            connection: try Self.makeStubConnection()
         )
         inbound.reject()  // first call should claim
         inbound.reject()  // second call should be a no-op (claimed already)
     }
 
     @Test
-    func inboundChannelAcceptRejectsServiceMismatch() {
+    func inboundChannelAcceptRejectsServiceMismatch() throws {
         // Use a non-null but fake handle — we can't actually call ghostty_channel_free
         // on a fake pointer in this pure-Swift test, so we use a null handle (0).
         // The accept path calls ghostty_channel_free(nil) on mismatch, which is a no-op.
         let inbound = Ghostty.InboundChannel(
             handleBits: 0,
             serviceID: UInt8(GHOSTTY_CHANNEL_SERVICE_TCP_CONNECT.rawValue),
-            params: Data()
+            params: Data(),
+            connection: try Self.makeStubConnection()
         )
         // Try to accept as PortListenerService — service ID mismatch must return nil.
         let channel = inbound.accept(using: Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22))
@@ -440,11 +455,12 @@ struct SSHTests {
     }
 
     @Test
-    func inboundChannelDoubleAcceptReturnsNil() {
+    func inboundChannelDoubleAcceptReturnsNil() throws {
         let inbound = Ghostty.InboundChannel(
             handleBits: 0,
             serviceID: UInt8(GHOSTTY_CHANNEL_SERVICE_PORT_LISTENER.rawValue),
-            params: Data()
+            params: Data(),
+            connection: try Self.makeStubConnection()
         )
         // First accept: will succeed (or fail for service mismatch) and claims the state.
         let _ = inbound.accept(using: Ghostty.PortListenerService(bindHost: "0.0.0.0", port: 22))
