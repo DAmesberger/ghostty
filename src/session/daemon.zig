@@ -328,11 +328,33 @@ fn daemonMain(alloc: Allocator) !void {
     const socket_path = try session.shared.socketPath(alloc);
     defer alloc.free(socket_path);
 
+    const listener_fd = try bindUnixSocket(socket_path);
+    // Capture the filesystem inode of our bound socket file *now*. The
+    // `isSocketOurs` poll-timeout check compares this against the file
+    // currently on disk at `socket_path`. Comparing fstat(listener_fd)
+    // against stat(path) is wrong for unix-domain sockets: the listener
+    // fd's `st_ino` is an anonymous kernel-socket inode (matches what
+    // `/proc/net/unix` shows, e.g. 191054754) while the path's `st_ino`
+    // is the filesystem inode of the socket entry (e.g. 9306784).
+    // Those never match, so the original implementation made the daemon
+    // commit suicide on every 60s poll-timeout — surfacing as "remote
+    // terminals vanish after exactly 1 minute".
+    var stbuf: c.struct_stat = undefined;
+    {
+        var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        if (socket_path.len >= path_buf.len) return error.SocketPathTooLong;
+        @memcpy(path_buf[0..socket_path.len], socket_path);
+        path_buf[socket_path.len] = 0;
+        if (c.stat(&path_buf, &stbuf) != 0) return error.StatBoundSocketFailed;
+    }
+    const socket_file_inode: u64 = @intCast(stbuf.st_ino);
+
     var daemon: Daemon = .{
         .alloc = alloc,
         .socket_path = try alloc.dupe(u8, socket_path),
+        .socket_file_inode = socket_file_inode,
         .groups = std.AutoArrayHashMap(Uuid, *SessionGroup).init(alloc),
-        .listener = try bindUnixSocket(socket_path),
+        .listener = listener_fd,
         .channel_registry = session.channel_mux.Registry.init(alloc),
     };
     defer daemon.deinit();
@@ -358,7 +380,7 @@ fn daemonMain(alloc: Allocator) !void {
 
         // On timeout, check if our socket file has been replaced by a new daemon.
         if (rc == 0) {
-            if (!isSocketOurs(daemon.listener, daemon.socket_path)) {
+            if (!isSocketOurs(daemon.socket_file_inode, daemon.socket_path)) {
                 daemonLog("socket replaced, shutting down", .{});
                 return;
             }
@@ -585,6 +607,13 @@ pub const SessionGroup = struct {
 const Daemon = struct {
     alloc: Allocator,
     socket_path: []const u8,
+    /// Filesystem inode of the bound socket file, captured by
+    /// `stat(socket_path)` immediately after `bindUnixSocket`. The
+    /// poll-timeout `isSocketOurs` check compares this against the
+    /// current `stat(socket_path).st_ino` to detect "a new daemon
+    /// has replaced our socket file" without conflating it with the
+    /// listener fd's anonymous kernel-socket inode.
+    socket_file_inode: u64,
     listener: posix.fd_t,
     mutex: std.Thread.Mutex = .{},
     groups: std.AutoArrayHashMap(Uuid, *SessionGroup),
@@ -1752,16 +1781,22 @@ fn canConnect(path: []const u8) !bool {
 
 /// Check whether the socket file on disk still belongs to this daemon.
 /// Returns false if the file is gone or points to a different inode.
-fn isSocketOurs(listener: posix.fd_t, path: []const u8) bool {
-    var listener_st: c.struct_stat = undefined;
-    if (c.fstat(listener, &listener_st) != 0) return false;
+///
+/// Compares the filesystem inode of the path against the inode we
+/// captured at bind time. The listener fd's `st_ino` is a kernel
+/// anonymous-socket inode and CANNOT be compared against the path's
+/// filesystem inode — they live in different namespaces and never
+/// match. Using fstat(listener) here used to make the daemon shut
+/// itself down on every 60s poll-timeout, manifesting as remote
+/// terminals vanishing after exactly 1 minute of idle.
+fn isSocketOurs(bound_inode: u64, path: []const u8) bool {
     var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
     if (path.len >= path_buf.len) return false;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
     var file_st: c.struct_stat = undefined;
     if (c.stat(&path_buf, &file_st) != 0) return false;
-    return listener_st.st_ino == file_st.st_ino and listener_st.st_dev == file_st.st_dev;
+    return @as(u64, @intCast(file_st.st_ino)) == bound_inode;
 }
 
 fn bindUnixSocket(path: []const u8) !posix.fd_t {

@@ -722,9 +722,16 @@ pub fn sshThreadMain(entry: *Entry) void {
             entry.libssh2_mutex.lock();
             const ping_err = sendFrame(channel, .ping, 0, "");
             entry.libssh2_mutex.unlock();
-            ping_err catch |err| {
+            if (ping_err) |_| {
+                // Diagnostic: confirm pings are leaving on the main multiplex
+                // channel. Multiplex-side keepalive_server_timeout (60s) fires
+                // a terminal-vanish if these stop arriving.
+                log.info("keepalive: sent ping (interval={d}s)", .{
+                    @as(i64, @intCast(@divFloor(now - last_keepalive_sent, std.time.ns_per_s))),
+                });
+            } else |err| {
                 log.warn("ping send failed: {}", .{err});
-            };
+            }
             last_keepalive_sent = now;
         }
 
