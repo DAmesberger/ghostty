@@ -1235,6 +1235,75 @@ pub const ClientMux = struct {
         return .{ .alloc = alloc, .fd = fd };
     }
 
+    /// Send our `capabilities` frame to the peer. MUST be called once,
+    /// before any `openChannel`, as the very first frame on the mux fd.
+    ///
+    /// The daemon's `ClientThread.main_` requires `.capabilities` as the
+    /// first frame (`daemon.zig:413-414`) — without it the daemon falls
+    /// through `else => {}`, closes the connection, and every subsequent
+    /// `channel_open` lands on a dead socket. The peer responds with its
+    /// own capabilities, which we apply via `applyPeerCapabilities` on
+    /// receipt.
+    pub fn sendCapabilities(self: *ClientMux) !void {
+        const ours = protocol.Capabilities{
+            .protocol_version = protocol.protocol_version,
+            .services = &.{},
+            .default_window = protocol.default_channel_window_units,
+            .max_window = protocol.max_channel_window_units,
+            .max_payload_kib = protocol.max_payload / 1024,
+            .compression_algo = .lz4,
+        };
+        const encoded = try ours.encode(self.alloc);
+        defer self.alloc.free(encoded);
+        try self.sendFrameLocked(.capabilities, encoded);
+    }
+
+    /// Read frames from `self.fd` until EOF and dispatch each to the
+    /// embedder. Counterpart to `Mux`'s server-side `runMuxMode` loop
+    /// (`daemon.zig:476`). Without this reader, `channel_opened`,
+    /// `channel_data`, `channel_close`, etc. accumulate in the
+    /// socketpair buffer with no consumer — embedders see open frames
+    /// land but never receive a response, manifesting as hanging
+    /// channels.
+    ///
+    /// Returns when `self.fd` EOFs (peer closed) or any read/dispatch
+    /// error occurs. Callers typically run this on a dedicated thread
+    /// spawned right after `sendCapabilities`.
+    pub fn runReader(self: *ClientMux) void {
+        const rlog = std.log.scoped(.channel_mux);
+        while (true) {
+            var hbuf: [protocol.header_size]u8 = undefined;
+            readAllFd(self.fd, &hbuf) catch return;
+            const hdr = protocol.Header.parseFromBuf(&hbuf) catch {
+                rlog.warn("client: malformed frame header", .{});
+                return;
+            };
+            if (hdr.len > protocol.max_payload) {
+                rlog.warn("client: oversized frame len={d}", .{hdr.len});
+                return;
+            }
+            const buf = self.alloc.alloc(u8, hdr.len) catch {
+                rlog.warn("client: alloc {d} bytes for frame failed", .{hdr.len});
+                return;
+            };
+            defer self.alloc.free(buf);
+            readAllFd(self.fd, buf) catch return;
+            self.dispatch(hdr.kind, buf) catch |err| {
+                rlog.warn("client: dispatch error: {}", .{err});
+                return;
+            };
+        }
+    }
+
+    fn readAllFd(fd: posix.fd_t, buf: []u8) !void {
+        var off: usize = 0;
+        while (off < buf.len) {
+            const n = posix.read(fd, buf[off..]) catch |err| return err;
+            if (n == 0) return error.UnexpectedEOF;
+            off += n;
+        }
+    }
+
     pub fn deinit(self: *ClientMux) void {
         // Fire on_close for every channel that's still live so the
         // embedder can release its handles, then free.

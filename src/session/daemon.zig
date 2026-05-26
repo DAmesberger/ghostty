@@ -42,6 +42,7 @@ pub const Options = struct {
     list: bool = false,
     @"protocol-version": bool = false,
     @"stdio-attach": bool = false,
+    @"mux-attach": bool = false,
     kill: ?[]const u8 = null,
     rename: ?[]const u8 = null,
     @"detach-others": ?[]const u8 = null,
@@ -111,8 +112,95 @@ pub fn run(
         return try multiplex(alloc, stderr);
     }
 
+    if (opts.@"mux-attach") {
+        return try muxAttach(alloc, stderr);
+    }
+
     try stderr.writeAll("missing helper mode\n");
     return 1;
+}
+
+/// Direct stdio↔socket bidirectional pump for ClientMux frames.
+///
+/// Why this exists: cmux opens a second SSH channel dedicated to ClientMux
+/// (browser_proxy / port_listener / tcp_connect / tcp_accepted) traffic via
+/// `client.openMultiplexChannel`. That channel is exec'd here. Unlike the
+/// terminal-side `multiplex` mode, which is itself a *demultiplexer* that
+/// only understands `.open`/`.close`/`.data_in`/... and silently drops
+/// `.channel_*` frames (the bug this mode fixes — see the multiplex switch
+/// in this file: `.channel_open` falls into `else => {}` and disappears),
+/// this mode is a pure passthrough: every byte from stdin goes to the main
+/// daemon's unix socket, and every byte read from that socket goes to
+/// stdout. The main daemon's `ClientThread` (this file, ~line 376) already
+/// dispatches `.channel_*` frames to its `channel_registry`, which has
+/// `browser_proxy`, `port_listener`, `tcp_connect`, `tcp_accepted`,
+/// `file_transfer` registered.
+///
+/// Lifecycle: exits when either side EOFs or errors. The main daemon must
+/// already be running — `client.ensureRemoteDaemon(--daemonize)` is the
+/// caller's responsibility before exec'ing this mode.
+fn muxAttach(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
+    _ = stderr;
+
+    const socket_path = try session.shared.socketPath(alloc);
+    defer alloc.free(socket_path);
+
+    const sock_fd = connectUnixSocket(socket_path) catch |err| {
+        daemonLog("mux-attach: connect to daemon socket failed: {}", .{err});
+        return 1;
+    };
+    defer closeFd(sock_fd);
+
+    const stdin_fd = posix.STDIN_FILENO;
+    const stdout_fd = posix.STDOUT_FILENO;
+
+    var pollfds = [2]c.struct_pollfd{
+        .{ .fd = stdin_fd, .events = c.POLLIN, .revents = 0 },
+        .{ .fd = sock_fd, .events = c.POLLIN, .revents = 0 },
+    };
+
+    var buf: [16 * 1024]u8 = undefined;
+
+    while (true) {
+        const rc = c.poll(&pollfds, 2, -1);
+        if (rc < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return 1;
+        }
+
+        // stdin → socket
+        if (pollfds[0].revents & c.POLLIN != 0) {
+            const n = posix.read(stdin_fd, &buf) catch return 0;
+            if (n == 0) return 0;
+            try writeAll(sock_fd, buf[0..n]);
+        }
+        if (pollfds[0].revents & (c.POLLHUP | c.POLLERR) != 0 and
+            pollfds[0].revents & c.POLLIN == 0)
+        {
+            return 0;
+        }
+
+        // socket → stdout
+        if (pollfds[1].revents & c.POLLIN != 0) {
+            const n = posix.read(sock_fd, &buf) catch return 0;
+            if (n == 0) return 0;
+            try writeAll(stdout_fd, buf[0..n]);
+        }
+        if (pollfds[1].revents & (c.POLLHUP | c.POLLERR) != 0 and
+            pollfds[1].revents & c.POLLIN == 0)
+        {
+            return 0;
+        }
+    }
+}
+
+fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = posix.write(fd, bytes[off..]) catch |err| return err;
+        if (n == 0) return error.WriteFailed;
+        off += n;
+    }
 }
 
 /// Kill any running daemon by connecting to its socket and signaling it.

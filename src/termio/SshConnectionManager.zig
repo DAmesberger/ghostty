@@ -1088,7 +1088,7 @@ pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     // tryOpenChannel can be called concurrently with `sshThreadMain`
     // on the same Entry (e.g. from `onStateListener` running on the
     // M1 SetupWorker's thread after broadcasting `.connected`). The
-    // libssh2 calls inside `openMultiplexChannel` and
+    // libssh2 calls inside `openClientMuxChannel` and
     // `ensureRemoteDaemon` MUST serialise with the SSH thread's calls
     // on the same session, otherwise concurrent `libssh2_channel_*`
     // and transport-level reads/writes corrupt internal lists (we hit
@@ -1097,15 +1097,23 @@ pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     entry.libssh2_mutex.lock();
     defer entry.libssh2_mutex.unlock();
 
+    // Use `openClientMuxChannel` (--mux-attach) not `openMultiplexChannel`
+    // (--stdio-attach). The latter is the terminal-frame demuxer which
+    // silently drops `.channel_*` frames in its else => {} branch.
+    // --mux-attach is a pure stdio↔daemon-socket pump that lets
+    // ClientMux's channel_open / channel_data / etc. reach the main
+    // daemon's channel_registry where browser_proxy + port_listener +
+    // tcp_connect + tcp_accepted are registered.
+
     // First attempt
-    if (session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path)) |ch| {
+    if (session.client.openClientMuxChannel(alloc, &entry.ctx, remote_bin_path)) |ch| {
         return ch;
     } else |_| {}
 
     // Daemon might be dead — try starting without killing existing one first
     session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false) catch return null;
 
-    return session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path) catch null;
+    return session.client.openClientMuxChannel(alloc, &entry.ctx, remote_bin_path) catch null;
 }
 
 /// Register a C-API terminal surface on the given Entry. The

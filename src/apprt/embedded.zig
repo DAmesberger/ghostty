@@ -20,6 +20,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
+const session = @import("../session.zig");
 
 const log = std.log.scoped(.embedded_window);
 
@@ -415,6 +416,17 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// Stored copy of the embedder's `on_remote_opened` callback (if
+    /// any). Invoked from the SSH `opened` reply path so cmux can
+    /// promote the daemon-assigned group_id from the first surface to
+    /// subsequent surfaces in the same workspace (drives
+    /// `surface_new` instead of `session_attach`).
+    on_remote_opened_cb: ?*const fn (
+        ?*anyopaque,
+        *const [16]u8,
+        *const [16]u8,
+    ) callconv(.c) void = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -460,6 +472,52 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Optional SSH connection target ("user@host" or "user@host via jump").
+        /// When non-null, the surface is initialized with the `Remote` termio
+        /// backend bound to the matching `SshConnectionManager.Entry` rather
+        /// than spawning a local PTY. The other `ssh_*` fields below
+        /// configure session/surface identity for daemon reattach.
+        ssh_target: ?[*:0]const u8 = null,
+
+        /// Optional 32-char hex group ID. Retained for backward
+        /// compatibility with non-cmux embedders that hand the daemon a
+        /// known group UUID; cmux drives identity via `ssh_session_id` +
+        /// `ssh_label` instead and leaves this null. Ignored when
+        /// `ssh_target` is null.
+        ssh_group_id: ?[*:0]const u8 = null,
+
+        /// Optional stable embedder-chosen session id (e.g. a workspace
+        /// UUID, dashed or undashed). Routes the surface open through the
+        /// daemon's "session_attach by label / create-on-miss" path so the
+        /// first terminal creates a new group named after `ssh_label` and
+        /// subsequent terminals join that group. The local group_id is
+        /// derived from the parsed UUID so cross-surface joins agree.
+        /// Ignored when `ssh_target` is null.
+        ssh_session_id: ?[*:0]const u8 = null,
+
+        /// Optional 32-char hex surface ID. When set, asks the daemon to
+        /// reattach an existing surface (replays scrollback + cursor).
+        /// Ignored when `ssh_target` is null.
+        ssh_surface_id: ?[*:0]const u8 = null,
+
+        /// Optional human-readable label shown in the daemon session list.
+        /// Ignored when `ssh_target` is null.
+        ssh_label: ?[*:0]const u8 = null,
+
+        /// Callback fired when the remote daemon acknowledges our open
+        /// request and hands back the authoritative group_id / surface_id.
+        /// Both arguments are 16-byte raw UUIDs (`session.shared.Uuid`),
+        /// guaranteed non-null and live only for the duration of the
+        /// callback — copy if you need to retain. Userdata is the same
+        /// opaque pointer passed in `Options.userdata`. Fires zero or one
+        /// time per surface (zero if the surface is freed before the
+        /// daemon responds). Ignored when `ssh_target` is null.
+        on_remote_opened: ?*const fn (
+            ?*anyopaque,
+            *const [16]u8,
+            *const [16]u8,
+        ) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -467,6 +525,7 @@ pub const Surface = struct {
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
             .userdata = opts.userdata,
+            .on_remote_opened_cb = opts.on_remote_opened,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -483,6 +542,53 @@ pub const Surface = struct {
         // Shallow copy the config so that we can modify it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
+
+        // If the embedder requested an SSH-backed surface, fold the ssh
+        // connection identity into the config so the core surface picks
+        // the `Remote` termio backend via `SshConnectionContext.fromConfig`.
+        // Mirrors the GTK surface-init path
+        // (`apprt/gtk/class/surface.zig: applyToConfig`).
+        if (opts.ssh_target) |c_target| {
+            const target_slice = std.mem.sliceTo(c_target, 0);
+            if (target_slice.len > 0) {
+                const parsed = session.shared.parseSshTarget(target_slice);
+
+                const group_id: session.shared.Uuid = if (opts.ssh_group_id) |c_gid| gid: {
+                    const gid_slice = std.mem.sliceTo(c_gid, 0);
+                    if (gid_slice.len == 0) break :gid session.shared.zero_uuid;
+                    break :gid session.shared.parseUuid(gid_slice) catch session.shared.zero_uuid;
+                } else session.shared.zero_uuid;
+
+                const surface_id: session.shared.Uuid = if (opts.ssh_surface_id) |c_sid| sid: {
+                    const sid_slice = std.mem.sliceTo(c_sid, 0);
+                    if (sid_slice.len == 0) break :sid session.shared.zero_uuid;
+                    break :sid session.shared.parseUuid(sid_slice) catch session.shared.zero_uuid;
+                } else session.shared.zero_uuid;
+
+                const label_slice: ?[]const u8 = if (opts.ssh_label) |c_lbl| label: {
+                    const slice = std.mem.sliceTo(c_lbl, 0);
+                    break :label if (slice.len == 0) null else slice;
+                } else null;
+
+                const session_id_slice: ?[]const u8 = if (opts.ssh_session_id) |c_sid| sid: {
+                    const slice = std.mem.sliceTo(c_sid, 0);
+                    break :sid if (slice.len == 0) null else slice;
+                } else null;
+
+                const ssh_ctx: session.shared.SshConnectionContext = .{
+                    .target = parsed.target,
+                    .jump = parsed.jump,
+                    .session_id = session_id_slice,
+                    .label = label_slice,
+                    .group_id = group_id,
+                    .surface_id = surface_id,
+                    .reconnect_attempts = config.@"ssh-reconnect-attempts",
+                    .reconnect_backoff = config.@"ssh-reconnect-backoff",
+                    .reconnect_interval_ms = config.@"ssh-reconnect-interval",
+                };
+                try ssh_ctx.applyToConfig(&config);
+            }
+        }
 
         // If we have a working directory from the options then we set it.
         if (opts.working_directory) |c_wd| {
@@ -757,6 +863,21 @@ pub const Surface = struct {
 
     pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
         return self.cursor_pos;
+    }
+
+    /// Forward the daemon-authoritative group_id / surface_id from a
+    /// `Message.remote_opened` to the embedder via the
+    /// `on_remote_opened` callback stamped in `Surface.Options`.
+    /// Called from `core.Surface.handleMessage` so the embedder sees
+    /// the same data the GTK surface receives through
+    /// `updateSessionState` plus its surface-property bindings.
+    pub fn remoteOpened(
+        self: *Surface,
+        group_id: session.shared.Uuid,
+        surface_id: session.shared.Uuid,
+    ) void {
+        const cb = self.on_remote_opened_cb orelse return;
+        cb(self.userdata, &group_id, &surface_id);
     }
 
     pub fn refresh(self: *Surface) void {

@@ -726,6 +726,37 @@ pub fn openMultiplexChannel(
     return channel;
 }
 
+/// Open a second SSH channel dedicated to ClientMux traffic
+/// (browser_proxy / port_listener / tcp_connect / tcp_accepted).
+///
+/// Distinct from `openMultiplexChannel` (the terminal-frame demuxer)
+/// because the multiplex process drops every `.channel_*` frame on the
+/// floor — its switch statement only handles `.open` / `.close` /
+/// `.data_in` / etc. and falls through `else => {}` for ClientMux
+/// frames. This mode (`--mux-attach`) is a pure stdio↔unix-socket
+/// pump that hands every byte straight to the main daemon's
+/// `ClientThread`, which already dispatches `.channel_*` frames
+/// against the `channel_registry`.
+///
+/// Caller must have already ensured the main daemon is running
+/// (`ensureRemoteDaemon` → `--daemonize`) so the unix socket exists
+/// when this exec connects.
+pub fn openClientMuxChannel(
+    alloc: Allocator,
+    ctx: *const SshContext,
+    remote_bin_path: []const u8,
+) !ssh.Channel {
+    var sess = ctx.session orelse return error.RemoteCommandFailed;
+    var channel = try sess.openChannel();
+    errdefer channel.close();
+
+    const cmd = try std.fmt.allocPrint(alloc, "{s} " ++ shared.remote_subcommand ++ " --mux-attach", .{remote_bin_path});
+    defer alloc.free(cmd);
+
+    try channel.exec(cmd);
+    return channel;
+}
+
 /// Knobs threaded into `attachRemoteSurface` so callers (terminal
 /// surfaces via `termio/Remote.zig`, the libghostty C API via
 /// `apprt/embedded/ssh_capi.zig`) can override defaults without

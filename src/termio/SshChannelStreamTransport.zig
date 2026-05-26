@@ -204,8 +204,19 @@ pub fn close(self: *SshChannelStreamTransport) void {
     posix.close(self.mux_fd);
     self.mux_fd = -1;
 
-    // Close the libssh2 channel.
-    self.config.channel.close();
+    // Close the libssh2 channel under the external mutex (if any).
+    // The Entry's SSH I/O thread (`sshThreadMain`) may still be
+    // making libssh2 calls on the same session — without
+    // serialisation the close races inside `_libssh2_transport_send`
+    // and crashes with a Translation fault (the close-time crash in
+    // 2026-05-26-100729.ips). The reader/writer loops already serialise
+    // through `ssh2Mutex()`; the close path needs to do the same.
+    {
+        const mu = self.ssh2Mutex();
+        mu.lock();
+        defer mu.unlock();
+        self.config.channel.close();
+    }
 }
 
 pub fn deinit(self: *SshChannelStreamTransport) void {

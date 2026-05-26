@@ -1275,6 +1275,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                         ro.color,
                     );
                 }
+                // Notify the embedded apprt (cmux) so it can promote the
+                // daemon-assigned group_id from the first surface to
+                // subsequent surfaces in the same workspace (drives
+                // `surface_new` instead of repeated `session_attach`).
+                if (@hasDecl(apprt.runtime.Surface, "remoteOpened")) {
+                    self.rt_surface.remoteOpened(ro.group_id, ro.surface_id);
+                }
             }
         },
 

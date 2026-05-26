@@ -27,6 +27,12 @@ pub const Options = struct {
     /// Attach the helper to stdio for an interactive session transport.
     @"stdio-attach": bool = false,
 
+    /// Pure bidirectional pipe from stdio to the main daemon's unix
+    /// socket. Used by the client's second SSH channel for ClientMux
+    /// frames (browser_proxy / port_listener / tcp_connect / tcp_accepted)
+    /// that --stdio-attach silently drops.
+    @"mux-attach": bool = false,
+
     /// Kill the specified remote session id.
     kill: ?[]const u8 = null,
 
@@ -114,6 +120,7 @@ pub fn run(alloc: Allocator) !u8 {
         .@"kill-daemon" = opts.@"kill-daemon",
         .list = opts.list,
         .@"stdio-attach" = opts.@"stdio-attach",
+        .@"mux-attach" = opts.@"mux-attach",
         .kill = opts.kill,
         .rename = opts.rename,
         .@"detach-others" = opts.@"detach-others",

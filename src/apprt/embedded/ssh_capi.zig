@@ -445,6 +445,13 @@ pub const SshHandle = struct {
     /// handle; torn down in `deinit` (transport stop → mux deinit →
     /// channel close are all handled by `SshChannelStreamTransport.deinit`).
     transport: ?*SshChannelStreamTransport = null,
+    /// Dispatch thread for inbound ClientMux frames. Spawned in
+    /// `wireMuxTransport` right after `sendCapabilities`; reads frames
+    /// from `mux.fd` and calls `mux.dispatch` so embedder callbacks
+    /// (`on_opened`/`on_data`/`on_close`) fire. Joined in
+    /// `tearMuxTransport` after `mux.deinit` closes the fd, which EOFs
+    /// the read and lets the thread exit cleanly.
+    mux_reader_thread: ?std.Thread = null,
     /// Live channels rooted on this connection. Used to validate the
     /// "free channels before ssh" invariant and to broadcast TRANSPORT
     /// closes on reconnect.
@@ -504,13 +511,24 @@ pub const SshHandle = struct {
 
         // Production transport teardown sequence:
         //   1. Stop transport threads (they hold references to mux_fd).
-        //   2. Deinit + free the ClientMux (closes any remaining channels).
-        //   3. Free the transport struct itself (also closes libssh2 channel).
+        //   2. Join the mux reader thread (it holds a pointer to ClientMux
+        //      and may be mid-dispatch firing embedder callbacks).
+        //   3. Deinit + free the ClientMux (closes any remaining channels).
+        //   4. Free the transport struct itself (also closes libssh2 channel).
         // We call close() instead of deinit() so we can control step order.
         const saved_transport = self.transport;
         self.transport = null;
         if (saved_transport) |t| {
             t.close(); // join threads + close fds (mux_fd, ssh_fd, stop_pipe)
+        }
+
+        // Joining the mux reader MUST happen after `t.close()` (which
+        // closes mux_fd → EOFs the reader's blocking read) but BEFORE
+        // `mux.deinit` / `destroy(mux)` — otherwise an in-flight
+        // dispatch on the reader thread reads freed memory.
+        if (self.mux_reader_thread) |th| {
+            th.join();
+            self.mux_reader_thread = null;
         }
 
         // ClientMux deinit/free (applies to both transport-backed and test-injected).
@@ -581,6 +599,31 @@ pub const SshHandle = struct {
         self.client_mux = mux;
         self.client_mux_owned = true;
         self.transport = t;
+
+        // Send our capabilities as the FIRST frame on the mux. The daemon
+        // requires this before it will accept channel_open frames
+        // (`daemon.zig:413-414`). Without it the daemon closes the
+        // connection silently and every subsequent channel_open lands on
+        // a dead socket. The peer's capabilities reply is applied in
+        // `dispatch` via `applyPeerCapabilities`.
+        mux.sendCapabilities() catch |err| {
+            log.warn("wireMuxTransport: sendCapabilities failed: {}", .{err});
+        };
+
+        // Spawn the inbound-frame dispatch thread. Without this no one
+        // reads from `mux.fd`, so `channel_opened` / `channel_data` /
+        // `channel_close` frames accumulate in the socketpair buffer
+        // with no consumer — embedders see open frames go out but
+        // never receive the response, which manifests as channels
+        // hanging in the "opening" state forever (every browser_proxy
+        // request silently times out).
+        if (std.Thread.spawn(.{}, ClientMux.runReader, .{mux})) |th| {
+            self.mux_reader_thread = th;
+        } else |err| {
+            log.warn("wireMuxTransport: spawn mux reader failed: {}", .{err});
+        }
+
+        log.info("wireMuxTransport: wired (client_mux is live, sent capabilities, reader thread spawned)", .{});
     }
 
     /// Fired by the transport reader thread when the SSH channel EOF's
@@ -617,7 +660,15 @@ pub const SshHandle = struct {
 
         const saved_transport = self.transport;
         self.transport = null;
+        // Close transport first — that EOFs the mux fd, which makes
+        // the reader thread's blocking read return UnexpectedEOF and
+        // exit cleanly. Joining BEFORE close would deadlock.
         if (saved_transport) |t| t.close();
+
+        if (self.mux_reader_thread) |th| {
+            th.join();
+            self.mux_reader_thread = null;
+        }
 
         if (self.client_mux_owned) {
             if (self.client_mux) |mux| {
@@ -822,6 +873,7 @@ pub const SshHandle = struct {
                 // wireMuxTransport is idempotent — reconnects that reach
                 // .connected again while a transport is live are no-ops.
                 if (self.transport == null) {
+                    log.info("onStateListener: .connected — attempting tryOpenChannel for mux", .{});
                     if (self.entry) |entry| {
                         if (SshConnectionManager.tryOpenChannel(entry)) |mux_chan| {
                             self.wireMuxTransport(mux_chan);
@@ -829,7 +881,11 @@ pub const SshHandle = struct {
                             log.warn("onStateListener: failed to open mux channel; " ++
                                 "inbound channels will not be available", .{});
                         }
+                    } else {
+                        log.warn("onStateListener: .connected but self.entry is null", .{});
                     }
+                } else {
+                    log.info("onStateListener: .connected — transport already wired (reconnect)", .{});
                 }
             },
             .disconnected, .failed => {
@@ -1550,6 +1606,14 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
         ch.emitClose(.daemon_shutdown, null);
     }
 
+    // Tear down the mux transport (which holds a libssh2 channel on
+    // this Entry's session) BEFORE releasing the pool entry. The
+    // transport's `close` ultimately calls `libssh2_channel_close` —
+    // if the Entry / session is already released, that's a UAF inside
+    // libssh2 (`_libssh2_transport_send → KERN_INVALID_ADDRESS`),
+    // exactly the close-time crash captured in 2026-05-26-100729.ips.
+    if (h.transport != null) h.tearMuxTransport();
+
     // Release the pool entry symmetrically with acquire. Use the
     // cached target/jump from open since entry.ctx may have been
     // partially torn down by a failed connect.
@@ -1654,10 +1718,13 @@ export fn ghostty_ssh_open_channel(
     // the dead-channel close so the embedder observes a clean edge
     // instead of a hung handle.
     const mux = h.client_mux orelse {
+        log.info("open_channel: client_mux=null — embedder opened channel before .connected " ++
+            "OR wireMuxTransport never ran (service={s})", .{@tagName(service)});
         ch.emitClose(.service_error, null);
         return ch;
     };
     ch.client_mux = mux;
+    log.info("open_channel: mux ok, sending channel_open frame (service={s})", .{@tagName(service)});
 
     // Service params are borrowed for the call; ClientMux.openChannel
     // copies them into the channel_open frame before returning.
@@ -1679,6 +1746,7 @@ export fn ghostty_ssh_open_channel(
         return ch;
     };
     ch.channel_id = channel_id;
+    log.info("open_channel: openChannel ok service={s} channel_id={d}", .{ @tagName(service), channel_id });
     return ch;
 }
 
@@ -1707,6 +1775,12 @@ export fn ghostty_channel_write(
     if (ch.service == .terminal) {
         const entry = ch.capi_entry orelse return std.math.maxInt(usize);
         if (ch.capi_target_id == 0) return std.math.maxInt(usize);
+        // M6 input-side diagnostic: log every write so we can see if
+        // user keystrokes ever reach the libghostty channel layer
+        // (output works, input was reported broken — pinpoints where
+        // the chain breaks: cat-pump, master-fd loop, bridge.send,
+        // libghostty enqueue, or daemon-side dispatch).
+        log.info("channel_write target={d} len={d}", .{ ch.capi_target_id, len });
         SshConnectionManager.enqueueWrite(entry, .data_in, ch.capi_target_id, slice);
         return len;
     }

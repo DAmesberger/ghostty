@@ -450,6 +450,42 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  // SSH-backed surface configuration. When `ssh_target` is non-null the
+  // surface uses the `Remote` termio backend bound to the matching SSH
+  // connection in `ghostty_ssh_open` instead of spawning a local PTY.
+  // The optional `ssh_session_id` field is a stable embedder-chosen string
+  // (e.g. a workspace UUID) that drives the daemon's "create-or-attach by
+  // session" semantics: the first attach creates a new group named after
+  // `ssh_label`, subsequent attaches find it by label, and Remote.zig
+  // derives a local group_id from `ssh_session_id` so cross-surface joins
+  // converge on the same daemon group. `ssh_surface_id` is a 32-char hex
+  // UUID per terminal — embedders persist it and pass it back on restore
+  // so the daemon reattaches the same PTY (replays scrollback). `ssh_label`
+  // is a human-readable label shown in the daemon session list and used as
+  // the find-or-create key. The legacy `ssh_group_id` is retained for
+  // backward compatibility with non-cmux embedders that pass a daemon-known
+  // 32-char hex group UUID; cmux now drives identity via `ssh_session_id`
+  // + `ssh_label` instead. All fields are ignored when `ssh_target` is null.
+  const char* ssh_target;
+  const char* ssh_group_id;
+  const char* ssh_session_id;
+  const char* ssh_surface_id;
+  const char* ssh_label;
+  // Fired when the remote daemon acknowledges our open request and hands
+  // back the authoritative group_id / surface_id (16-byte raw UUIDs).
+  // Both pointers are non-null and only valid for the duration of the
+  // callback — copy if you need to retain. `userdata` is the same opaque
+  // pointer set in this surface config. Fires zero or one time per
+  // surface (zero if the surface is freed before the daemon responds).
+  // Embedders use this to promote the daemon-assigned group_id from the
+  // first surface to subsequent surfaces in the same logical workspace
+  // so Remote.zig emits `surface_new` (new PTY in same group) instead
+  // of `session_attach` (which reattaches the same PTY and produces a
+  // single shared shell across all surfaces). Ignored when
+  // `ssh_target` is null.
+  void (*on_remote_opened)(void* userdata,
+                           const uint8_t* group_id,
+                           const uint8_t* surface_id);
 } ghostty_surface_config_s;
 
 typedef struct {
