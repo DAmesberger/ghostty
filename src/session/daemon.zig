@@ -35,6 +35,66 @@ fn daemonLog(comptime fmt: []const u8, args: anytype) void {
     _ = std.posix.write(2, msg) catch {};
 }
 
+/// Create a per-session bin directory containing a `cmux` shim that re-execs
+/// this daemon binary as `+cmux-notify "$@"`, and return the owned directory
+/// path (caller frees and is responsible for removing the tree).
+///
+/// The shim is intentionally named `cmux` so coding-agent hooks that call
+/// `cmux notify ...` work unchanged inside cmux-managed remote sessions.
+/// Within those sessions this shadows any pre-existing remote `cmux` on PATH
+/// (acceptable and intended — the dir is prepended to PATH).
+fn installCmuxShim(alloc: Allocator) ![]u8 {
+    // Resolve our own on-disk path so the shim can re-exec us.
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_exe = try std.fs.selfExePath(&exe_buf);
+
+    // Choose a short temp dir (mirrors the reverse-channel socket placement)
+    // so the directory path stays well within filesystem limits.
+    const base = base: {
+        if (std.posix.getenv("TMPDIR")) |t| {
+            const trimmed = std.mem.trimRight(u8, t, "/");
+            if (trimmed.len > 0) break :base trimmed;
+        }
+        break :base "/tmp";
+    };
+
+    var rand: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand);
+    const hex = std.fmt.bytesToHex(rand, .lower);
+
+    const dir = try std.fmt.allocPrint(alloc, "{s}/cmux-bin-{s}", .{ base, hex });
+    errdefer alloc.free(dir);
+
+    std.fs.cwd().makePath(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Write the shim. We shell-quote the daemon path (wrapping single quotes
+    // and escaping any embedded single quote) so paths with spaces work.
+    const shim_path = try std.fs.path.join(alloc, &.{ dir, "cmux" });
+    defer alloc.free(shim_path);
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    try script.appendSlice(alloc, "#!/bin/sh\nexec '");
+    for (self_exe) |ch| {
+        if (ch == '\'') {
+            // End quote, escaped quote, reopen quote: ' -> '\''
+            try script.appendSlice(alloc, "'\\''");
+        } else {
+            try script.append(alloc, ch);
+        }
+    }
+    try script.appendSlice(alloc, "' +cmux-notify \"$@\"\n");
+
+    var file = try std.fs.cwd().createFile(shim_path, .{ .mode = 0o755 });
+    defer file.close();
+    try file.writeAll(script.items);
+
+    return dir;
+}
+
 pub const Options = struct {
     daemonize: bool = false,
     daemon: bool = false,
@@ -382,6 +442,16 @@ fn daemonMain(alloc: Allocator) !void {
         break :blk null;
     };
 
+    // Install the per-session `cmux` shim. This is a tiny `/bin/sh` script
+    // that re-execs THIS daemon binary as `+cmux-notify`, so a coding
+    // agent's `cmux notify ...` (and the report_* subset) on the remote is
+    // transparently routed back to the local app over the reverse channel.
+    // The containing dir is prepended to PATH in `createSurface`.
+    daemon.cmux_control_shim_dir = installCmuxShim(alloc) catch |err| blk: {
+        daemonLog("cmux_control: cmux shim install failed: {}", .{err});
+        break :blk null;
+    };
+
     while (true) {
         // Poll with timeout so we can periodically reap empty groups
         var pollfds = [1]c.struct_pollfd{
@@ -665,6 +735,11 @@ const Daemon = struct {
     /// reverse-channel socket, injected as `CMUX_SOCKET_PASSWORD`. Owned
     /// here; null if derivation failed.
     cmux_control_token: ?[]u8 = null,
+    /// Per-daemon directory holding the `cmux` shim that re-execs this
+    /// daemon binary as `+cmux-notify`. Prepended to `PATH` in every
+    /// spawned shell so `cmux notify ...` resolves to the shim. Owned
+    /// here; null if creation failed. Removed in `deinit`.
+    cmux_control_shim_dir: ?[]u8 = null,
 
     fn deinit(self: *Daemon) void {
         for (self.groups.values()) |group| group.deinit();
@@ -675,6 +750,11 @@ const Daemon = struct {
         self.alloc.free(self.socket_path);
         if (self.cmux_control_socket_path) |p| self.alloc.free(p);
         if (self.cmux_control_token) |t| self.alloc.free(t);
+        if (self.cmux_control_shim_dir) |d| {
+            // Best-effort teardown: delete the shim file and its dir.
+            std.fs.cwd().deleteTree(d) catch {};
+            self.alloc.free(d);
+        }
     }
 
     /// Find a group by UUID or by label (for named sessions).
@@ -1165,6 +1245,30 @@ const Daemon = struct {
         }
         if (self.cmux_control_token) |token| {
             try env.put("CMUX_SOCKET_PASSWORD", token);
+        }
+
+        // Prepend the `cmux` shim dir to PATH so `cmux notify ...` (and the
+        // report_* subset) resolves to our shim -> daemon +cmux-notify ->
+        // CMUX_SOCKET_PATH -> local app. Preserve the inherited PATH; if it
+        // was unset, fall back to a sane default so basic tools still work.
+        if (self.cmux_control_shim_dir) |shim_dir| {
+            if (env.get("PATH")) |existing| {
+                const new_path = try std.fmt.allocPrint(
+                    self.alloc,
+                    "{s}:{s}",
+                    .{ shim_dir, existing },
+                );
+                defer self.alloc.free(new_path);
+                try env.put("PATH", new_path);
+            } else {
+                const new_path = try std.fmt.allocPrint(
+                    self.alloc,
+                    "{s}:/usr/local/bin:/usr/bin:/bin",
+                    .{shim_dir},
+                );
+                defer self.alloc.free(new_path);
+                try env.put("PATH", new_path);
+            }
         }
 
         var command: Command = .{
