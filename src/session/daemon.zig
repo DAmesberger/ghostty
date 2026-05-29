@@ -366,6 +366,21 @@ fn daemonMain(alloc: Allocator) !void {
     try session.services.file_transfer.register(&daemon.channel_registry);
     try session.services.port_listener.register(&daemon.channel_registry);
     try session.services.tcp_accepted.register(&daemon.channel_registry);
+    try session.services.cmux_control.register(&daemon.channel_registry);
+
+    // Derive the per-daemon cmux_control reverse-channel socket path and
+    // auth token now (before any client connects). The socket itself is
+    // bound lazily on each mux connection (see `runMuxMode`); the path +
+    // token are injected into every spawned shell's env (see
+    // `createSurface`) so the remote `cmux` CLI can reach the client.
+    daemon.cmux_control_socket_path = session.services.cmux_control.deriveSocketPath(alloc) catch |err| blk: {
+        daemonLog("cmux_control: socket path derive failed: {}", .{err});
+        break :blk null;
+    };
+    daemon.cmux_control_token = session.services.cmux_control.deriveToken(alloc) catch |err| blk: {
+        daemonLog("cmux_control: token derive failed: {}", .{err});
+        break :blk null;
+    };
 
     while (true) {
         // Poll with timeout so we can periodically reap empty groups
@@ -486,6 +501,27 @@ const ClientThread = struct {
             &self.daemon.channel_registry,
         );
         defer mux.deinit();
+
+        // Start the cmux_control reverse-channel listener for this mux
+        // connection. It binds the per-daemon AF_UNIX socket and opens a
+        // daemon-originated `cmux_control` child channel for each accepted
+        // connection. Stop it BEFORE `mux.deinit()` so no new child
+        // channels are opened during teardown.
+        var cmux_listener: ?*session.services.cmux_control.Listener = null;
+        if (self.daemon.cmux_control_socket_path) |sock_path| {
+            if (self.daemon.cmux_control_token) |token| {
+                cmux_listener = session.services.cmux_control.startListener(
+                    self.daemon.alloc,
+                    &mux,
+                    sock_path,
+                    token,
+                ) catch |err| blk: {
+                    log.warn("cmux_control: listener start failed: {}", .{err});
+                    break :blk null;
+                };
+            }
+        }
+        defer if (cmux_listener) |l| l.stop();
 
         // Capability exchange. `handshake` parses the already-read
         // payload and sends our reply.
@@ -621,6 +657,14 @@ const Daemon = struct {
     /// thereafter. Empty in Phase 6A.2 — every channel_open is rejected
     /// with service_not_supported until services land in 6A.3.
     channel_registry: session.channel_mux.Registry,
+    /// Per-daemon AF_UNIX path the `cmux_control` reverse channel binds
+    /// on each mux connection, and the path injected into every spawned
+    /// shell as `CMUX_SOCKET_PATH`. Owned here; null if derivation failed.
+    cmux_control_socket_path: ?[]u8 = null,
+    /// Per-daemon auth token the remote `cmux` CLI must present on the
+    /// reverse-channel socket, injected as `CMUX_SOCKET_PASSWORD`. Owned
+    /// here; null if derivation failed.
+    cmux_control_token: ?[]u8 = null,
 
     fn deinit(self: *Daemon) void {
         for (self.groups.values()) |group| group.deinit();
@@ -629,6 +673,8 @@ const Daemon = struct {
         closeFd(self.listener);
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         self.alloc.free(self.socket_path);
+        if (self.cmux_control_socket_path) |p| self.alloc.free(p);
+        if (self.cmux_control_token) |t| self.alloc.free(t);
     }
 
     /// Find a group by UUID or by label (for named sessions).
@@ -1107,6 +1153,19 @@ const Daemon = struct {
         try env.put("COLORTERM", "truecolor");
         try env.put("TERM_PROGRAM", "ghostty");
         try env.put("TERM_PROGRAM_VERSION", build_config.version_string);
+
+        // Reverse control channel: point the remote `cmux` CLI at the
+        // per-daemon AF_UNIX socket the `cmux_control` listener binds, and
+        // hand it the per-daemon auth token it must present on that socket
+        // (the daemon enforces the token before forwarding any line to the
+        // client). Without these the remote `cmux notify` has nowhere to
+        // connect.
+        if (self.cmux_control_socket_path) |sock_path| {
+            try env.put("CMUX_SOCKET_PATH", sock_path);
+        }
+        if (self.cmux_control_token) |token| {
+            try env.put("CMUX_SOCKET_PASSWORD", token);
+        }
 
         var command: Command = .{
             .path = command_path,

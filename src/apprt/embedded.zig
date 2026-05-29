@@ -21,6 +21,7 @@ const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const session = @import("../session.zig");
+const ssh_capi = @import("embedded/ssh_capi.zig");
 
 const log = std.log.scoped(.embedded_window);
 
@@ -427,6 +428,16 @@ pub const Surface = struct {
         *const [16]u8,
     ) callconv(.c) void = null,
 
+    /// Stored copy of the embedder's `on_remote_state` callback (if any).
+    /// Invoked from `core.Surface.handleMessage`'s `connection_state`
+    /// path so the embedder learns this surface's own transport health
+    /// (the same pooled `Entry` the terminal data plane rides), distinct
+    /// from the whole-connection `ghostty_ssh_open` `on_state` callback.
+    on_remote_state_cb: ?*const fn (
+        ?*anyopaque,
+        *const ssh_capi.State,
+    ) callconv(.c) void = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -518,6 +529,22 @@ pub const Surface = struct {
             *const [16]u8,
             *const [16]u8,
         ) callconv(.c) void = null,
+
+        /// Callback fired whenever THIS surface's `Remote` termio backend
+        /// transitions connection state on its own pooled SSH `Entry`
+        /// (the same connection the terminal data plane rides). This is
+        /// the per-surface transport health, distinct from the
+        /// whole-connection `ghostty_ssh_open` `on_state` callback — a
+        /// degraded browser-proxy channel cannot move it. `state` mirrors
+        /// the `ghostty_ssh_open` `on_state` payload (`ghostty_ssh_state_t`
+        /// = `ssh_capi.State`) and is valid only for the callback's
+        /// duration — copy if you need to retain. Userdata is the same
+        /// opaque pointer passed in `Options.userdata`. Ignored when
+        /// `ssh_target` is null.
+        on_remote_state: ?*const fn (
+            ?*anyopaque,
+            *const ssh_capi.State,
+        ) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -526,6 +553,7 @@ pub const Surface = struct {
             .platform = try .init(opts.platform_tag, opts.platform),
             .userdata = opts.userdata,
             .on_remote_opened_cb = opts.on_remote_opened,
+            .on_remote_state_cb = opts.on_remote_state,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -878,6 +906,24 @@ pub const Surface = struct {
     ) void {
         const cb = self.on_remote_opened_cb orelse return;
         cb(self.userdata, &group_id, &surface_id);
+    }
+
+    /// Forward this surface's `Remote` backend connection-state
+    /// transition to the embedder via the `on_remote_state` callback
+    /// stamped in `Surface.Options`. Called from `core.Surface.handleMessage`
+    /// alongside the renderer-overlay update so the embedder (cmux) can
+    /// drive a per-surface transport-health signal off the SAME pooled
+    /// `Entry` the terminal data plane rides — instead of inferring
+    /// terminal health from the separate browser-proxy C-API connection.
+    /// The flat `ssh_capi.State` is built on this stack frame and only
+    /// borrowed for the callback's duration.
+    pub fn remoteConnectionState(
+        self: *Surface,
+        state: session.protocol.ConnectionState,
+    ) void {
+        const cb = self.on_remote_state_cb orelse return;
+        const c_state = ssh_capi.translateConnectionState(state);
+        cb(self.userdata, &c_state);
     }
 
     pub fn refresh(self: *Surface) void {

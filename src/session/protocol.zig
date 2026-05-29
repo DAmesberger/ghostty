@@ -7,14 +7,27 @@ const Allocator = std.mem.Allocator;
 /// supports up to 4GB — no protocol-level limit.
 pub const max_payload = 256 * 1024;
 
-/// Keepalive: client sends ping at this interval, daemon responds with pong.
-/// Halves keepalive traffic vs bidirectional keepalive.
-pub const keepalive_interval_ns: i128 = 15 * std.time.ns_per_s;
+/// Default keepalive intervals. The client may override these per-Entry
+/// (see SshConnectionManager.Entry / Config) for faster disconnect
+/// detection on flaky links. The server-side timeout
+/// (keepalive_server_timeout_ns) is enforced by the multiplex process
+/// and is not currently runtime-configurable from the client.
+///
+/// Client sends ping at `keepalive_interval_ns`, daemon responds with
+/// pong. Halves keepalive traffic vs bidirectional keepalive.
+pub const keepalive_interval_ns: i128 = 5 * std.time.ns_per_s;
 
-/// Client considers connection stale if no pong received within this window.
-pub const keepalive_stale_ns: i128 = 45 * std.time.ns_per_s;
+/// Client considers connection stale if no pong received within this
+/// window. With the default interval=5s, two missed pongs ⇒ stale,
+/// which surfaces as a `.reconnecting` state broadcast and lets the
+/// embedder show its reconnect overlay within ~10s of a dropped link
+/// (instead of the previous 45s).
+pub const keepalive_stale_ns: i128 = 12 * std.time.ns_per_s;
 
 /// Server closes connection if no ping received within this window.
+/// Stays at 60s because changing it would require coordinating both
+/// ends of the protocol; the client-side stale (12s) trips first
+/// anyway under normal flow.
 pub const keepalive_server_timeout_ns: i128 = 60 * std.time.ns_per_s;
 
 /// Connection state reported to surfaces for overlay display.
@@ -1039,6 +1052,16 @@ pub const ChannelService = enum(u8) {
     file_transfer = 3,
     browser_proxy = 4,
     process_exec = 5,
+    /// cmux control reverse channel. The daemon listens on a remote-side
+    /// unix socket (path injected into the remote shell via
+    /// `CMUX_SOCKET_PATH`) and forwards each framed CLI request received
+    /// there back to the client over a daemon-originated channel of this
+    /// service. The client runs the request through its in-process socket
+    /// dispatcher (notify / notify_target / report_*) and writes the
+    /// response back. Wire id 7 — the first free slot above the
+    /// spec-defined services and below the `tcp_accepted` daemon-internal
+    /// id (which uses the reserved-range value, see services/tcp_accepted.zig).
+    cmux_control = 7,
     custom = 255,
     _,
 };

@@ -195,6 +195,13 @@ pub const Entry = struct {
     max_reconnect_attempts: u32 = 5,
     reconnect_backoff: config.SshReconnectBackoff = .exponential,
     reconnect_interval_ms: u32 = 1000,
+    /// Upper bound on the per-attempt sleep after exponential / linear
+    /// growth. Embedders that want truly persistent reconnect set
+    /// `max_reconnect_attempts` very high and pick a small ceiling
+    /// here (e.g. 8000ms) so the loop is patient but doesn't drift
+    /// into multi-minute sleeps once the network has been down for a
+    /// while.
+    reconnect_max_interval_ms: u32 = 30_000,
 
     // Reconnect IPC pipe (write end signaled from GTK thread, read end polled by SSH thread)
     reconnect_pipe: [2]posix.fd_t = .{ -1, -1 },
@@ -679,12 +686,37 @@ pub fn sshThreadMain(entry: *Entry) void {
             } else break;
         }
 
-        // Check channel EOF (remote ghostty exited — all sessions dead)
+        // Check channel EOF. Two distinct causes:
+        //   1. The remote ghostty-daemon exited cleanly (genuine
+        //      session-end — surfaces should die).
+        //   2. The SSH transport itself dropped (tunnel/VPN down,
+        //      laptop sleep, network partition). The daemon is
+        //      almost certainly still alive on the other side; we
+        //      want to drive the reconnect loop instead of tearing
+        //      surfaces down.
+        //
+        // We can't reliably distinguish (1) from (2) from EOF alone,
+        // but `attemptReconnect` is the right thing to try first —
+        // if max_reconnect_attempts is exhausted (or set to 0) the
+        // function returns false and we fall through to the
+        // session-end behaviour. With a "patient but persistent"
+        // config (max_reconnect_attempts = u32.max) we essentially
+        // never give up on tunnel drops, which is what cmux wants.
         entry.libssh2_mutex.lock();
         const channel_is_eof = channel.eof();
         entry.libssh2_mutex.unlock();
         if (channel_is_eof) {
-            log.info("ssh channel EOF", .{});
+            log.info("ssh channel EOF — attempting reconnect", .{});
+            if (attemptReconnect(entry)) {
+                // Reconnected — refresh local refs and continue the loop.
+                const reconnect_now = std.time.nanoTimestamp();
+                last_keepalive_sent = reconnect_now;
+                entry.last_keepalive_received = reconnect_now;
+                sess = &entry.ctx.session.?;
+                channel = &entry.channel.?;
+                broadcastConnectionState(entry, .connected);
+                continue;
+            }
             notifyAllSurfaces(entry);
             return;
         }
@@ -1672,11 +1704,14 @@ pub fn cancelReconnect(entry: *Entry) void {
 }
 
 /// Compute backoff delay in milliseconds for the given attempt (0-based).
-fn computeBackoff(entry: *const Entry, attempt: u32) u64 {
+/// `pub` so the C-API setup worker can reuse the same backoff curve for
+/// its relentless *initial*-connect retry loop (see ssh_capi.zig).
+pub fn computeBackoff(entry: *const Entry, attempt: u32) u64 {
     const base: u64 = entry.reconnect_interval_ms;
+    const cap: u64 = entry.reconnect_max_interval_ms;
     return switch (entry.reconnect_backoff) {
-        .exponential => @min(base *| (@as(u64, 1) << @intCast(@min(attempt, 30))), 30_000),
-        .linear => @min(base *| (@as(u64, attempt) + 1), 30_000),
+        .exponential => @min(base *| (@as(u64, 1) << @intCast(@min(attempt, 30))), cap),
+        .linear => @min(base *| (@as(u64, attempt) + 1), cap),
         .constant => base,
     };
 }
@@ -1895,4 +1930,54 @@ test "unregisterCAPISurface prevents subsequent dispatch" {
     unregisterCAPISurface(&entry, 5);
     try testing.expect(!dispatchCAPIFrame(&entry, 5, .data_out, "abc"));
     try testing.expectEqual(@as(u32, 0), ctx.data_calls);
+}
+
+// Regression: a remote terminal surface whose ssh_target encodes the
+// ProxyJump via the ` via ` syntax must resolve the SAME pool key as the
+// C-API proxy connection, which calls `makeKey(host, jump)` with a separate
+// jump argument. Before the cmux fix the terminal surface keyed on the bare
+// host (jump=null) while the proxy keyed on host|jump, so a ProxyJump user
+// got two libssh2 connections instead of one shared Entry.
+test "makeKey: terminal host-via-jump target pools with proxy (host, jump)" {
+    const alloc = testing.allocator;
+
+    const host = "user@example.com:2222";
+    const jump = "bastion@jump.example.com";
+
+    // Proxy path: target and jump arrive as separate arguments.
+    const proxy_key = try makeKey(alloc, host, jump);
+    defer alloc.free(proxy_key);
+
+    // Terminal path: the surface ssh_target is the canonical
+    // "host via jump" string; `parseSshTarget` splits it back into
+    // (target, jump) exactly as `Remote.threadEnter` does before acquire.
+    const surface_target = "user@example.com:2222 via bastion@jump.example.com";
+    const parsed = session.shared.parseSshTarget(surface_target);
+    const terminal_key = try makeKey(alloc, parsed.target, parsed.jump);
+    defer alloc.free(terminal_key);
+
+    try testing.expectEqualStrings(host, parsed.target);
+    try testing.expectEqualStrings(jump, parsed.jump.?);
+    try testing.expectEqualStrings(proxy_key, terminal_key);
+    try testing.expectEqualStrings("user@example.com:2222|bastion@jump.example.com", terminal_key);
+}
+
+// With no ProxyJump configured the terminal surface keeps the bare target,
+// `parseSshTarget` returns jump=null, and the key is just the host — matching
+// a direct (jump=null) proxy connection so they still share one Entry.
+test "makeKey: bare target keys on host with no jump" {
+    const alloc = testing.allocator;
+
+    const host = "user@example.com:2222";
+    const parsed = session.shared.parseSshTarget(host);
+    try testing.expect(parsed.jump == null);
+
+    const key = try makeKey(alloc, parsed.target, parsed.jump);
+    defer alloc.free(key);
+
+    const direct_key = try makeKey(alloc, host, null);
+    defer alloc.free(direct_key);
+
+    try testing.expectEqualStrings(host, key);
+    try testing.expectEqualStrings(direct_key, key);
 }

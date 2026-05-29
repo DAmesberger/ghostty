@@ -41,11 +41,15 @@ extension Ghostty {
             /// Reconnect attempts after an unexpected drop. 0 disables auto-
             /// reconnect entirely; UINT32_MAX gives the libghostty default.
             public let maxReconnectAttempts: UInt32
-            /// Initial backoff; doubles per attempt, capped at 60 s. 0 uses
-            /// libghostty default (1000 ms).
+            /// Initial backoff; grows per attempt (capped by
+            /// `reconnectMaxIntervalMs`). 0 uses libghostty default (1000 ms).
             public let reconnectIntervalMs: UInt32
             /// Soft cap on per-surface scrollback bytes; 0 = daemon default.
             public let scrollbackLimitBytes: UInt32
+            /// Ceiling on a single reconnect backoff sleep, in milliseconds.
+            /// Combine with `maxReconnectAttempts: .max` for "patient but
+            /// persistent" reconnect. 0 uses libghostty default (30 000 ms).
+            public let reconnectMaxIntervalMs: UInt32
 
             public init(
                 target: String,
@@ -54,7 +58,8 @@ extension Ghostty {
                 keepaliveIntervalMs: UInt32 = 0,
                 maxReconnectAttempts: UInt32 = .max,
                 reconnectIntervalMs: UInt32 = 0,
-                scrollbackLimitBytes: UInt32 = 0
+                scrollbackLimitBytes: UInt32 = 0,
+                reconnectMaxIntervalMs: UInt32 = 0
             ) {
                 self.target = target
                 self.jump = jump
@@ -63,6 +68,7 @@ extension Ghostty {
                 self.maxReconnectAttempts = maxReconnectAttempts
                 self.reconnectIntervalMs = reconnectIntervalMs
                 self.scrollbackLimitBytes = scrollbackLimitBytes
+                self.reconnectMaxIntervalMs = reconnectMaxIntervalMs
             }
         }
 
@@ -179,7 +185,8 @@ extension Ghostty {
                             max_reconnect_attempts: config.maxReconnectAttempts,
                             reconnect_interval_ms: config.reconnectIntervalMs,
                             host_key_policy: hostKey.cPolicy,
-                            scrollback_limit_bytes: config.scrollbackLimitBytes
+                            scrollback_limit_bytes: config.scrollbackLimitBytes,
+                            reconnect_max_interval_ms: config.reconnectMaxIntervalMs
                         )
                         var cbs = ghostty_ssh_callbacks_t(
                             on_state: SSHConnection.cOnState,

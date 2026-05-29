@@ -289,27 +289,50 @@ pub fn ensureRemoteGhostty(
     defer alloc.free(daemon_path);
 
     if (try probeDeployedBinary(alloc, sess, daemon_path)) {
-        return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
+        // Protocol matches. If we ALSO have a local daemon adjacent
+        // to this exe (development build), require a content-hash
+        // match too. Bumps that don't bump `protocol_version` (e.g.
+        // the daemon isSocketOurs inode fix, keepalive default
+        // tweaks, debugging tweaks) leave protocol_version steady
+        // but DO change the binary, and a stale remote silently
+        // breaks the user's session. The check is best-effort:
+        // skipped silently if `sha256sum` is unavailable on the
+        // remote or the local binary can't be hashed.
+        const hash_decision = remoteBinaryMatchesLocalHash(alloc, sess, daemon_path, remote_os, remote_arch) catch null;
+        if (hash_decision == null or hash_decision == true) {
+            return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
+        }
+        log.info(
+            "remote binary at {s} content-hash differs from local — re-uploading",
+            .{daemon_path},
+        );
+        // Fall through to the upload path below.
     }
 
     // Need to provision — install as ghostty-daemon.
     const dest = try alloc.dupe(u8, daemon_path);
     errdefer alloc.free(dest);
 
-    // 2. Same architecture → try uploading local ghostty-daemon binary.
-    const local = shared.localPlatform();
-    const arch_matches = platformMatches(local.os, remote_os) and
-        std.ascii.eqlIgnoreCase(local.arch, remote_arch);
+    // 2. Try uploading a locally-available daemon binary for the
+    //    remote target. `findLocalDaemon` resolves to a target-tagged
+    //    or generic bundled binary (or an env-var override) — see its
+    //    docstring for the resolution order. We no longer gate on
+    //    `arch_matches`: if the bundle contains a binary specifically
+    //    named `ghostty-daemon-<os>-<arch>` for the remote, the cmux
+    //    host's own arch is irrelevant (cross-platform deploy is the
+    //    whole point of the tagged slot). If it returns only the
+    //    legacy untagged `ghostty-daemon`, uploadGhostty's
+    //    architecture-verification step will catch a mismatch and we
+    //    fall through to the GitHub download path.
+    if (try findLocalDaemon(alloc, remote_os, remote_arch)) |local_daemon| {
+        defer alloc.free(local_daemon);
 
-    if (arch_matches) {
-        if (try findLocalDaemon(alloc)) |local_daemon| {
-            defer alloc.free(local_daemon);
-
-            if (uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon)) {
-                return .{ .path = dest, .provisioned = true };
-            } else |_| {
-                // Local daemon upload failed (e.g., file not found) — fall through to download.
-            }
+        if (uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon)) {
+            return .{ .path = dest, .provisioned = true };
+        } else |_| {
+            // Local daemon upload failed (e.g., file not found, or
+            // arch mismatch on the legacy untagged path) — fall
+            // through to download.
         }
     }
 
@@ -327,14 +350,185 @@ pub fn ensureRemoteGhostty(
     return .{ .path = dest, .provisioned = true };
 }
 
-/// Find a locally-built daemon binary adjacent to the current exe.
-/// Returns the path if found, null otherwise. Caller owns returned memory.
-fn findLocalDaemon(alloc: Allocator) !?[]const u8 {
-    const exe_path = std.fs.selfExePathAlloc(alloc) catch return null;
-    defer alloc.free(exe_path);
+/// Find a bundled-or-built daemon binary suitable for the given
+/// remote target.
+///
+/// Resolution order (returns the first that actually exists on disk):
+///
+///   1. `<exe-dir>/../Resources/ghostty-daemon-<os>-<arch>` — a
+///      target-tagged binary bundled into the app at build time
+///      (e.g. `ghostty-daemon-linux-x86_64`). This is the right
+///      slot for cross-platform deploy where the cmux host arch
+///      differs from the remote arch.
+///   2. `<exe-dir>/../Resources/ghostty-daemon` — an untagged
+///      bundled binary. Used when the bundle ships a single daemon
+///      built for the same target as the host (the common
+///      release-app shape).
+///   3. `<exe-dir>/ghostty-daemon` — adjacent to the running exe,
+///      same shape as the legacy bundling. Preserved for backwards
+///      compatibility.
+///   4. `CMUX_GHOSTTY_DAEMON_PATH` env var — ultimate override for
+///      pointing at an arbitrary daemon binary on the host
+///      filesystem (e.g. a freshly-built `zig-out/bin/ghostty-daemon`
+///      during dev iteration). Lowest priority so a bundled binary
+///      always wins; the env var is the explicit "I know what I'm
+///      doing" escape hatch.
+///
+/// Returns null if none of those paths point at a regular file.
+/// Caller owns returned memory.
+fn findLocalDaemon(
+    alloc: Allocator,
+    remote_os: []const u8,
+    remote_arch: []const u8,
+) !?[]const u8 {
+    const exe_path = std.fs.selfExePathAlloc(alloc) catch null;
+    defer if (exe_path) |p| alloc.free(p);
 
-    const dir = std.fs.path.dirname(exe_path) orelse return null;
-    return try std.fs.path.join(alloc, &.{ dir, "ghostty-daemon" });
+    const exe_dir = if (exe_path) |p| std.fs.path.dirname(p) else null;
+    const resources_dir = if (exe_dir) |d|
+        try std.fs.path.join(alloc, &.{ d, "..", "Resources" })
+    else
+        null;
+    defer if (resources_dir) |r| alloc.free(r);
+
+    const norm_os = shared.normalizeOs(remote_os);
+    const norm_arch = shared.normalizeArch(remote_arch);
+    const tagged_name = try std.fmt.allocPrint(
+        alloc,
+        "ghostty-daemon-{s}-{s}",
+        .{ norm_os, norm_arch },
+    );
+    defer alloc.free(tagged_name);
+
+    // 1. Resources/ghostty-daemon-<os>-<arch>
+    if (resources_dir) |r| {
+        const tagged = try std.fs.path.join(alloc, &.{ r, tagged_name });
+        if (fileExists(tagged)) return tagged;
+        alloc.free(tagged);
+    }
+    // 2. Resources/ghostty-daemon
+    if (resources_dir) |r| {
+        const generic = try std.fs.path.join(alloc, &.{ r, "ghostty-daemon" });
+        if (fileExists(generic)) return generic;
+        alloc.free(generic);
+    }
+    // 3. <exe-dir>/ghostty-daemon
+    if (exe_dir) |d| {
+        const adjacent = try std.fs.path.join(alloc, &.{ d, "ghostty-daemon" });
+        if (fileExists(adjacent)) return adjacent;
+        alloc.free(adjacent);
+    }
+    // 4. Env var escape hatch
+    if (std.posix.getenv("CMUX_GHOSTTY_DAEMON_PATH")) |env_path| {
+        if (env_path.len > 0 and fileExists(env_path)) {
+            return try alloc.dupe(u8, env_path);
+        }
+    }
+
+    return null;
+}
+
+/// True if `path` points at an existing regular file. Used to gate
+/// the candidate slots in `findLocalDaemon` so callers see "this
+/// binary really exists" semantics.
+fn fileExists(path: []const u8) bool {
+    const f = std.fs.openFileAbsolute(path, .{}) catch return false;
+    f.close();
+    return true;
+}
+
+/// Compare the SHA256 of `remote_path` on the remote against the local
+/// daemon binary adjacent to this exe (`findLocalDaemon`).
+///
+/// Returns:
+///   * `true`  — both hashes computed and they match
+///   * `false` — both hashes computed and they differ (remote is stale)
+///   * `null`  — couldn't compute one side (no local daemon, no
+///               `sha256sum` on remote, exec error, etc). Caller treats
+///               null as "unknown" and skips the re-upload trigger.
+///
+/// We use the remote's `sha256sum` rather than asking the daemon to
+/// hash itself: the daemon's binary may be the wrong version or even
+/// crash on startup, and we want a check that works in those cases too.
+fn remoteBinaryMatchesLocalHash(
+    alloc: Allocator,
+    sess: *ssh.SshSession,
+    remote_path: []const u8,
+    remote_os: []const u8,
+    remote_arch: []const u8,
+) !?bool {
+    // 1. Need a local daemon for the target to compare against.
+    const local_path = (try findLocalDaemon(alloc, remote_os, remote_arch)) orelse return null;
+    defer alloc.free(local_path);
+
+    // 2. Hash the local binary.
+    const local_hex = computeLocalSha256(alloc, local_path) catch return null;
+    defer alloc.free(local_hex);
+
+    // 3. Get the remote hash. We try `sha256sum` (GNU coreutils — Linux
+    //    default) and `shasum -a 256` (macOS / BSD). If neither is on
+    //    PATH, the check returns null (unknown).
+    var remote_hex_buf: [64]u8 = undefined;
+    const remote_hex = blk: {
+        const cmd_a = try std.fmt.allocPrint(
+            alloc,
+            "sha256sum '{s}' 2>/dev/null | head -c 64",
+            .{remote_path},
+        );
+        defer alloc.free(cmd_a);
+        if (sess.exec(cmd_a)) |result| {
+            defer alloc.free(result.stdout);
+            defer alloc.free(result.stderr);
+            if (result.exit_code == 0 and result.stdout.len >= 64) {
+                @memcpy(remote_hex_buf[0..], result.stdout[0..64]);
+                break :blk remote_hex_buf[0..];
+            }
+        } else |_| {}
+
+        const cmd_b = try std.fmt.allocPrint(
+            alloc,
+            "shasum -a 256 '{s}' 2>/dev/null | head -c 64",
+            .{remote_path},
+        );
+        defer alloc.free(cmd_b);
+        if (sess.exec(cmd_b)) |result| {
+            defer alloc.free(result.stdout);
+            defer alloc.free(result.stderr);
+            if (result.exit_code == 0 and result.stdout.len >= 64) {
+                @memcpy(remote_hex_buf[0..], result.stdout[0..64]);
+                break :blk remote_hex_buf[0..];
+            }
+        } else |_| {}
+
+        return null; // No usable hash tool on remote.
+    };
+
+    return std.ascii.eqlIgnoreCase(local_hex, remote_hex);
+}
+
+/// Compute the SHA256 of a local file and return the hex-encoded
+/// digest. Caller owns the returned slice.
+fn computeLocalSha256(alloc: Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try file.read(&buf);
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+
+    const hex = try alloc.alloc(u8, 64);
+    const charset = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        hex[i * 2] = charset[(b >> 4) & 0x0f];
+        hex[i * 2 + 1] = charset[b & 0x0f];
+    }
+    return hex;
 }
 
 /// Check if a deployed binary at the given path has a compatible protocol version.
@@ -771,6 +965,10 @@ pub const AttachConfig = struct {
     reconnect_backoff: @import("../config.zig").Config.SshReconnectBackoff,
     /// Initial reconnect interval in milliseconds.
     reconnect_interval_ms: u32,
+    /// Upper bound on a single reconnect sleep after backoff growth,
+    /// in milliseconds. 0 means "leave the Entry default in place"
+    /// (legacy 30 000 ms).
+    reconnect_max_interval_ms: u32 = 0,
     /// Client-side scrollback retention requested from the daemon.
     scrollback_limit: u32,
 };
@@ -923,6 +1121,9 @@ pub fn attachRemoteSurface(
     entry.max_reconnect_attempts = cfg.max_reconnect_attempts;
     entry.reconnect_backoff = cfg.reconnect_backoff;
     entry.reconnect_interval_ms = cfg.reconnect_interval_ms;
+    if (cfg.reconnect_max_interval_ms != 0) {
+        entry.reconnect_max_interval_ms = cfg.reconnect_max_interval_ms;
+    }
     entry.scrollback_limit = cfg.scrollback_limit;
 
     // Pipes used by the SSH thread for quit / write-wakeup /

@@ -1252,6 +1252,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .connection_state,
                 state,
             ) catch {};
+
+            // Notify the embedded apprt (cmux) with THIS surface's own
+            // transport-health transition via the per-surface
+            // `on_remote_state` callback. The GHOSTTY_ACTION_CONNECTION_STATE
+            // action carries no readable payload to embedders (its C union
+            // member is `void`), so cmux instead drives `RemoteHealth.transport`
+            // off this callback — sourced from the surface's own pooled
+            // `Entry`, not the separate browser-proxy C-API connection.
+            if (@hasDecl(apprt.runtime.Surface, "remoteConnectionState")) {
+                self.rt_surface.remoteConnectionState(state);
+            }
         },
 
         .remote_opened => |ro| {

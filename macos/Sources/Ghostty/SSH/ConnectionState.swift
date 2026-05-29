@@ -173,6 +173,71 @@ extension Ghostty {
             default: return false
             }
         }
+
+        /// Decode a flat C `ghostty_ssh_state_t` into the Swift enum
+        /// WITHOUT an owning `SSHConnection`. Used by the per-surface
+        /// `on_remote_state` callback path (`ghostty_surface_config_s`),
+        /// which surfaces a `Remote` backend's own transport health and
+        /// has no connection wrapper to bind password closures to. A
+        /// terminal `Remote` backend never prompts for a password, so the
+        /// `passwordRequired` closures are inert no-ops here; every other
+        /// case is decoded identically to the connection path.
+        public static func decode(surfaceState s: ghostty_ssh_state_t) -> ConnectionState {
+            switch s.kind {
+            case GHOSTTY_SSH_STATE_CONNECTING:
+                return .connecting
+            case GHOSTTY_SSH_STATE_DOWNLOADING:
+                return .downloading
+            case GHOSTTY_SSH_STATE_SETUP:
+                return .setup
+            case GHOSTTY_SSH_STATE_CONNECTED:
+                return .connected
+            case GHOSTTY_SSH_STATE_STALE:
+                return .stale
+            case GHOSTTY_SSH_STATE_PASSWORD_REQUIRED:
+                let p = s.payload.password
+                let host = p.host.map { String(cString: $0) } ?? ""
+                return .passwordRequired(.init(
+                    isJump: p.is_jump,
+                    host: host,
+                    submit: { _ in },
+                    cancel: {}
+                ))
+            case GHOSTTY_SSH_STATE_UPLOADING:
+                let u = s.payload.upload
+                return .uploading(.init(
+                    bytesSent: u.bytes_sent,
+                    totalBytes: u.total_bytes,
+                    source: ProvisionSource.from(u.source)
+                ))
+            case GHOSTTY_SSH_STATE_RECONNECTING:
+                let r = s.payload.reconnect
+                let nextDate: Date? = r.next_retry_ns == 0
+                    ? nil
+                    : Date(timeIntervalSince1970: Double(r.next_retry_ns) / 1_000_000_000)
+                return .reconnecting(.init(
+                    attempt: r.attempt,
+                    maxAttempts: r.max_attempts,
+                    elapsed: Double(r.elapsed_ns) / 1_000_000_000,
+                    nextRetry: nextDate
+                ))
+            case GHOSTTY_SSH_STATE_FAILED:
+                let f = s.payload.fail
+                let msg = f.message.map { String(cString: $0) }
+                return .failed(.init(
+                    reason: Failure.Reason.from(f.reason),
+                    message: msg
+                ))
+            case GHOSTTY_SSH_STATE_DISCONNECTED:
+                let d = s.payload.disconnect
+                return .disconnected(.init(
+                    attemptsMade: d.attempts_made,
+                    reason: Disconnect.Reason.from(d.reason)
+                ))
+            default:
+                return .connecting
+            }
+        }
     }
 
     /// Public error type for the SSH wrapper. Distinct from the package-

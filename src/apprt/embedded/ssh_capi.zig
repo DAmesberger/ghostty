@@ -288,6 +288,12 @@ pub const Config = extern struct {
     reconnect_interval_ms: u32,
     host_key_policy: HostKeyPolicy,
     scrollback_limit_bytes: u32,
+    /// Upper bound on a single reconnect backoff sleep, in
+    /// milliseconds. Pair with `max_reconnect_attempts = UINT32_MAX`
+    /// for "patient but persistent" reconnect: ghostty keeps trying
+    /// indefinitely, but never sleeps longer than this between
+    /// attempts. Set to 0 to use the legacy 30 s default.
+    reconnect_max_interval_ms: u32,
 };
 
 /// Mirror of `ghostty_ssh_callbacks_t`.
@@ -367,6 +373,7 @@ const OwnedConfig = struct {
     reconnect_interval_ms: u32,
     host_key_policy: HostKeyPolicy,
     scrollback_limit_bytes: u32,
+    reconnect_max_interval_ms: u32,
 
     fn fromC(alloc: Allocator, cfg: *const Config) !OwnedConfig {
         const target = try alloc.dupeZ(u8, std.mem.span(cfg.target));
@@ -383,6 +390,10 @@ const OwnedConfig = struct {
             .reconnect_interval_ms = cfg.reconnect_interval_ms,
             .host_key_policy = cfg.host_key_policy,
             .scrollback_limit_bytes = cfg.scrollback_limit_bytes,
+            .reconnect_max_interval_ms = if (cfg.reconnect_max_interval_ms == 0)
+                30_000
+            else
+                cfg.reconnect_max_interval_ms,
         };
     }
 
@@ -1108,6 +1119,15 @@ pub const ChannelHandle = struct {
 // Internal helpers — state translation, manager access.
 // =========================================================================
 
+/// Public re-export of `translateState` for the per-surface
+/// `on_remote_state` callback in `apprt/embedded.zig`. The surface path
+/// has no PasswordPrompt token plumbing (a terminal `Remote` backend
+/// never prompts), so the password-variant `host` stays empty exactly
+/// as the SSH-connection path leaves it before stashing the bytes.
+pub fn translateConnectionState(state: protocol.ConnectionState) State {
+    return translateState(state);
+}
+
 /// Translate `protocol.ConnectionState` into the flat C `ghostty_ssh_state_t`.
 /// PasswordPrompt currently surfaces `auth_token=0` because the
 /// token-allocation plumbing lands with the password follow-up; embedders
@@ -1265,11 +1285,20 @@ export fn ghostty_ssh_open(
         // own that path, but the Entry-level knobs (interval, max
         // attempts) belong to the connection-pool level and must be
         // set before the first attach so reconnect respects them.
-        if (cfg.max_reconnect_attempts != std.math.maxInt(u32)) {
-            entry.max_reconnect_attempts = cfg.max_reconnect_attempts;
-        }
+        //
+        // No sentinel handling for `max_reconnect_attempts` — the
+        // embedder always speaks the literal value (0 disables
+        // auto-reconnect, u32_max for "never give up"). A previous
+        // sentinel that mapped `u32_max → leave at default(5)`
+        // silently ignored the "infinite" request and caused the
+        // workspace to drop to `.disconnected` after only a handful
+        // of failed attempts.
+        entry.max_reconnect_attempts = cfg.max_reconnect_attempts;
         if (cfg.reconnect_interval_ms != 0) {
             entry.reconnect_interval_ms = cfg.reconnect_interval_ms;
+        }
+        if (cfg.reconnect_max_interval_ms != 0) {
+            entry.reconnect_max_interval_ms = cfg.reconnect_max_interval_ms;
         }
         if (cfg.scrollback_limit_bytes != 0) {
             entry.scrollback_limit = cfg.scrollback_limit_bytes;
@@ -1310,6 +1339,7 @@ export fn ghostty_ssh_open(
             .max_reconnect_attempts = entry.max_reconnect_attempts,
             .reconnect_backoff = entry.reconnect_backoff,
             .reconnect_interval_ms = entry.reconnect_interval_ms,
+            .reconnect_max_interval_ms = entry.reconnect_max_interval_ms,
             .scrollback_limit = entry.scrollback_limit,
         };
 
@@ -1359,44 +1389,58 @@ const SetupWorker = struct {
             alloc.destroy(self);
         }
 
-        // Race-prevention via the per-Entry atomic. Mirror of the
-        // pattern in `termio/Remote.zig:threadEnter` so the GTK and
-        // libghostty paths agree on first-attacher election.
-        const prev = entry.conn_state.cmpxchgStrong(
-            .uninitialized,
-            .connecting,
-            .seq_cst,
-            .seq_cst,
-        );
-        if (prev == null) {
-            // Won the race — drive the full setup. `attachRemoteSurface`
-            // already broadcasts intermediate states (UPLOADING, SETUP,
-            // PASSWORD_REQUIRED, FAILED) via `pushAttachState`; only the
-            // final `.connected` broadcast is our responsibility per the
-            // helper's docstring.
-            session_client.attachRemoteSurface(
-                handle.alloc,
-                self.manager,
-                entry,
-                null,
-                self.cfg,
-            ) catch |err| {
-                log.warn("ghostty_ssh_open: setupConnection failed: {}", .{err});
+        // Driver election via the per-Entry atomic. Mirror of the pattern
+        // in `termio/Remote.zig:threadEnter` so the GTK and libghostty
+        // paths agree on first-attacher election — extended here to be
+        // self-healing across re-opens.
+        //
+        // We claim the driver role from a fresh (`.uninitialized`) OR a
+        // parked (`.failed`) entry. Reviving `.failed` is what un-wedges
+        // restore: a prior attempt that gave up (terminal auth failure,
+        // exhausted budget, or a handle closed mid-connect) leaves the
+        // pooled Entry at `.failed` with no driver, and a re-open
+        // (user-initiated "Reconnect", or cmux re-creating the
+        // integration) must be free to retry rather than inherit the
+        // stale failure. If another attacher currently owns setup
+        // (`.connecting`/`.ready`) we wait; should that owner later bail
+        // and park the entry at `.failed`, we loop back and take over.
+        while (true) {
+            if (handle.closed.load(.acquire)) return;
+
+            const claimed = entry.conn_state.cmpxchgStrong(
+                .uninitialized,
+                .connecting,
+                .seq_cst,
+                .seq_cst,
+            ) == null or entry.conn_state.cmpxchgStrong(
+                .failed,
+                .connecting,
+                .seq_cst,
+                .seq_cst,
+            ) == null;
+
+            if (claimed) {
+                // We are the driver. Drive the full setup with a relentless
+                // retry loop. `attachRemoteSurface` already broadcasts
+                // intermediate states (UPLOADING, SETUP, PASSWORD_REQUIRED,
+                // FAILED) via `pushAttachState`; only the final `.connected`
+                // broadcast is our responsibility per the helper's docstring.
+                if (self.driveConnectWithRetry()) {
+                    entry.conn_state.store(.ready, .seq_cst);
+                    break;
+                }
+                // Terminal failure, cancel, or close. The terminal state
+                // has already been broadcast; park the entry at `.failed`
+                // so a live poller (or a later re-open) can take over.
                 entry.conn_state.store(.failed, .seq_cst);
                 return;
-            };
-            entry.conn_state.store(.ready, .seq_cst);
-        } else {
-            // Lost the race — another attacher is bringing up the
-            // connection. Poll the atomic until it settles. If the
-            // handle is closed mid-wait, bail without broadcasting.
-            while (true) {
-                if (handle.closed.load(.acquire)) return;
-                const state = entry.conn_state.load(.seq_cst);
-                if (state == .ready) break;
-                if (state == .failed) return;
-                std.Thread.sleep(1_000_000); // 1ms
             }
+
+            // Another attacher owns setup. Wait for it to settle. `.ready`
+            // → reuse it; `.failed` → loop and attempt the take-over
+            // cmpxchg above; otherwise keep polling.
+            if (entry.conn_state.load(.seq_cst) == .ready) break;
+            std.Thread.sleep(1_000_000); // 1ms
         }
 
         // Signal the listener registry that this connection is fully
@@ -1408,7 +1452,138 @@ const SetupWorker = struct {
         });
         SshConnectionManager.broadcastConnectionState(entry, .connected);
     }
+
+    /// Drive the initial connect, retrying transient failures with
+    /// backoff until success, a terminal failure, a cancel, or the
+    /// handle being closed. Returns true once `attachRemoteSurface`
+    /// succeeds (the per-Entry SSH I/O thread is now running and owns the
+    /// connection); false otherwise, with the appropriate terminal state
+    /// already broadcast.
+    ///
+    /// This is what makes the *initial* connect "relentless" the same way
+    /// a post-establishment drop is. The steady-state reconnect loop
+    /// lives in `SshConnectionManager.sshThreadMain`, which only exists
+    /// after the first successful attach — so without this loop a
+    /// transient failure at app-launch restore (network/VPN not up yet)
+    /// would broadcast `.failed` once and then sit forever, since
+    /// `requestReconnect` is a no-op until that I/O thread (and its
+    /// reconnect pipe) exists.
+    fn driveConnectWithRetry(self: *SetupWorker) bool {
+        const handle = self.handle;
+        const entry = self.entry;
+        const max = entry.max_reconnect_attempts;
+        var attempt: u32 = 0;
+        while (true) {
+            if (handle.closed.load(.acquire)) return false;
+            attempt += 1;
+
+            // Reset any partially-initialised connection state from a
+            // prior failed attempt (or from reviving a parked `.failed`
+            // entry) so `connectWithAuth` re-runs the handshake instead of
+            // early-returning on a stale `ctx.session`. Idempotent on a
+            // fresh entry: session/channel are already null. Mirrors the
+            // reset `attemptReconnect` performs before each retry.
+            if (entry.channel) |*ch| {
+                ch.close();
+                entry.channel = null;
+            }
+            entry.ctx.deinit();
+            entry.ctx.session = null;
+            entry.ctx.jump_session = null;
+            entry.ctx.jump_hop_index = 0;
+
+            if (session_client.attachRemoteSurface(
+                handle.alloc,
+                self.manager,
+                entry,
+                null,
+                self.cfg,
+            )) |_| {
+                return true;
+            } else |err| {
+                if (handle.closed.load(.acquire)) return false;
+                // `attachRemoteSurface` already broadcast `.failed = reason`.
+                if (isTerminalConnectError(err)) {
+                    // Permanent: retrying with the same credentials can
+                    // only fail the same way. Leave the broadcast
+                    // `.failed = .auth_failed` in place so the embedder
+                    // (cmux) surfaces an actionable error instead of an
+                    // endless "Reconnecting…".
+                    log.warn("ssh_capi: initial connect terminal failure: {}", .{err});
+                    return false;
+                }
+                // Transient (network/handshake timeout, helper hiccup,
+                // unknown). Honor a finite attempt budget; cmux passes
+                // u32.max, making this loop effectively infinite.
+                if (max != std.math.maxInt(u32) and attempt >= max) {
+                    log.warn("ssh_capi: initial connect exhausted after {d} attempts", .{attempt});
+                    SshConnectionManager.broadcastConnectionState(entry, .{ .disconnected = .{
+                        .attempts_made = attempt,
+                        .reason = .exhausted,
+                    } });
+                    return false;
+                }
+                const delay_ms = SshConnectionManager.computeBackoff(entry, attempt - 1);
+                SshConnectionManager.broadcastConnectionState(entry, .{ .reconnecting = .{
+                    .attempt = attempt,
+                    .max_attempts = max,
+                    .elapsed_ns = 0,
+                    .next_retry_ns = 0,
+                } });
+                log.info("ssh_capi: initial connect attempt {d} failed ({}); retrying in {d}ms", .{
+                    attempt, err, delay_ms,
+                });
+                if (!self.sleepBeforeRetry(delay_ms)) return false;
+            }
+        }
+    }
+
+    /// Interruptible backoff between initial-connect attempts. Unlike the
+    /// steady-state `interruptibleSleep`, this can't wait on the Entry's
+    /// `reconnect_pipe` — that pipe is only created once
+    /// `attachRemoteSurface` succeeds. Instead it polls the close flag and
+    /// the same atomics that `requestReconnect`/`cancelReconnect` set, so
+    /// "Retry Now" and "Cancel" still work during the initial connect.
+    /// Returns false to abort the loop (closed or cancelled), true to
+    /// proceed with the next attempt.
+    fn sleepBeforeRetry(self: *SetupWorker, delay_ms: u64) bool {
+        const handle = self.handle;
+        const entry = self.entry;
+        const step_ms: u64 = 50;
+        var slept: u64 = 0;
+        while (slept < delay_ms) {
+            if (handle.closed.load(.acquire)) return false;
+            if (entry.cancel_reconnect.load(.acquire)) {
+                entry.cancel_reconnect.store(false, .release);
+                SshConnectionManager.broadcastConnectionState(entry, .{ .disconnected = .{
+                    .attempts_made = 0,
+                    .reason = .cancelled,
+                } });
+                return false;
+            }
+            if (entry.reconnect_requested.load(.acquire)) {
+                entry.reconnect_requested.store(false, .release);
+                return true; // "Retry Now" — skip the rest of the backoff
+            }
+            std.Thread.sleep(step_ms * std.time.ns_per_ms);
+            slept += step_ms;
+        }
+        return true;
+    }
 };
+
+/// Classify an `attachRemoteSurface` error as permanent (no point
+/// retrying) vs transient. Auth rejection and an explicit auth cancel are
+/// permanent — the same credentials will only fail the same way, so the
+/// embedder should surface an error rather than reconnect forever.
+/// Everything else (TCP/handshake timeout, helper provisioning hiccup,
+/// unknown) is treated as transient and retried.
+fn isTerminalConnectError(err: anyerror) bool {
+    return switch (err) {
+        error.SshAuthFailed, error.RemoteAuthRequired => true,
+        else => false,
+    };
+}
 
 fn spawnSetupWorker(
     handle: *SshHandle,
@@ -2777,6 +2952,21 @@ test "translateState — failed payload carries reason" {
     const s = translateState(.{ .failed = .auth_failed });
     try testing.expectEqual(StateKind.failed, s.kind);
     try testing.expectEqual(FailReason.auth_failed, s.payload.fail.reason);
+}
+
+test "isTerminalConnectError — auth failures are permanent, everything else retries" {
+    // The whole point of the initial-connect retry loop is that it keeps
+    // trying transient failures (the host may just be unreachable for a
+    // moment at app-launch restore) but stops on a permanent one (the same
+    // credentials can only fail the same way). This contract is what lets
+    // cmux fold transient failures into "Reconnecting…" while surfacing
+    // auth failures as an actionable terminal error.
+    try testing.expect(isTerminalConnectError(error.SshAuthFailed));
+    try testing.expect(isTerminalConnectError(error.RemoteAuthRequired));
+    try testing.expect(!isTerminalConnectError(error.SshConnectFailed));
+    try testing.expect(!isTerminalConnectError(error.SshHandshakeFailed));
+    try testing.expect(!isTerminalConnectError(error.OutOfMemory));
+    try testing.expect(!isTerminalConnectError(error.ConnectionResetByPeer));
 }
 
 test "translateState — disconnected payload carries reason + attempts" {

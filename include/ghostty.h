@@ -437,6 +437,12 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+// Forward declaration for the per-surface `on_remote_state` callback in
+// `ghostty_surface_config_s` below. The full definition (the tagged
+// union mirroring `session.protocol.ConnectionState`) appears later in
+// the SSH connection + channel API block.
+typedef struct ghostty_ssh_state_s ghostty_ssh_state_t;
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -486,6 +492,20 @@ typedef struct {
   void (*on_remote_opened)(void* userdata,
                            const uint8_t* group_id,
                            const uint8_t* surface_id);
+  // Fired whenever THIS surface's `Remote` termio backend transitions
+  // connection state on its own pooled SSH `Entry` (the same connection
+  // the terminal data plane rides). This is the per-surface transport
+  // health, distinct from the whole-connection `ghostty_ssh_open`
+  // `on_state` callback — a degraded browser-proxy channel cannot move
+  // it. `state` mirrors the `ghostty_ssh_open` `on_state` payload
+  // (`ghostty_ssh_state_t`) and is valid only for the duration of the
+  // callback — copy if you need to retain. `userdata` is the same
+  // opaque pointer set in this surface config. Fires zero or more times
+  // over the surface lifetime (CONNECTING on open, CONNECTED on attach,
+  // RECONNECTING/FAILED on transport churn). Ignored when `ssh_target`
+  // is null. May be NULL.
+  void (*on_remote_state)(void* userdata,
+                          const ghostty_ssh_state_t* state);
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1261,7 +1281,7 @@ typedef struct {
 // Tagged union surfaced via on_state. Read `kind` first and ONLY
 // access the `payload` variant field matching that kind — other
 // variant fields are uninitialized.
-typedef struct {
+struct ghostty_ssh_state_s {
   ghostty_ssh_state_kind_e kind;
   union {
     ghostty_ssh_state_password_t password;
@@ -1272,7 +1292,9 @@ typedef struct {
     // CONNECTING / DOWNLOADING / SETUP / CONNECTED / STALE carry no
     // additional payload.
   } payload;
-} ghostty_ssh_state_t;
+};
+// `ghostty_ssh_state_t` is typedef'd above (forward-declared near
+// `ghostty_surface_config_s`).
 
 // Host-key verification callback payload. The embedder MUST call
 // ghostty_ssh_submit_host_key_decision(ssh, decision_token, accept,
@@ -1318,8 +1340,9 @@ typedef struct {
   // ghostty_ssh_request_reconnect). Default 5 when set to UINT32_MAX.
   uint32_t max_reconnect_attempts;
 
-  // Initial backoff interval; doubles per failed attempt up to a
-  // 60s cap. 0 uses the libghostty default (1000 ms).
+  // Initial backoff interval; grows per failed attempt (capped by
+  // reconnect_max_interval_ms). 0 uses the libghostty default
+  // (1000 ms).
   uint32_t reconnect_interval_ms;
 
   // How strictly host keys are checked. See enum docs.
@@ -1328,6 +1351,13 @@ typedef struct {
   // Soft cap on per-surface scrollback retention requested from the
   // daemon (bytes). 0 = daemon default.
   uint32_t scrollback_limit_bytes;
+
+  // Upper bound on a single reconnect backoff sleep, in milliseconds.
+  // Combine with `max_reconnect_attempts = UINT32_MAX` for "patient
+  // but persistent" reconnect: ghostty keeps retrying indefinitely
+  // without ever sleeping longer than this between attempts. 0 uses
+  // the legacy 30 000 ms default.
+  uint32_t reconnect_max_interval_ms;
 } ghostty_ssh_config_t;
 
 // Callbacks set at ghostty_ssh_open time. All fire on libghostty-owned
