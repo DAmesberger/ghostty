@@ -625,6 +625,16 @@ const ClientThread = struct {
                     log.warn("mux dispatch error: {}", .{err});
                     return;
                 },
+                // Keepalive: answer the client's session-level ping with a
+                // pong. Without this the mux path drops `.ping` into the
+                // `else` branch below, the client never sees a pong, and its
+                // stale-detection (no pong for keepalive_stale_ns = 12s)
+                // forces a needless reconnect every interval on an idle mux
+                // connection — which manifests as the workspace flashing a
+                // "Reconnecting" overlay every ~12s. The legacy `multiplex`
+                // loop already answers pings; the mux path was missing it.
+                .ping => sendFrameFd(self.fd, .pong, 0, "") catch {},
+                .pong => {},
                 // Legacy session-lifecycle kinds are not supported on
                 // mux-mode connections in this phase. Reject so the
                 // client knows to use a separate connection (or wait
