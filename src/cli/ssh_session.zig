@@ -154,7 +154,7 @@ fn runRemote(alloc: Allocator, opts: Options) !u8 {
     };
     defer ctx.deinit();
 
-    const provision = try session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null);
+    const provision = try session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null);
     const remote_bin_path = provision.path;
     defer alloc.free(remote_bin_path);
     try session.client.ensureRemoteDaemon(alloc, &ctx, remote_bin_path, provision.provisioned);

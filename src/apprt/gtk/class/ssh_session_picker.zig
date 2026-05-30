@@ -837,7 +837,7 @@ fn renameSessionThread(rnd: anytype) void {
     };
     defer ctx.deinit();
 
-    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch return;
+    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch return;
     defer alloc.free(provision.path);
     session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
 
@@ -877,7 +877,7 @@ fn detachOthersThread(dd: anytype) void {
     };
     defer ctx.deinit();
 
-    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch return;
+    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch return;
     defer alloc.free(provision.path);
     session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
 
@@ -931,7 +931,7 @@ fn killSessionThread(kd: anytype) void {
     };
     defer ctx.deinit();
 
-    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch return;
+    const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch return;
     defer alloc.free(provision.path);
     session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
 
@@ -1189,7 +1189,7 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
 
         log.info("session query: SSH connected, checking remote Ghostty...", .{});
 
-        const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null) catch |err| {
+        const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch |err| {
             log.warn("session query: ensureRemoteGhostty failed: {}", .{err});
             return error.NoActiveConnection;
         };
