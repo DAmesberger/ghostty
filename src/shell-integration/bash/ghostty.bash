@@ -189,6 +189,19 @@ fi
 _ghostty_executing=""
 _ghostty_last_reported_cwd=""
 
+# Non-printing prompt delimiters. Bash only strips the \[ \] markers from the
+# prompt when the readline line editor is active; a bash built without readline
+# (e.g. some Nix bash-5.3 builds) prints them literally, so the OSC payload is
+# consumed by the terminal but the delimiters leak as visible "\[ \]". Detect
+# readline once and drop the delimiters when it is unavailable.
+if (builtin set -o 2>/dev/null | builtin command grep -qE '^(emacs|vi)\b'); then
+  _ghostty_pl='\['
+  _ghostty_pr='\]'
+else
+  _ghostty_pl=''
+  _ghostty_pr=''
+fi
+
 function __ghostty_precmd() {
   local ret="$?"
   if test "$_ghostty_executing" != "0"; then
@@ -198,8 +211,8 @@ function __ghostty_precmd() {
     # Use 133;P (not 133;A) inside PS1 to avoid fresh-line behavior on
     # readline redraws (e.g., vi mode switches, Ctrl-L). The initial
     # 133;A with fresh-line is emitted once via printf below.
-    PS1='\[\e]133;P;k=i\a\]'$PS1'\[\e]133;B\a\]'
-    PS2='\[\e]133;P;k=s\a\]'$PS2'\[\e]133;B\a\]'
+    PS1="${_ghostty_pl}"'\e]133;P;k=i\a'"${_ghostty_pr}"$PS1"${_ghostty_pl}"'\e]133;B\a'"${_ghostty_pr}"
+    PS2="${_ghostty_pl}"'\e]133;P;k=s\a'"${_ghostty_pr}"$PS2"${_ghostty_pl}"'\e]133;B\a'"${_ghostty_pr}"
 
     # Bash doesn't redraw the leading lines in a multiline prompt so we mark
     # the start of each line (after each newline) as a secondary prompt. This
@@ -210,7 +223,7 @@ function __ghostty_precmd() {
     # because literal newlines may appear inside $(...) command substitutions
     # where inserting escape sequences would break shell syntax.
     if [[ "$PS1" == *"\n"* ]]; then
-      PS1="${PS1//\\n/\\n$'\\[\\e]133;P;k=s\\a\\]'}"
+      PS1="${PS1//\\n/\\n${_ghostty_pl}$'\\e]133;P;k=s\\a'${_ghostty_pr}}"
     fi
 
     # Cursor
@@ -218,13 +231,13 @@ function __ghostty_precmd() {
       builtin local cursor=5  # blinking bar
       [[ "$GHOSTTY_SHELL_FEATURES" == *"cursor:steady"* ]] && cursor=6  # steady bar
 
-      [[ "$PS1" != *"\[\e[${cursor} q\]"* ]] && PS1=$PS1"\[\e[${cursor} q\]"
-      [[ "$PS0" != *'\[\e[0 q\]'* ]] && PS0=$PS0'\[\e[0 q\]' # reset
+      [[ "$PS1" != *"${_ghostty_pl}\e[${cursor} q${_ghostty_pr}"* ]] && PS1=$PS1"${_ghostty_pl}\e[${cursor} q${_ghostty_pr}"
+      [[ "$PS0" != *"${_ghostty_pl}"'\e[0 q'"${_ghostty_pr}"* ]] && PS0=$PS0"${_ghostty_pl}"'\e[0 q'"${_ghostty_pr}" # reset
     fi
 
     # Title (working directory)
     if [[ "$GHOSTTY_SHELL_FEATURES" == *"title"* ]]; then
-      PS1=$PS1'\[\e]2;\w\a\]'
+      PS1=$PS1"${_ghostty_pl}"'\e]2;\w\a'"${_ghostty_pr}"
     fi
   fi
 
