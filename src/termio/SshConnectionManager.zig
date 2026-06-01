@@ -1003,8 +1003,13 @@ fn attemptReconnect(entry: *Entry) bool {
         const connect_ok = if (entry.ctx.connect(stderr)) |_| true else |_| false;
 
         if (connect_ok) {
-            // Try to open multiplexed channel (with daemon restart fallback)
-            if (tryOpenChannel(entry)) |new_channel| {
+            // Reopen the TERMINAL channel in `--stdio-attach` mode (the mode
+            // the initial connect used), NOT the `--mux-attach` proxy opener
+            // `tryOpenChannel` — see `tryReopenTerminalChannel`. Using the mux
+            // opener here reopened the terminal channel in a mode that EOFs in
+            // ~77ms, causing an infinite reconnect flicker once terminal+proxy
+            // shared one Entry.
+            if (tryReopenTerminalChannel(entry)) |new_channel| {
                 // Switch to non-blocking
                 var sess = &entry.ctx.session.?;
                 sess.setBlocking(0);
@@ -1153,6 +1158,48 @@ pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false) catch return null;
 
     return session.client.openClientMuxChannel(alloc, &entry.ctx, remote_bin_path) catch null;
+}
+
+/// Reopen the Entry's TERMINAL transport channel after a drop, using the
+/// SAME `--stdio-attach` mode the initial connect used (`openMultiplexChannel`
+/// → the daemon `multiplex` terminal-frame loop), NOT the `--mux-attach`
+/// proxy/control opener `tryOpenChannel` (`openClientMuxChannel` → runMuxMode).
+///
+/// `attemptReconnect` previously reopened `entry.channel` via `tryOpenChannel`.
+/// Once the SSH pool unified the terminal transport and the C-API proxy onto
+/// ONE shared Entry / one `entry.channel`, that silently reopened the terminal
+/// channel in mux mode after the first drop. A mux-mode channel is not a
+/// long-lived terminal session: it EOFs within ~77ms, `sshThreadMain` sees
+/// `channel.eof()` and reconnects, reopens-in-mux-mode, EOFs again — an
+/// infinite ~340ms connect↔reconnect flicker (every reconnect succeeds, so it
+/// never escalates past attempt 1). Reopening in `--stdio-attach` keeps the
+/// terminal channel a real terminal session so it stays up. The proxy/control
+/// mux channel is reopened separately by `onStateListener` via `tryOpenChannel`.
+pub fn tryReopenTerminalChannel(entry: *Entry) ?ssh.Channel {
+    const alloc = entry.alloc;
+
+    entry.surfaces_mutex.lock();
+    const remote_bin_path = alloc.dupe(u8, entry.remote_bin_path) catch {
+        entry.surfaces_mutex.unlock();
+        return null;
+    };
+    entry.surfaces_mutex.unlock();
+    defer alloc.free(remote_bin_path);
+
+    // Serialise libssh2 calls with the SSH thread on the same session
+    // (see the note in `tryOpenChannel`).
+    entry.libssh2_mutex.lock();
+    defer entry.libssh2_mutex.unlock();
+
+    // First attempt: the terminal-frame `--stdio-attach` channel.
+    if (session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path)) |ch| {
+        return ch;
+    } else |_| {}
+
+    // Daemon might be dead — try starting without killing the existing one.
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false) catch return null;
+
+    return session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path) catch null;
 }
 
 /// Register a C-API terminal surface on the given Entry. The
