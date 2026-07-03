@@ -26,7 +26,6 @@ pub const HeadlessHandler = struct {
     enquiry_response: []const u8 = "",
     default_cursor_style: terminal.CursorStyle = .block,
     default_cursor_blink: ?bool = null,
-    default_cursor: bool = true,
 
     // DCS/APC state
     apc: terminal.apc.Handler = .{},
@@ -243,13 +242,6 @@ pub const HeadlessHandler = struct {
         };
     }
 
-    fn writePtyBuf(self: *HeadlessHandler, data: []const u8, len: usize) void {
-        if (len == 0) return;
-        _ = posix.write(self.pty_fd, data[0..len]) catch |err| {
-            log.warn("pty write failed: {}", .{err});
-        };
-    }
-
     inline fn horizontalTab(self: *HeadlessHandler, count: u16) void {
         for (0..count) |_| {
             const x = self.terminal.screens.active.cursor.x;
@@ -267,10 +259,8 @@ pub const HeadlessHandler = struct {
     }
 
     fn setCursorStyle(self: *HeadlessHandler, style: terminal.CursorStyleReq) !void {
-        self.default_cursor = false;
         switch (style) {
             .default => {
-                self.default_cursor = true;
                 self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
                 self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink orelse true);
             },

@@ -14,7 +14,6 @@ pub const services = struct {
 /// injection and the remote forwarder. See `control_bridge_config.zig`.
 pub const control_bridge_config = @import("session/control_bridge_config.zig");
 pub const layout = @import("session/layout.zig");
-pub const registry = @import("session/registry.zig");
 pub const client = @import("session/client.zig");
 pub const daemon = @import("session/daemon.zig");
 pub const ssh = @import("session/ssh.zig");

@@ -25,19 +25,6 @@ const log = std.log.scoped(.session_ssh);
 /// (-11 on Linux, -35 on macOS)
 const posix_EAGAIN: isize = -@as(isize, @intFromEnum(std.posix.E.AGAIN));
 
-pub const Error = error{
-    SshInitFailed,
-    SshHandshakeFailed,
-    SshAuthFailed,
-    SshChannelOpenFailed,
-    SshChannelExecFailed,
-    SshScpSendFailed,
-    SshConnectFailed,
-    SshDisconnected,
-    SshAgentFailed,
-    SshHostKeyMismatch,
-};
-
 pub const ExecResult = struct {
     stdout: []u8,
     stderr: []u8,
@@ -458,13 +445,6 @@ pub const SshSession = struct {
         }
     }
 
-    /// Get the underlying socket fd. For tunneled sessions this returns
-    /// the dummy fd (used by libssh2 for setsockopt/fcntl). Use
-    /// `getPollSocket()` for the fd you should actually poll on.
-    pub fn getSocket(self: *const SshSession) posix.fd_t {
-        return self.sock;
-    }
-
     /// Get the socket fd suitable for polling. For tunneled sessions
     /// this returns the jump host's real TCP socket; for direct
     /// sessions it returns `self.sock`.
@@ -590,26 +570,6 @@ pub const Channel = struct {
         }
     }
 
-    /// Request a PTY on this channel.
-    pub fn requestPty(self: *Channel, term: []const u8, width: u32, height: u32) !void {
-        const term_z = try self.alloc.dupeZ(u8, term);
-        defer self.alloc.free(term_z);
-
-        if (ssh2.libssh2_channel_request_pty_ex(
-            self.inner,
-            term_z.ptr,
-            @intCast(term.len),
-            null,
-            0,
-            @intCast(width),
-            @intCast(height),
-            0,
-            0,
-        ) != 0) {
-            return error.SshChannelExecFailed;
-        }
-    }
-
     /// Read from stdout (blocking).
     pub fn read(self: *Channel, buf: []u8) !usize {
         const rc = channelRead(self.inner, buf.ptr, buf.len);
@@ -622,19 +582,6 @@ pub const Channel = struct {
     /// the session is in non-blocking mode.
     pub fn readNonBlock(self: *Channel, buf: []u8) isize {
         return channelRead(self.inner, buf.ptr, buf.len);
-    }
-
-    /// Read from stderr.
-    pub fn readStderr(self: *Channel, buf: []u8) !usize {
-        const rc = channelReadStderr(self.inner, buf.ptr, buf.len);
-        if (rc < 0) return error.SshDisconnected;
-        return @intCast(rc);
-    }
-
-    /// Non-blocking read from stderr. Returns bytes read, 0 if no data
-    /// available (EAGAIN), or negative on error.
-    pub fn readStderrNonBlock(self: *Channel, buf: []u8) isize {
-        return channelReadStderr(self.inner, buf.ptr, buf.len);
     }
 
     /// Write data to the channel. Handles EAGAIN by retrying.

@@ -6,25 +6,6 @@
 //! (page diffs) rather than its *input* (raw VT), so the client applies
 //! binary diffs directly to its Terminal's page memory, skipping VT
 //! parsing entirely.
-//!
-//! Format (data_out payload):
-//!   [1]  diff_type: 0=incremental (dirty rows), 1=full_snapshot (all rows)
-//!   [2]  seq: u16 LE sequence number (wrapping)
-//!   [2]  cursor_row, [2] cursor_col
-//!   [1]  cursor_style (block/underline/bar + blink bit)
-//!   [1]  cursor_visible
-//!   [1]  mode_flags (bit 0: alt_screen, bit 1: origin_mode, bit 2: auto_wrap)
-//!   [1]  dirty_row_count
-//!   per dirty row:
-//!     [2]  row_index
-//!     [1]  row_flags (bit 0: wrap, bit 1: wrap_continuation, bit 2..3: semantic_prompt)
-//!     [2]  cell_count (non-trailing-empty cells)
-//!     [cell_count * 8]  raw Cell data (packed u64, serialized as-is)
-//!   Style table (appended after row data):
-//!     [2]  style_count
-//!     per style:
-//!       [2]  server_style_id
-//!       [N]  serialized Style struct
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -33,50 +14,6 @@ const Terminal = terminal.Terminal;
 const Screen = terminal.Screen;
 const page = terminal.page;
 const style = @import("../terminal/style.zig");
-
-/// Diff type byte at the start of data_out payload.
-pub const DiffType = enum(u8) {
-    incremental = 0,
-    full_snapshot = 1,
-};
-
-/// Header size for the diff payload (before per-row data).
-pub const header_size = 1 + 2 + 2 + 2 + 1 + 1 + 1 + 1;
-
-/// Per-row overhead: row_index(2) + row_flags(1) + cell_count(2) = 5 bytes.
-pub const row_overhead = 5;
-
-/// Cursor style encoding: low 2 bits = style, bit 2 = blink.
-pub fn encodeCursorStyle(cursor_style: terminal.CursorStyle, blink: bool) u8 {
-    const base: u8 = switch (cursor_style) {
-        .block => 0,
-        .underline => 1,
-        .bar => 2,
-        .block_hollow => 3,
-    };
-    return base | (if (blink) @as(u8, 0x04) else 0);
-}
-
-pub fn decodeCursorStyle(byte: u8) struct { style: terminal.CursorStyle, blink: bool } {
-    return .{
-        .style = switch (@as(u2, @intCast(byte & 0x03))) {
-            0 => .block,
-            1 => .underline,
-            2 => .bar,
-            3 => .block_hollow,
-        },
-        .blink = (byte & 0x04) != 0,
-    };
-}
-
-/// Encode mode flags byte.
-pub fn encodeModeFlags(t: *const Terminal) u8 {
-    var flags: u8 = 0;
-    if (t.modes.get(.alt_screen) or t.modes.get(.alt_screen_save_cursor_clear_enter)) flags |= 0x01;
-    if (t.modes.get(.origin)) flags |= 0x02;
-    if (t.modes.get(.wraparound)) flags |= 0x04;
-    return flags;
-}
 
 /// Encode row flags byte.
 fn encodeRowFlags(row: page.Row) u8 {
@@ -99,155 +36,6 @@ fn countContentCells(cells: []const page.Cell) u16 {
         }
     }
     return last;
-}
-
-/// Serialize dirty rows from the terminal's active screen into a binary
-/// page diff. Returns an owned slice (caller must free). Returns null
-/// if no rows are dirty.
-///
-/// After calling this, the caller should clear dirty flags via
-/// `clearDirtyFlags`.
-pub fn serializeDirtyRows(alloc: Allocator, t: *Terminal) !?[]u8 {
-    return serializeRows(alloc, t, .incremental);
-}
-
-/// Serialize ALL rows from the terminal's active screen (for reconnect
-/// state restore). Returns an owned slice.
-pub fn serializeFullSnapshot(alloc: Allocator, t: *Terminal) ![]u8 {
-    return (try serializeRows(alloc, t, .full_snapshot)).?;
-}
-
-fn serializeRows(alloc: Allocator, t: *Terminal, diff_type: DiffType) !?[]u8 {
-    const s: *Screen = t.screens.active;
-
-    // First pass: count dirty rows and estimate size
-    var dirty_count: u16 = 0;
-    var estimated_size: usize = header_size;
-
-    var row_it = s.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-    var row_idx: u16 = 0;
-    while (row_it.next()) |row_pin| : (row_idx += 1) {
-        const p: *page.Page = &row_pin.node.data;
-        const rac = row_pin.rowAndCell();
-        const row = rac.row;
-
-        if (diff_type == .full_snapshot or row.dirty) {
-            const cells = p.getCells(row);
-            const cell_count = countContentCells(cells);
-            estimated_size += row_overhead + @as(usize, cell_count) * 8;
-            dirty_count += 1;
-        }
-    }
-
-    if (dirty_count == 0 and diff_type == .incremental) return null;
-
-    // Style table: we'll collect styles after serializing rows
-    // Add generous estimate for style table
-    estimated_size += 2 + 256 * 20; // style_count + up to 256 styles
-
-    var buf = try alloc.alloc(u8, estimated_size);
-    errdefer alloc.free(buf);
-    var offset: usize = 0;
-
-    // Write header
-    buf[offset] = @intFromEnum(diff_type);
-    offset += 1;
-    // seq placeholder (caller can set)
-    std.mem.writeInt(u16, buf[offset..][0..2], 0, .little);
-    offset += 2;
-    // Cursor position
-    std.mem.writeInt(u16, buf[offset..][0..2], s.cursor.y, .little);
-    offset += 2;
-    std.mem.writeInt(u16, buf[offset..][0..2], s.cursor.x, .little);
-    offset += 2;
-    // Cursor style + blink
-    buf[offset] = encodeCursorStyle(s.cursor.cursor_style, t.modes.get(.cursor_blinking));
-    offset += 1;
-    // Cursor visible
-    buf[offset] = if (t.modes.get(.cursor_visible)) 1 else 0;
-    offset += 1;
-    // Mode flags
-    buf[offset] = encodeModeFlags(t);
-    offset += 1;
-    // Dirty row count
-    buf[offset] = @intCast(@min(dirty_count, 255));
-    offset += 1;
-
-    // Track referenced styles for the style table
-    var style_ids_seen = std.AutoArrayHashMap(style.Id, void).init(alloc);
-    defer style_ids_seen.deinit();
-
-    // Second pass: serialize rows
-    var row_it2 = s.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-    var row_idx2: u16 = 0;
-    while (row_it2.next()) |row_pin| : (row_idx2 += 1) {
-        const p: *page.Page = &row_pin.node.data;
-        const rac = row_pin.rowAndCell();
-        const row = rac.row;
-
-        if (diff_type != .full_snapshot and !row.dirty) continue;
-
-        const cells = p.getCells(row);
-        const cell_count = countContentCells(cells);
-
-        // Row header
-        std.mem.writeInt(u16, buf[offset..][0..2], row_idx2, .little);
-        offset += 2;
-        buf[offset] = encodeRowFlags(row.*);
-        offset += 1;
-        std.mem.writeInt(u16, buf[offset..][0..2], cell_count, .little);
-        offset += 2;
-
-        // Raw cell data (8 bytes per cell, packed u64)
-        for (cells[0..cell_count]) |cell| {
-            const cell_bits: u64 = @bitCast(cell);
-            std.mem.writeInt(u64, buf[offset..][0..8], cell_bits, .little);
-            offset += 8;
-
-            // Track style IDs for the style table
-            if (cell.style_id != 0) {
-                style_ids_seen.put(cell.style_id, {}) catch {};
-            }
-        }
-    }
-
-    // Write style table
-    const style_count: u16 = @intCast(style_ids_seen.count());
-    std.mem.writeInt(u16, buf[offset..][0..2], style_count, .little);
-    offset += 2;
-
-    // For each referenced style, serialize it
-    // We need a page reference to look up styles. Use the first page
-    // from the viewport (styles are page-local, so we iterate per-page
-    // during apply on the client side).
-    // For now, serialize style_id → style mapping from whatever page
-    // each cell came from. This is a simplification — a full
-    // implementation would track page-per-style-id during serialization.
-    // TODO: Handle multi-page style lookups properly
-    var row_it3 = s.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-    while (row_it3.next()) |row_pin| {
-        const p: *page.Page = &row_pin.node.data;
-        const rac = row_pin.rowAndCell();
-        const row = rac.row;
-        const cells = p.getCells(row);
-
-        for (cells) |cell| {
-            if (cell.style_id != 0 and style_ids_seen.contains(cell.style_id)) {
-                // Serialize this style
-                const s_ptr = p.styles.get(p.memory, cell.style_id);
-                std.mem.writeInt(u16, buf[offset..][0..2], cell.style_id, .little);
-                offset += 2;
-                // Serialize the Style struct fields
-                offset += serializeStyle(buf[offset..], s_ptr.*);
-                // Remove from set so we don't serialize it again
-                _ = style_ids_seen.orderedRemove(cell.style_id);
-            }
-        }
-        if (style_ids_seen.count() == 0) break;
-    }
-
-    // Trim to actual size
-    return try alloc.realloc(buf, offset);
 }
 
 /// Serialize a Style into the buffer. Returns bytes written.
@@ -286,16 +74,6 @@ fn serializeColor(buf: []u8, color: style.Style.Color) usize {
             buf[3] = rgb.b;
             return 4;
         },
-    }
-}
-
-/// Clear dirty flags on all viewport rows after serialization.
-pub fn clearDirtyFlags(t: *Terminal) void {
-    const s: *Screen = t.screens.active;
-    var row_it = s.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-    while (row_it.next()) |row_pin| {
-        const rac = row_pin.rowAndCell();
-        rac.row.dirty = false;
     }
 }
 
@@ -689,22 +467,5 @@ pub fn applyScrollbackChunk(
 
         // Mark row dirty for renderer
         row.dirty = true;
-    }
-}
-
-test "cursor style encoding roundtrip" {
-    const testing = std.testing;
-    const cases = [_]struct { s: terminal.CursorStyle, b: bool }{
-        .{ .s = .block, .b = false },
-        .{ .s = .block, .b = true },
-        .{ .s = .underline, .b = false },
-        .{ .s = .bar, .b = true },
-        .{ .s = .block_hollow, .b = false },
-    };
-    for (cases) |c| {
-        const encoded = encodeCursorStyle(c.s, c.b);
-        const decoded = decodeCursorStyle(encoded);
-        try testing.expectEqual(c.s, decoded.style);
-        try testing.expectEqual(c.b, decoded.blink);
     }
 }

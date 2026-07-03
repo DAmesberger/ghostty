@@ -1441,11 +1441,6 @@ pub fn writeFrameFlags(
     try writer.writeAll(payload);
 }
 
-pub fn writeResize(writer: anytype, target: u16, resize: Resize) !void {
-    const resize_bytes = resize.bytes();
-    try writeFrame(writer, .resize, target, &resize_bytes);
-}
-
 pub fn readHeader(reader: anytype) !Header {
     var header: [header_size]u8 = undefined;
     try readExact(reader, &header);

@@ -529,17 +529,6 @@ pub fn storeAndSendLayout(entry: *Entry, group_id: Uuid, target: u16, blob: []co
     enqueueWrite(entry, .layout, target, blob);
 }
 
-/// Detach all surfaces on this entry. Marks each as detaching, sends
-/// close(detach) frames, and closes all surface mailboxes.
-pub fn detachAll(entry: *Entry) void {
-    entry.surfaces_mutex.lock();
-    defer entry.surfaces_mutex.unlock();
-    var it = entry.sessions.iterator();
-    while (it.next()) |kv| {
-        detachSessionLocked(entry, kv.value_ptr.*);
-    }
-}
-
 /// Detach all surfaces in a single session. Caller must hold surfaces_mutex.
 fn detachSessionLocked(entry: *Entry, sess: *Session) void {
     for (sess.surfaces.items) |s| {

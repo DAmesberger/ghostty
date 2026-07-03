@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const internal_os = @import("../os/main.zig");
 
@@ -178,25 +177,8 @@ test "secureZeroAndFree zeroes buffer before free" {
     }
 }
 
-pub const ControlCommand = enum {
-    detach,
-    reconnect,
-};
-
 pub fn stateDir(alloc: Allocator) ![]const u8 {
     return try internal_os.xdg.state(alloc, .{ .subdir = state_subdir });
-}
-
-pub fn registryPath(alloc: Allocator) ![]const u8 {
-    const dir = try stateDir(alloc);
-    defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, "registry" });
-}
-
-pub fn sessionDir(alloc: Allocator) ![]const u8 {
-    const dir = try stateDir(alloc);
-    defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, "sessions" });
 }
 
 pub fn socketPath(alloc: Allocator) ![]const u8 {
@@ -229,12 +211,6 @@ pub fn remoteInstallDir(alloc: Allocator, remote_home: []const u8, remote_os: []
     else
         ".local/state/ghostty/bin";
     return try std.fs.path.join(alloc, &.{ remote_home, suffix });
-}
-
-pub fn remoteInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
-    const dir = try remoteInstallDir(alloc, remote_home, remote_os);
-    defer alloc.free(dir);
-    return try std.fs.path.join(alloc, &.{ dir, remote_binary_name });
 }
 
 pub fn remoteDaemonInstallPath(alloc: Allocator, remote_home: []const u8, remote_os: []const u8) ![]const u8 {
@@ -436,22 +412,6 @@ pub fn generateUuid() Uuid {
 /// Format a UUID as a hex string (32 lowercase hex chars, no dashes).
 pub fn formatUuid(uuid: Uuid) [32]u8 {
     return std.fmt.bytesToHex(uuid, .lower);
-}
-
-/// Format a UUID as a standard dashed string (36 chars: 8-4-4-4-12).
-pub fn formatUuidDashed(uuid: Uuid) [36]u8 {
-    const hex = std.fmt.bytesToHex(uuid, .lower);
-    var out: [36]u8 = undefined;
-    @memcpy(out[0..8], hex[0..8]);
-    out[8] = '-';
-    @memcpy(out[9..13], hex[8..12]);
-    out[13] = '-';
-    @memcpy(out[14..18], hex[12..16]);
-    out[18] = '-';
-    @memcpy(out[19..23], hex[16..20]);
-    out[23] = '-';
-    @memcpy(out[24..36], hex[20..32]);
-    return out;
 }
 
 /// Parse a UUID from a 32-char hex string (no dashes).
@@ -668,18 +628,6 @@ pub fn shiftBuffer(buf: *std.ArrayList(u8), amount: usize) void {
         std.mem.copyForwards(u8, buf.items, buf.items[amount..]);
         buf.shrinkRetainingCapacity(buf.items.len - amount);
     }
-}
-
-pub const Platform = struct {
-    os: []const u8,
-    arch: []const u8,
-};
-
-pub fn localPlatform() Platform {
-    return .{
-        .os = @tagName(builtin.os.tag),
-        .arch = @tagName(builtin.cpu.arch),
-    };
 }
 
 test "generate readable name" {
