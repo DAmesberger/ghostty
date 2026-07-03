@@ -310,8 +310,18 @@ const max_style_bytes = 14;
 pub fn deserializeColor(buf: []const u8) struct { color: style.Style.Color, len: usize } {
     if (buf.len == 0) return .{ .color = .none, .len = 0 };
     return switch (buf[0]) {
-        1 => .{ .color = .{ .palette = buf[1] }, .len = 2 },
-        2 => .{ .color = .{ .rgb = .{ .r = buf[1], .g = buf[2], .b = buf[3] } }, .len = 4 },
+        // palette tag needs 1 tag byte + 1 index byte
+        1 => if (buf.len >= 2)
+            .{ .color = .{ .palette = buf[1] }, .len = 2 }
+        else
+            // Truncated: signal malformed chunk with a zero-length sentinel.
+            .{ .color = .none, .len = 0 },
+        // rgb tag needs 1 tag byte + 3 component bytes
+        2 => if (buf.len >= 4)
+            .{ .color = .{ .rgb = .{ .r = buf[1], .g = buf[2], .b = buf[3] } }, .len = 4 }
+        else
+            // Truncated: signal malformed chunk with a zero-length sentinel.
+            .{ .color = .none, .len = 0 },
         else => .{ .color = .none, .len = 1 },
     };
 }

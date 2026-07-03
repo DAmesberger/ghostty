@@ -63,6 +63,12 @@ pub fn compressPayload(alloc: Allocator, data: []const u8, level: u8) ?[]u8 {
 pub fn decompressPayload(alloc: Allocator, data: []const u8) ![]u8 {
     if (data.len < 4) return error.InvalidLz4Data;
     const orig_len = std.mem.readInt(u32, data[0..4], .little);
+    // The 4-byte length prefix is attacker-controllable on the wire and in
+    // persisted state, so validate it BEFORE lz4.decompress allocates a
+    // buffer of that size. A decompressed payload can never legitimately
+    // exceed a single protocol frame (max_payload = 256 KiB); reject anything
+    // larger so a forged prefix can't force a multi-GiB allocation.
+    if (orig_len > protocol.max_payload) return error.Lz4PayloadTooLarge;
     return lz4.decompress(alloc, data[4..], orig_len);
 }
 

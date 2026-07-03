@@ -1100,8 +1100,19 @@ fn attemptReconnect(entry: *Entry) bool {
     entry.reconnect_requested.store(false, .release);
     entry.cancel_reconnect.store(false, .release);
 
-    // Close old channel
+    // Close old channel under the per-Entry libssh2 mutex. The mux
+    // transport's reader/writer threads (SshChannelStreamTransport) may
+    // still be calling libssh2 on the SAME session — they are only torn
+    // down later, when the surfaces are re-opened — so `ch.close()`
+    // (libssh2_channel_close + libssh2_channel_free) must serialise with
+    // them, otherwise the free races inside libssh2's internal lists and
+    // crashes (same class as the close-time SEGV in
+    // SshChannelStreamTransport.close()). Mirrors the close/open-under-
+    // mutex pattern at SshChannelStreamTransport.zig:214-219 and
+    // `tryOpenChannel` below, which lock this same `entry.libssh2_mutex`.
     if (entry.channel) |*ch| {
+        entry.libssh2_mutex.lock();
+        defer entry.libssh2_mutex.unlock();
         ch.close();
         entry.channel = null;
     }

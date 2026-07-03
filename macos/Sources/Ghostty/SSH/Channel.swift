@@ -133,8 +133,20 @@ extension Ghostty {
             // `ghostty_ssh_free` panics in Debug when `h.channels` is
             // non-empty (`ssh_capi.zig:1604-1611`).
             guard let h = handle else { return }
+            // Capture the channel box strongly so it outlives
+            // `ghostty_channel_free` (which unregisters this channel's
+            // callbacks). A worker-thread callback can still be mid-flight
+            // invoking the trampoline on the box until free returns; if the
+            // box were released the moment deinit returns (it is held only by
+            // `self`, otherwise dropped here), that in-flight trampoline would
+            // dereference freed memory. `detach()` above only clears the weak
+            // back-ref; the box object itself must stay alive.
+            let box = userdataBox
             connection.cleanupQueue.async {
                 ghostty_channel_free(h)
+                // Keep the box alive until after the C handle is freed; only
+                // then can no further trampoline fire on it.
+                _ = box
             }
         }
 

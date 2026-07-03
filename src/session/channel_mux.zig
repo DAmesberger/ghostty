@@ -263,6 +263,20 @@ pub const Channel = struct {
     /// Set by `closeChannel` before invoking `on_close` so pump
     /// threads waiting on credit can exit promptly.
     close_signal: std.Thread.ResetEvent = .{},
+    /// Number of dispatch-thread handlers currently holding this
+    /// `*Channel` outside `Mux.mutex` (see `Mux.pinChannel`). A teardown
+    /// path (`requestClose`, `closeChannelById`, `closeChannel`) may claim
+    /// the channel and run its teardown concurrently, but it MUST NOT
+    /// `alloc.destroy` the struct while this is non-zero — it hands the
+    /// free off via `free_deferred` instead. Read/written under
+    /// `Mux.mutex` only. (Client-side channels never use this field.)
+    dispatch_refs: usize = 0,
+    /// Set by the teardown owner (whoever claimed `closing`) when it
+    /// reaches the free step but finds `dispatch_refs > 0`. Whoever then
+    /// drops the last dispatch ref performs the deferred `alloc.destroy`.
+    /// Guarantees the struct is freed exactly once. Read/written under
+    /// `Mux.mutex` only.
+    free_deferred: bool = false,
 
     /// Assert the backend invariant: exactly one of `vtable` /
     /// `client_callbacks` is set. Called right after construction at
@@ -558,18 +572,20 @@ pub const Mux = struct {
             log.warn("malformed channel_opened frame", .{});
             return;
         };
-        self.mutex.lock();
-        const ch = self.channels.get(opened.channel_id) orelse {
-            self.mutex.unlock();
+        // Pin so the `closeChannel` / `credit_signal.set()` paths below
+        // can't race a pump thread freeing the channel.
+        const ch = self.pinChannel(opened.channel_id) orelse {
             log.debug(
-                "channel_opened for unknown channel_id={x} — discarding",
+                "channel_opened for unknown/closing channel_id={x} — discarding",
                 .{opened.channel_id},
             );
             return;
         };
+        defer self.unpinChannel(ch);
+        // `origin` is immutable after construction, so it's safe to read
+        // without the lock.
         if (ch.origin != .local) {
             // We received this open from the peer; we already replied.
-            self.mutex.unlock();
             log.debug(
                 "ignoring channel_opened for peer-opened channel_id={x}",
                 .{opened.channel_id},
@@ -578,7 +594,6 @@ pub const Mux = struct {
         }
         if (opened.status != .ok) {
             // Peer rejected our open. Tear down our half of the channel.
-            self.mutex.unlock();
             log.warn(
                 "peer rejected daemon-originated channel_id={x}: status={}",
                 .{ opened.channel_id, opened.status },
@@ -589,6 +604,7 @@ pub const Mux = struct {
         // Record the negotiated outbound window. The open frame we sent
         // pre-set `out_credit` to our advertised initial window; the
         // peer's reply is authoritative, so override it.
+        self.mutex.lock();
         if (opened.peer_window > 0) {
             ch.out_credit = @as(usize, opened.peer_window) * 4 * 1024;
         }
@@ -746,20 +762,59 @@ pub const Mux = struct {
         return error.ChannelIdsExhausted;
     }
 
+    /// Look up a channel by id and pin it for the calling dispatch-thread
+    /// handler. Returns null (nothing pinned) if the channel is unknown or
+    /// already tearing down (`closing`); the inbound frame is then dropped.
+    ///
+    /// While pinned, the `*Channel` struct is guaranteed to remain
+    /// allocated even if a service pump thread concurrently claims and
+    /// tears the channel down via `requestClose` / `closeChannelById`:
+    /// those paths detect the pin (`dispatch_refs > 0`) and defer the
+    /// final `alloc.destroy` to the matching `unpinChannel`. This closes
+    /// the window where a handler cached a `*Channel` under the lock,
+    /// released it, and then dereferenced a pointer a pump had freed.
+    ///
+    /// The caller MUST pair every non-null return with exactly one
+    /// `unpinChannel` (use `defer`). This only ever *defers* a
+    /// non-blocking `destroy`; it never blocks a teardown thread and adds
+    /// no new lock, so it cannot deadlock. Dispatch-thread only.
+    fn pinChannel(self: *Mux, channel_id: u32) ?*Channel {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ch = self.channels.get(channel_id) orelse return null;
+        if (ch.closing) return null;
+        ch.dispatch_refs += 1;
+        return ch;
+    }
+
+    /// Drop a dispatch-thread pin taken by `pinChannel`. If the channel
+    /// was torn down while pinned (its teardown owner set `free_deferred`)
+    /// and this is the last outstanding pin, perform the deferred free.
+    fn unpinChannel(self: *Mux, ch: *Channel) void {
+        self.mutex.lock();
+        ch.dispatch_refs -= 1;
+        const do_free = ch.free_deferred and ch.dispatch_refs == 0;
+        self.mutex.unlock();
+        if (do_free) self.alloc.destroy(ch);
+    }
+
     fn handleData(self: *Mux, payload: []const u8) !void {
         const data = protocol.ChannelData.parse(payload) catch {
             log.warn("malformed channel_data frame", .{});
             return;
         };
-        self.mutex.lock();
-        const ch = self.channels.get(data.channel_id) orelse {
-            self.mutex.unlock();
-            log.debug("channel_data for unknown channel_id={d} — discarding", .{data.channel_id});
+        // Pin the channel for the whole dispatch so a service pump thread's
+        // requestClose / closeChannelById can't free `ch` (nor its
+        // `service_state`) while we dereference it below.
+        const ch = self.pinChannel(data.channel_id) orelse {
+            log.debug("channel_data for unknown/closing channel_id={d} — discarding", .{data.channel_id});
             return;
         };
+        defer self.unpinChannel(ch);
 
         // Flow-control: peer is sending against the credit we granted.
         // Drop + close if they exceed it.
+        self.mutex.lock();
         if (data.bytes.len > ch.in_credit) {
             log.warn("channel_id={d} window violation: sent {d}, credit {d}", .{
                 ch.id, data.bytes.len, ch.in_credit,
@@ -783,9 +838,11 @@ pub const Mux = struct {
             return;
         };
 
-        // Replenish the credit window eagerly.
+        // Replenish the credit window eagerly. Skip if the channel began
+        // closing while `on_data` ran (it's still pinned/alive, but a
+        // window update for a torn-down channel would be pointless).
         self.mutex.lock();
-        const should_replenish = ch.in_unacked >= ch.initial_window_bytes / 4;
+        const should_replenish = !ch.closing and ch.in_unacked >= ch.initial_window_bytes / 4;
         var credit_to_grant: u32 = 0;
         if (should_replenish) {
             credit_to_grant = @intCast(ch.in_unacked);
@@ -810,11 +867,11 @@ pub const Mux = struct {
             log.warn("malformed channel_window frame", .{});
             return;
         };
+        // Pin so `ch.credit_signal.set()` below can't race a pump thread
+        // freeing the channel.
+        const ch = self.pinChannel(win.channel_id) orelse return;
+        defer self.unpinChannel(ch);
         self.mutex.lock();
-        const ch = self.channels.get(win.channel_id) orelse {
-            self.mutex.unlock();
-            return;
-        };
         // Saturating-add to prevent overflow on misbehaving peers.
         ch.out_credit = std.math.add(usize, ch.out_credit, win.credit_bytes) catch
             std.math.maxInt(usize);
@@ -825,11 +882,11 @@ pub const Mux = struct {
 
     fn handleEof(self: *Mux, payload: []const u8) !void {
         const eof = protocol.ChannelEof.parse(payload) catch return;
+        // Pin so the `on_eof` deref below can't race a pump thread freeing
+        // the channel.
+        const ch = self.pinChannel(eof.channel_id) orelse return;
+        defer self.unpinChannel(ch);
         self.mutex.lock();
-        const ch = self.channels.get(eof.channel_id) orelse {
-            self.mutex.unlock();
-            return;
-        };
         if (ch.remote_eof) {
             self.mutex.unlock();
             return; // duplicate
@@ -860,12 +917,10 @@ pub const Mux = struct {
 
     fn handleControl(self: *Mux, payload: []const u8) !void {
         const ctrl = protocol.ChannelControl.parse(payload) catch return;
-        self.mutex.lock();
-        const ch = self.channels.get(ctrl.channel_id) orelse {
-            self.mutex.unlock();
-            return;
-        };
-        self.mutex.unlock();
+        // Pin so the `on_control` deref (and any `closeChannel` on error)
+        // below can't race a pump thread freeing the channel.
+        const ch = self.pinChannel(ctrl.channel_id) orelse return;
+        defer self.unpinChannel(ch);
         ch.vtable.?.on_control(ch.service_state, ctrl.op, ctrl.op_payload) catch |err| {
             const reason: protocol.ChannelCloseReason = switch (err) {
                 error.PolicyDenied => .policy_denied,
@@ -945,8 +1000,14 @@ pub const Mux = struct {
 
         self.mutex.lock();
         _ = self.channels.remove(id);
+        // If a dispatch-thread handler is currently pinning `ch`, hand the
+        // free off to its `unpinChannel`; otherwise free now. Deciding
+        // this under the lock (where `dispatch_refs` is stable) makes the
+        // handoff race-free — see `pinChannel`.
+        const do_free = ch.dispatch_refs == 0;
+        if (!do_free) ch.free_deferred = true;
         self.mutex.unlock();
-        self.alloc.destroy(ch);
+        if (do_free) self.alloc.destroy(ch);
     }
 
     /// Tear down a channel by id, running the full close path: the
@@ -1085,12 +1146,19 @@ pub const Mux = struct {
         // Remove the channel from the registry. The service must NOT
         // touch ch after this returns.
         _ = self.channels.remove(id);
-        self.mutex.unlock();
-
-        // Wake any other pumps for the same channel (defensive).
+        // Wake any other pumps for the same channel (defensive). Done
+        // under the lock so a concurrent `unpinChannel` can't free `ch`
+        // out from under us between here and the destroy decision below.
+        // (ResetEvent.set() does not take `Mux.mutex`, so this can't
+        // self-deadlock.)
         ch.close_signal.set();
         ch.credit_signal.set();
-        self.alloc.destroy(ch);
+        // If a dispatch-thread handler is currently pinning `ch`, hand the
+        // free off to its `unpinChannel`; otherwise free now.
+        const do_free = ch.dispatch_refs == 0;
+        if (!do_free) ch.free_deferred = true;
+        self.mutex.unlock();
+        if (do_free) self.alloc.destroy(ch);
     }
 
     /// Block until `out_credit` is non-zero for the given channel,

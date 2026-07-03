@@ -905,7 +905,16 @@ pub const SessionGroup = struct {
     mutex: std.Thread.Mutex = .{},
 
     pub fn deinit(self: *SessionGroup) void {
-        for (self.surfaces.values()) |sess| sess.deinit();
+        // Drop the group's reference to each surface rather than deinit()ing it
+        // directly: a detached reader thread may still be running. kill() makes
+        // that reader exit promptly (PTY EOF) and drop its own reference; the
+        // last release frees the surface. If a reader already exited, the
+        // release here frees the surface synchronously. Either way there is no
+        // double-free vs the reader and no use-after-free of a running reader.
+        for (self.surfaces.values()) |sess| {
+            sess.kill();
+            sess.release();
+        }
         self.surfaces.deinit();
         self.detached_surfaces.deinit();
         if (self.layout_blob) |blob| self.alloc.free(blob);
@@ -946,13 +955,21 @@ pub const SessionGroup = struct {
         return true;
     }
 
-    /// Get the first alive surface in the group (for reconnect).
+    /// Get the first alive surface in the group (for reconnect). The returned
+    /// surface has an extra reference held; the caller must `release()` it.
+    /// Holds `group.mutex` across selection + retain so the surface cannot be
+    /// removed and freed between the lookup and the retain.
     pub fn firstAliveSurface(self: *SessionGroup) ?*RemoteSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.surfaces.values()) |sess| {
             sess.mutex.lock();
             const alive = sess.alive;
             sess.mutex.unlock();
-            if (alive) return sess;
+            if (alive) {
+                sess.retain();
+                return sess;
+            }
         }
         return null;
     }
@@ -1127,6 +1144,7 @@ const Daemon = struct {
                 self.sendOpenedResponse(fd, target, group, surface_id, 0, null);
                 sess.attachAndServe(fd, target, open_data) catch {};
                 self.cleanupDetachedSurface(group, sess, surface_id);
+                sess.release(); // drop the caller reference from createSurface
             },
             .session_attach => {
                 // cmux scrollback persistence: if the requested group is not
@@ -1200,6 +1218,7 @@ const Daemon = struct {
                 const sess = if (!session.shared.isZeroUuid(open_data.surface_id)) blk: {
                     group.mutex.lock();
                     const in_mem = group.surfaces.get(open_data.surface_id);
+                    if (in_mem) |s| s.retain(); // caller reference, taken under lock
                     group.mutex.unlock();
                     if (in_mem) |s| break :blk s;
                     // cmux scrollback persistence: surface not in memory — try
@@ -1213,12 +1232,14 @@ const Daemon = struct {
                         if (session.layout.findFirstLeafId(blob)) |first_id| {
                             group.mutex.lock();
                             const candidate = group.surfaces.get(first_id);
+                            if (candidate) |cand| cand.retain(); // caller ref under lock
                             group.mutex.unlock();
                             if (candidate) |cand| {
                                 cand.mutex.lock();
                                 const alive = cand.alive;
                                 cand.mutex.unlock();
-                                if (alive) break :blk candidate;
+                                if (alive) break :blk cand;
+                                cand.release(); // not alive: drop ref, try reload
                             }
                             // cmux scrollback persistence: first leaf not in
                             // memory — reload it from disk to preserve tab order.
@@ -1264,6 +1285,7 @@ const Daemon = struct {
                     };
 
                     self.cleanupDetachedSurface(group, s, attached_sid);
+                    s.release(); // drop the caller reference
                 } else if (created_new) {
                     // New group via create-or-attach: create the first surface.
                     const surface_id = if (!session.shared.isZeroUuid(open_data.surface_id))
@@ -1280,6 +1302,7 @@ const Daemon = struct {
                     };
 
                     self.cleanupDetachedSurface(group, new_sess, surface_id);
+                    new_sess.release(); // drop the caller reference from createSurface
                 } else {
                     // Send diagnostic info back to client
                     group.mutex.lock();
@@ -1326,14 +1349,17 @@ const Daemon = struct {
                 self.sendOpenedResponse(fd, target, group, open_data.surface_id, 0, null);
                 sess.attachAndServe(fd, target, open_data) catch {};
                 self.cleanupDetachedSurface(group, sess, open_data.surface_id);
+                sess.release(); // drop the caller reference from createSurface
             },
             .surface_attach => {
                 group.mutex.lock();
                 const in_mem_sess = group.surfaces.get(open_data.surface_id);
+                if (in_mem_sess) |s| s.retain(); // caller reference, taken under lock
                 group.mutex.unlock();
 
                 // cmux scrollback persistence: reload the surface from disk
                 // (fresh shell + restored scrollback) on an in-memory miss.
+                // Both branches yield a surface with a reference held for us.
                 const sess = in_mem_sess orelse
                     self.reloadSurfaceFromDisk(group, open_data.surface_id, open_data.resize, open_data.max_scrollback);
 
@@ -1346,8 +1372,8 @@ const Daemon = struct {
                     self.sendOpenedResponse(fd, target, group, open_data.surface_id, surf_history, null);
                     s.attachAndServe(fd, target, open_data) catch {};
                     self.cleanupDetachedSurface(group, s, open_data.surface_id);
+                    s.release(); // drop the caller reference
                 } else {
-                    daemonLog("VANISH surface-attach-miss group={s} surface={s} target={d}", .{ &session.shared.formatUuid(open_data.group_id), &session.shared.formatUuid(open_data.surface_id), target }); // TEMP(cmux-vanish-probe)
                     sendFrameFd(fd, .eof, target, "") catch {};
                 }
             },
@@ -1357,7 +1383,6 @@ const Daemon = struct {
 
     /// Unified close handler. Dispatches based on Close.mode.
     fn handleClose(self: *Daemon, close_data: session.protocol.Close) void {
-        daemonLog("VANISH handleClose mode={s} id={s}", .{ @tagName(close_data.mode), &session.shared.formatUuid(close_data.id) }); // TEMP(cmux-vanish-probe)
         switch (close_data.mode) {
             .surface => {
                 self.mutex.lock();
@@ -1373,6 +1398,10 @@ const Daemon = struct {
                         _ = group.detached_surfaces.swapRemove(close_data.id);
                         const gid = group.id;
                         group.mutex.unlock();
+                        // Drop the map's reference now that the surface is
+                        // removed. It is freed once the reader thread and any
+                        // attached viewer release their references too.
+                        sess.release();
                         // cmux scrollback persistence: explicit close removes
                         // the on-disk snapshot so it can't be reloaded later.
                         self.deletePersistedSurface(gid, close_data.id);
@@ -1388,7 +1417,14 @@ const Daemon = struct {
 
                 if (self.groups.get(close_data.id)) |group| {
                     group.mutex.lock();
-                    for (group.surfaces.values()) |sess| sess.kill();
+                    // Kill each surface and drop the map's reference to it; the
+                    // reader/viewer threads free it once they let go. Clearing
+                    // the map afterward is safe — those pointers are no longer
+                    // owned here.
+                    for (group.surfaces.values()) |sess| {
+                        sess.kill();
+                        sess.release();
+                    }
                     group.surfaces.clearRetainingCapacity();
                     // Session close wipes the whole group: drop the on-disk
                     // surface id-set too so maybeRemoveEmptyGroup reaps it.
@@ -1520,15 +1556,26 @@ const Daemon = struct {
     /// it from the group. Removes the group entirely if it becomes empty.
     fn cleanupDetachedSurface(self: *Daemon, group: *SessionGroup, sess: *RemoteSession, surface_id: Uuid) void {
         if (!sess.closed) return;
-        daemonLog("VANISH cleanup-kill surface={s} group={s}", .{ &session.shared.formatUuid(surface_id), &session.shared.formatUuid(group.id) }); // TEMP(cmux-vanish-probe)
         sess.kill();
         self.mutex.lock();
         group.mutex.lock();
         const gid = group.id;
-        _ = group.surfaces.orderedRemove(surface_id);
-        // Keep the id-set disjoint (no-op for a live surface by invariant).
-        _ = group.detached_surfaces.swapRemove(surface_id);
+        // Only drop the map's reference if THIS session is still the one
+        // registered under `surface_id`: a concurrent close may have already
+        // removed (and released) it, and the slot could even hold a different
+        // session. The caller still holds its own reference, so `sess` stays
+        // valid here regardless of whether we remove it.
+        var did_remove = false;
+        if (group.surfaces.get(surface_id)) |cur| {
+            if (cur == sess) {
+                _ = group.surfaces.orderedRemove(surface_id);
+                // Keep the id-set disjoint (no-op for a live surface by invariant).
+                _ = group.detached_surfaces.swapRemove(surface_id);
+                did_remove = true;
+            }
+        }
         group.mutex.unlock();
+        if (did_remove) sess.release(); // drop the map's reference
         // cmux scrollback persistence: a client-closed surface should not be
         // reloadable; drop its on-disk snapshot. maybeRemoveEmptyGroup below
         // additionally drops the whole group dir if it becomes empty.
@@ -1787,25 +1834,37 @@ const Daemon = struct {
         const gop = group.surfaces.getOrPutAssumeCapacity(surface_id);
         if (gop.found_existing) {
             const existing = gop.value_ptr.*;
+            // Hand the winner back to the caller with a reference held (the
+            // caller `release()`s it when done). Retained under group.mutex so
+            // it cannot be removed and freed before the caller uses it.
+            existing.retain();
             group.mutex.unlock();
-            // Lost the race. Tear down our just-built (reader-less) session.
-            // A SUCCESS return ⇒ the errdefers above do NOT fire (no double free).
+            // Lost the race. Tear down our just-built (reader-less, unshared)
+            // session directly. A SUCCESS return ⇒ the errdefers above do NOT
+            // fire (no double free).
             sess.kill();
             sess.deinit();
             return existing;
         }
-        gop.value_ptr.* = sess;
+        gop.value_ptr.* = sess; // the map now holds the surface's initial reference
         // Invariant: a live surface is never also "detached on disk".
         _ = group.detached_surfaces.swapRemove(surface_id);
 
+        // Reader-thread reference: taken BEFORE spawn so the reader can never
+        // observe a freed session; readerMain drops it when it exits.
+        sess.retain();
         sess.reader_thread = std.Thread.spawn(.{}, RemoteSession.readerMain, .{sess}) catch |err| {
             // Essentially OOM-only. Un-register and return the error so the
-            // errdefers above tear `sess` down exactly once (no reader started).
+            // errdefers above tear `sess` down exactly once — the reader never
+            // started, so the extra reference above dies with the freed `sess`.
             _ = group.surfaces.swapRemove(surface_id);
             group.mutex.unlock();
             return err;
         };
         sess.reader_thread.detach();
+        // Caller reference: returned to the caller, which `release()`s it when
+        // it finishes serving and cleaning up.
+        sess.retain();
         group.mutex.unlock();
 
         return sess;
@@ -1870,6 +1929,9 @@ const Daemon = struct {
         const layout_copy: ?[]u8 = if (group.layout_blob) |b| (self.alloc.dupe(u8, b) catch null) else null;
         for (group.surfaces.values()) |s| {
             if (surf_count >= surf_buf.len) break;
+            // Retain under group.mutex so the surface can't be removed and freed
+            // while we snapshot it off the lock below.
+            s.retain();
             surf_buf[surf_count] = s;
             surf_count += 1;
         }
@@ -1885,6 +1947,7 @@ const Daemon = struct {
 
         for (surf_buf[0..surf_count]) |sess| {
             self.checkpointSurface(group_dir, sess);
+            sess.release(); // drop the checkpoint reference
         }
     }
 
@@ -2442,8 +2505,12 @@ const Daemon = struct {
             // Single-threaded boot — should not happen. Treat as a no-op adopt.
             return error.AlreadyAdopted;
         }
-        gop.value_ptr.* = sess;
+        gop.value_ptr.* = sess; // the map holds the surface's initial reference
         _ = group.detached_surfaces.swapRemove(m.surface_id);
+        // Reader-thread reference: taken before spawn (readerMain drops it on
+        // exit). The caller discards the returned pointer, so no extra caller
+        // reference is needed here.
+        sess.retain();
         sess.reader_thread = std.Thread.spawn(.{}, RemoteSession.readerMain, .{sess}) catch |err| {
             _ = group.surfaces.swapRemove(m.surface_id);
             group.mutex.unlock();
@@ -2730,7 +2797,6 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                 => {
                     if (findMuxSession(&sessions, target)) |s| {
                         sendFrameFd(s.daemon_fd, kind, target, payload) catch {
-                            daemonLog("VANISH mux-fwd-fail target={d} kind={s} fd={d}", .{ target, @tagName(kind), s.daemon_fd }); // TEMP(cmux-vanish-probe)
                             session.shared.sendFrameFile(stdout_file, .eof, .{}, target, "") catch {};
                             closeMuxSession(&sessions, alloc, target);
                         };
@@ -2756,14 +2822,12 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                 if (pollfds[pidx].revents & c.POLLIN != 0) {
                     var daemon_buf: [8192]u8 = undefined;
                     const n = posix.read(s.daemon_fd, &daemon_buf) catch {
-                        daemonLog("VANISH mux-daemon-readerr target={d} fd={d}", .{ s.target, s.daemon_fd }); // TEMP(cmux-vanish-probe)
                         session.shared.sendFrameFile(stdout_file, .eof, .{}, s.target, "") catch {};
                         s.deinit(alloc);
                         slot.* = null;
                         continue;
                     };
                     if (n == 0) {
-                        daemonLog("VANISH mux-daemon-eof0 target={d} fd={d}", .{ s.target, s.daemon_fd }); // TEMP(cmux-vanish-probe)
                         session.shared.sendFrameFile(stdout_file, .eof, .{}, s.target, "") catch {};
                         s.deinit(alloc);
                         slot.* = null;
@@ -2775,7 +2839,6 @@ fn multiplex(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
                 if (pollfds[pidx].revents & (c.POLLHUP | c.POLLERR) != 0 and
                     pollfds[pidx].revents & c.POLLIN == 0)
                 {
-                    daemonLog("VANISH mux-daemon-hup target={d} fd={d}", .{ s.target, s.daemon_fd }); // TEMP(cmux-vanish-probe)
                     session.shared.sendFrameFile(stdout_file, .eof, .{}, s.target, "") catch {};
                     s.deinit(alloc);
                     slot.* = null;
@@ -3108,7 +3171,7 @@ fn detachOthersSession(
 fn preExecPty(cmd: *Command) ?u8 {
     const pty = cmd.getData(Pty) orelse return 1;
     pty.childPreExec() catch return 1;
-    // DEFECT 1: close every other inherited fd so the spawned shell can never
+    // Close every other inherited fd so the spawned shell can never
     // leak the daemon's listener socket, other sessions' PTY masters, or
     // accepted client/viewer sockets. Some of those are non-CLOEXEC, and
     // during a reexec handoff the masters+listener are DELIBERATELY
@@ -3122,7 +3185,7 @@ fn preExecPty(cmd: *Command) ?u8 {
 }
 
 /// Close every inherited fd >= 3 in the just-forked, pre-exec child. Used by
-/// `preExecPty` (DEFECT 1). Async-signal-safe: a bounded raw `close()` loop
+/// `preExecPty`. Async-signal-safe: a bounded raw `close()` loop
 /// only — NO allocation and NO `/proc` walk (those can deadlock in a child
 /// forked from a multi-threaded process). Uses `std.c.close` (not
 /// `posix.close`, which asserts `unreachable` on EBADF) so already-closed fds

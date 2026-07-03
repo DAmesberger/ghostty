@@ -33,13 +33,6 @@ const log = std.log.scoped(.remote_session);
 
 pub const Uuid = session.shared.Uuid;
 
-// TEMP(cmux-vanish-probe)
-fn daemonLog(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
-    _ = std.posix.write(2, msg) catch {};
-}
-
 pub const RemoteSession = struct {
     alloc: Allocator,
     id: []u8,
@@ -73,6 +66,16 @@ pub const RemoteSession = struct {
     /// Set to true when the client sends close(surface) (permanent close, not detach).
     closed: bool = false,
     reader_thread: std.Thread = undefined,
+
+    /// Reference count for safe teardown across threads. References are held by:
+    /// the group map (the initial 1, dropped when the surface is removed from
+    /// `group.surfaces`), the reader thread (dropped when `readerMain` returns),
+    /// each in-flight open/attach handler serving a viewer (dropped when it
+    /// finishes), and the checkpoint thread while it snapshots off the group
+    /// lock. `deinit` runs exactly once — on the final `release` — so a
+    /// closed/removed surface is never freed while a thread still touches it,
+    /// and never double-freed against `SessionGroup.deinit`.
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     /// Monotonically-increasing counter bumped under `mutex` in `readerMain`
     /// whenever PTY output is fed into the terminal. The daemon's checkpoint
@@ -181,7 +184,6 @@ pub const RemoteSession = struct {
     /// Force-disconnect a viewer by UUID. Must be called with mutex held.
     /// If viewer_id is zero_uuid, kick all viewers EXCEPT the one on `sender_fd`.
     pub fn kickViewer(self: *RemoteSession, viewer_id: Uuid, sender_fd: posix.fd_t) void {
-        daemonLog("VANISH kick surface={s} viewer={s} sender_fd={d} viewers={d}", .{ &session.shared.formatUuid(self.surface_id), &session.shared.formatUuid(viewer_id), sender_fd, self.viewers.items.len }); // TEMP(cmux-vanish-probe)
         if (session.shared.isZeroUuid(viewer_id)) {
             // Kick all others — iterate backward since we're removing.
             var i: usize = self.viewers.items.len;
@@ -305,6 +307,19 @@ pub const RemoteSession = struct {
         if (self.command.pid) |pid| _ = posix.kill(pid, posix.SIG.TERM) catch {};
     }
 
+    /// Acquire a reference. The caller must already hold a live reference or the
+    /// lock (`group.mutex`) that keeps this surface in `group.surfaces`, so the
+    /// count cannot be racing to zero underneath the increment.
+    pub fn retain(self: *RemoteSession) void {
+        _ = self.refs.fetchAdd(1, .acq_rel);
+    }
+
+    /// Release a reference. The final release `deinit`s the surface. After
+    /// calling this the caller must not touch `self` again.
+    pub fn release(self: *RemoteSession) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.deinit();
+    }
+
     /// Frame interval for output batching (nanoseconds).
     const frame_interval_ns: u64 = 16 * std.time.ns_per_ms;
     /// Soft threshold for flushing early.
@@ -313,9 +328,16 @@ pub const RemoteSession = struct {
     /// Reader thread: reads PTY output, feeds the headless Terminal,
     /// and forwards accumulated bytes to viewers at the frame rate.
     pub fn readerMain(self: *RemoteSession) void {
+        // Capture these now: the final `self.release()` may free `self`, and the
+        // deferred cleanup below runs AFTER it, so it must not dereference
+        // `self`. `alloc` is a value and `reexec` points into the daemon (both
+        // outlive the session), so the deferred uses stay valid post-free.
+        const alloc = self.alloc;
+        const reexec = self.reexec;
+
         var read_buf: [65536]u8 = undefined;
         var accum = std.ArrayList(u8).empty;
-        defer accum.deinit(self.alloc);
+        defer accum.deinit(alloc);
         var last_flush = std.time.nanoTimestamp();
 
         // cmux execve self-handoff (GATED): count this thread as a live,
@@ -323,8 +345,8 @@ pub const RemoteSession = struct {
         // before clearing CLOEXEC + execve. The function-scope defer balances
         // the add on eventual exit; the park branch below sub/adds around the
         // park so the count reflects "currently reading" at all times.
-        if (self.reexec) |rc| _ = rc.active_readers.fetchAdd(1, .acq_rel);
-        defer if (self.reexec) |rc| {
+        if (reexec) |rc| _ = rc.active_readers.fetchAdd(1, .acq_rel);
+        defer if (reexec) |rc| {
             _ = rc.active_readers.fetchSub(1, .acq_rel);
         };
 
@@ -413,12 +435,17 @@ pub const RemoteSession = struct {
 
         self.mutex.lock();
         self.alive = false;
-        daemonLog("VANISH readerMain-eof surface={s} viewers={d} closed={}", .{ &session.shared.formatUuid(self.surface_id), self.viewers.items.len, self.closed }); // TEMP(cmux-vanish-probe)
         for (self.viewers.items) |viewer| {
             sendFrameFd(viewer.fd, .eof, viewer.target, "") catch {};
         }
         self.mutex.unlock();
         _ = self.command.wait(false) catch {};
+
+        // Drop the reader thread's reference. This is the LAST access to `self`:
+        // if the surface was already removed from its group and no viewer still
+        // holds a reference, this frees it. The deferred cleanup above only
+        // touches the captured `alloc`/`reexec`, never `self`.
+        self.release();
     }
 
     /// Send accumulated data to all viewers, using compression if all support it.

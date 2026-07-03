@@ -23,8 +23,9 @@
 //!     same newline-delimited line protocol it would speak to the local
 //!     socket, but it MUST first send an auth line carrying the token
 //!     (`auth <token>\n`) before any command line is forwarded.
-//!   * For each accepted unix connection the daemon opens a
-//!     daemon-originated channel toward the client over the per-connection
+//!   * For each AUTHENTICATED unix connection (see the auth contract
+//!     below) the daemon opens a daemon-originated channel toward the
+//!     client over the per-connection
 //!     `Mux`, using `ChannelService.control_bridge` (wire id 7) with wire
 //!     params = the 8-byte ASCII discriminator tag `ghctrl01` the client
 //!     expects. The client surfaces this as service id 255 (CUSTOM) and
@@ -95,6 +96,22 @@ const pump_read_chunk_size = 16 * 1024;
 /// How long the channel-side pump waits for outbound credit before
 /// re-checking the close signal.
 const credit_wait_timeout_ns: u64 = 1 * std.time.ns_per_s;
+
+/// How long a freshly accepted connection has to send its auth line
+/// before the daemon drops it (FINDING #4). Bounds the resources a
+/// silent / half-open peer can pin: a connection that never sends a line
+/// is closed instead of holding an fd + thread indefinitely.
+const auth_handshake_timeout_ms: i64 = 10 * std.time.ms_per_s;
+
+/// Max bytes accepted for the auth line before the connection is treated
+/// as malformed and dropped. The real auth line is a short
+/// `auth <hextoken>`; anything far larger is abuse.
+const max_auth_line_bytes: usize = 4 * 1024;
+
+/// Max bytes buffered for the channel -> unix-socket (response) direction
+/// before the channel is torn down as a stuck/dead reader (FINDING #6).
+/// Bounds the memory a slow remote reader can pin on the daemon.
+const max_out_buf_bytes: usize = 1 * 1024 * 1024;
 
 // =========================================================================
 // Listener
@@ -281,6 +298,14 @@ pub const Listener = struct {
     token: []const u8,
     accept_thread: ?std.Thread = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    /// In-flight per-connection auth handshakes (FINDING #4). Each
+    /// accepted connection runs its auth handshake on a detached thread
+    /// that dereferences this `*Listener`; `stop` waits for `pending_count`
+    /// to drain to 0 before freeing the handle so no handshake thread
+    /// touches a freed `Listener`.
+    pending_mutex: std.Thread.Mutex = .{},
+    pending_cond: std.Thread.Condition = .{},
+    pending_count: usize = 0,
 
     /// Stop the accept loop, close the socket, and free the path. The
     /// socket FILE is unlinked only if this listener is still the current
@@ -297,12 +322,36 @@ pub const Listener = struct {
             t.join();
             self.accept_thread = null;
         }
+        // No further handshakes are spawned once the accept loop has
+        // exited; wait for any in-flight ones to finish dereferencing
+        // `self` before we free it. A handshake that already opened a
+        // child channel returns immediately (the channel is owned by the
+        // `Mux` and reaped by `Mux.deinit`, which runs after `stop`).
+        self.pending_mutex.lock();
+        while (self.pending_count != 0) self.pending_cond.wait(&self.pending_mutex);
+        self.pending_mutex.unlock();
         posix.close(self.listener_fd);
         if (PathGuard.instance.release(self.alloc, self.socket_path, self.path_generation)) {
             std.fs.cwd().deleteFile(self.socket_path) catch {};
         }
         self.alloc.free(self.socket_path);
         self.alloc.destroy(self);
+    }
+
+    /// Register an in-flight per-connection auth handshake. Paired with
+    /// exactly one `finishPending` (FINDING #4 lifecycle).
+    fn beginPending(self: *Listener) void {
+        self.pending_mutex.lock();
+        self.pending_count += 1;
+        self.pending_mutex.unlock();
+    }
+
+    fn finishPending(self: *Listener) void {
+        self.pending_mutex.lock();
+        self.pending_count -= 1;
+        const drained = self.pending_count == 0;
+        self.pending_mutex.unlock();
+        if (drained) self.pending_cond.signal();
     }
 };
 
@@ -393,7 +442,10 @@ fn acceptLoop(self: *Listener) !void {
         const ready = try posix.poll(&pollfds, 200);
         if (ready == 0) continue; // timeout — re-check the stop flag
 
-        const conn_fd = posix.accept(self.listener_fd, null, null, 0) catch |err| switch (err) {
+        // Non-blocking accepted socket (FINDING #6): the response-direction
+        // write in `onData` must never block the shared mux dispatch
+        // thread. accept4/emulated flags give us a non-blocking child fd.
+        const conn_fd = posix.accept(self.listener_fd, null, null, posix.SOCK.NONBLOCK) catch |err| switch (err) {
             error.WouldBlock,
             error.ConnectionAborted,
             error.ConnectionResetByPeer,
@@ -407,21 +459,101 @@ fn acceptLoop(self: *Listener) !void {
             return;
         }
 
-        spawnChild(self, conn_fd) catch |err| {
-            // Ownership of conn_fd never transferred to a child; close it.
-            log.warn("control_bridge: spawnChild failed: {}", .{err});
+        spawnAuthThread(self, conn_fd) catch |err| {
+            // Ownership of conn_fd never transferred to a handshake; close it.
+            log.warn("control_bridge: auth thread spawn failed: {}", .{err});
             posix.close(conn_fd);
         };
     }
 }
 
-/// Open a daemon-originated `control_bridge` child channel that adopts
-/// `conn_fd`. On success the fd's ownership transferred to the child
-/// service; on error the caller must close it.
-fn spawnChild(self: *Listener, conn_fd: posix.fd_t) !void {
+/// Spawn the per-connection auth handshake on a detached thread. The
+/// channel toward the client is opened ONLY after that handshake
+/// authenticates (FINDING #4), so accepting a connection never — by
+/// itself — opens a channel. On success ownership of `conn_fd` moves to
+/// the handshake thread; on spawn failure the caller must close it.
+fn spawnAuthThread(self: *Listener, conn_fd: posix.fd_t) !void {
+    // Track the handshake so `stop` waits for it before freeing `self`.
+    self.beginPending();
+    const t = std.Thread.spawn(.{}, authThreadMain, .{ self, conn_fd }) catch |err| {
+        self.finishPending();
+        return err;
+    };
+    t.detach();
+}
+
+/// Detached per-connection handshake thread body. Owns `conn_fd`: runs
+/// the auth handshake and, on success, hands the fd to a child channel;
+/// otherwise closes it.
+fn authThreadMain(self: *Listener, conn_fd: posix.fd_t) void {
+    defer self.finishPending();
+    const handed_off = runAuthHandshake(self, conn_fd);
+    if (!handed_off) posix.close(conn_fd);
+}
+
+/// Read + verify the first line as the auth line, then — only if it
+/// verifies — open the daemon-originated child channel toward the client.
+/// A peer that never sends a line is dropped after
+/// `auth_handshake_timeout_ms` (FINDING #4: no unbounded resource hold).
+///
+/// Returns true iff ownership of `conn_fd` has left this function (handed
+/// to a child channel, or already closed by a failed child `open`); false
+/// means the caller still owns `conn_fd` and must close it.
+fn runAuthHandshake(self: *Listener, conn_fd: posix.fd_t) bool {
+    var line = std.ArrayListUnmanaged(u8).empty;
+    defer line.deinit(self.alloc);
+
+    const deadline_ms = std.time.milliTimestamp() + auth_handshake_timeout_ms;
+    // Read the auth line ONE byte at a time so any pipelined command bytes
+    // after the newline stay in the socket buffer for the child's pump to
+    // read — no leftover handoff needed.
+    while (true) {
+        if (self.stop_requested.load(.acquire)) return false;
+        const remaining = deadline_ms - std.time.milliTimestamp();
+        if (remaining <= 0) {
+            log.warn("control_bridge: auth handshake timed out", .{});
+            return false;
+        }
+        var pollfds = [1]posix.pollfd{
+            .{ .fd = conn_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        // Cap the wait so we periodically re-check the stop flag/deadline.
+        const wait_ms: i32 = @intCast(@min(remaining, 200));
+        const ready = posix.poll(&pollfds, wait_ms) catch return false;
+        if (ready == 0) continue;
+
+        var b: [1]u8 = undefined;
+        const n = posix.read(conn_fd, &b) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return false,
+        };
+        if (n == 0) return false; // peer closed before authenticating
+        if (b[0] == '\n') break;
+        line.append(self.alloc, b[0]) catch return false;
+        if (line.items.len > max_auth_line_bytes) {
+            log.warn("control_bridge: auth line exceeded {d} bytes; dropping", .{max_auth_line_bytes});
+            return false;
+        }
+    }
+
+    const trimmed = std.mem.trim(u8, line.items, " \t\r");
+    if (!verifyAuthLine(trimmed, self.token)) {
+        _ = writeAll(conn_fd, "ERROR: control_bridge auth required\n");
+        return false; // never open a channel for an unauthenticated peer
+    }
+    _ = writeAll(conn_fd, "OK: authenticated\n");
+
+    return openChild(self, conn_fd);
+}
+
+/// Open a daemon-originated `control_bridge` child channel that adopts the
+/// already-authenticated `conn_fd`. Returns true iff `conn_fd` ownership
+/// has left the caller (handed to the child, or already closed by a failed
+/// `open`); false means the caller must still close it.
+fn openChild(self: *Listener, conn_fd: posix.fd_t) bool {
     // Daemon-local open params: [4] fd | [N] token. The token never goes
     // on the wire.
-    const service_params = try encodeChildOpenParams(self.alloc, conn_fd, self.token);
+    const service_params = encodeChildOpenParams(self.alloc, conn_fd, self.token) catch return false;
     defer self.alloc.free(service_params);
 
     const child_id = self.mux.openChannelFromDaemon(
@@ -431,9 +563,8 @@ fn spawnChild(self: *Listener, conn_fd: posix.fd_t) !void {
         child_window_units,
     ) catch |err| {
         switch (err) {
-            // `open` never ran — we still own conn_fd; surface the error
-            // so the accept loop closes it.
-            error.ServiceNotRegistered, error.ChannelIdsExhausted => return err,
+            // `open` never ran — we still own conn_fd; caller closes it.
+            error.ServiceNotRegistered, error.ChannelIdsExhausted => return false,
             // `open` ran and failed — its errdefer already closed conn_fd.
             error.InvalidRequest,
             error.ServiceError,
@@ -442,11 +573,12 @@ fn spawnChild(self: *Listener, conn_fd: posix.fd_t) !void {
             error.OutOfMemory,
             => {
                 log.warn("control_bridge: child open rejected: {}", .{err});
-                return;
+                return true;
             },
         }
     };
     log.debug("control_bridge: opened child channel id={x}", .{child_id});
+    return true;
 }
 
 // =========================================================================
@@ -458,14 +590,24 @@ const ChildState = struct {
     alloc: Allocator,
     mux: *channel_mux.Mux,
     channel_id: u32,
-    /// The accepted unix socket. Owned from `open` until `on_close`.
+    /// The accepted unix socket, non-blocking. Owned from `open` until
+    /// `on_close`.
     sock_fd: posix.fd_t,
-    /// Per-daemon auth token, copied locally (the listener's borrowed
-    /// slice may not outlive the pump thread).
+    /// Per-daemon auth token, copied locally. Authentication now happens
+    /// in the listener's handshake thread BEFORE this channel is opened
+    /// (FINDING #4), so the pump no longer consults it; retained so the
+    /// daemon-local open-params format stays stable.
     token: []u8,
     pump_thread: ?std.Thread = null,
     channel: ?*channel_mux.Channel = null,
     channel_attached: std.Thread.ResetEvent = .{},
+    /// Channel -> unix-socket (response direction) backlog. `onData` runs
+    /// on the shared mux dispatch thread and must not block on a slow
+    /// remote reader (FINDING #6): it writes what the non-blocking socket
+    /// accepts immediately and queues any remainder here for the pump
+    /// thread to flush. Guarded by `out_mutex`.
+    out_mutex: std.Thread.Mutex = .{},
+    out_buf: std.ArrayListUnmanaged(u8) = .empty,
 };
 
 /// Register the service in a daemon's channel-mux registry. Called once
@@ -544,16 +686,34 @@ fn open(
 
 fn onData(state_ptr: ?*anyopaque, bytes: []const u8) channel_mux.ServiceError!void {
     // Channel -> unix socket: the client's framed response line(s).
+    //
+    // This runs on the shared mux dispatch thread, so it must NOT block
+    // (head-of-line blocking would stall every other channel on the mux —
+    // FINDING #6). The socket is non-blocking: write what the kernel takes
+    // immediately and queue any remainder for the pump thread to flush.
     const state: *ChildState = @ptrCast(@alignCast(state_ptr orelse return));
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = posix.write(state.sock_fd, bytes[off..]) catch |err| {
-            log.warn("control_bridge: write to socket failed: {}", .{err});
+    if (bytes.len == 0) return;
+
+    state.out_mutex.lock();
+    defer state.out_mutex.unlock();
+
+    var remainder = bytes;
+    if (state.out_buf.items.len == 0) {
+        // Fast path: nothing queued — write straight through.
+        const written = writeSocketNonBlocking(state.sock_fd, bytes) catch {
+            log.warn("control_bridge: write to socket failed", .{});
             return error.ServiceError;
         };
-        if (n == 0) return error.ServiceError;
-        off += n;
+        if (written == bytes.len) return;
+        remainder = bytes[written..];
     }
+    // Preserve ordering: queue the un-writable tail BEHIND any backlog so
+    // the pump flushes it in FIFO order.
+    if (state.out_buf.items.len + remainder.len > max_out_buf_bytes) {
+        log.warn("control_bridge: response backlog exceeded {d} bytes; closing channel", .{max_out_buf_bytes});
+        return error.ServiceError;
+    }
+    state.out_buf.appendSlice(state.alloc, remainder) catch return error.ServiceError;
 }
 
 fn onControl(_: ?*anyopaque, op: u8, _: []const u8) channel_mux.ServiceError!void {
@@ -582,7 +742,9 @@ fn onClose(
         state.pump_thread = null;
     }
 
+    // Pump is joined — no other thread touches `out_buf` now.
     posix.close(state.sock_fd);
+    state.out_buf.deinit(state.alloc);
     state.alloc.free(state.token);
     state.alloc.destroy(state);
 }
@@ -601,31 +763,49 @@ fn pumpLoop(state: *ChildState) !void {
     state.channel_attached.wait();
     const ch = state.mux.getChannel(state.channel_id) orelse return;
 
+    // Guarantee the peer always learns the request stream ended, on EVERY
+    // exit path — socket EOF, read error, oversize line, poll failure, a
+    // failed forward, or normal close-signal teardown (FINDING #5). Without
+    // this the channel/fd/thread leaked until the whole mux tore down.
+    // `sendChannelEof` is idempotent and no-ops once the channel is
+    // closing, so this is safe even on the close-signal exit.
+    defer state.mux.sendChannelEof(ch) catch {};
+
     var pending = std.ArrayListUnmanaged(u8).empty;
     defer pending.deinit(state.alloc);
-    var authenticated = false;
 
     var buf: [pump_read_chunk_size]u8 = undefined;
     while (!ch.close_signal.isSet()) {
-        const n = posix.read(state.sock_fd, &buf) catch |err| switch (err) {
-            error.WouldBlock => {
-                // Non-blocking accept produced a non-blocking socket on
-                // some platforms; poll briefly so we don't spin.
-                var pollfds = [1]posix.pollfd{
-                    .{ .fd = state.sock_fd, .events = posix.POLL.IN, .revents = 0 },
-                };
-                _ = posix.poll(&pollfds, 200) catch return;
-                continue;
-            },
-            else => {
-                state.mux.sendChannelEof(ch) catch {};
-                return;
-            },
+        // Watch POLLOUT only while there is a response backlog to flush,
+        // so the pump drains `out_buf` that `onData` couldn't write inline
+        // (FINDING #6) without spinning when there is nothing pending.
+        const want_out = blk: {
+            state.out_mutex.lock();
+            defer state.out_mutex.unlock();
+            break :blk state.out_buf.items.len > 0;
         };
-        if (n == 0) {
-            state.mux.sendChannelEof(ch) catch {};
-            return;
+        var pollfds = [1]posix.pollfd{
+            .{ .fd = state.sock_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        if (want_out) pollfds[0].events |= posix.POLL.OUT;
+        const ready = posix.poll(&pollfds, 200) catch return;
+        if (ready == 0) continue;
+
+        if (want_out and (pollfds[0].revents & posix.POLL.OUT) != 0) {
+            // Socket writable again — flush queued response bytes. A write
+            // failure here means the socket is dead; exit (defer eofs).
+            flushOut(state) catch return;
         }
+
+        if ((pollfds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) == 0) {
+            continue;
+        }
+
+        const n = posix.read(state.sock_fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return,
+        };
+        if (n == 0) return; // socket EOF — defer sends channel_eof
 
         try pending.appendSlice(state.alloc, buf[0..n]);
         if (pending.items.len > max_line_bytes) {
@@ -633,24 +813,16 @@ fn pumpLoop(state: *ChildState) !void {
             return;
         }
 
-        // Split complete lines out of the buffer and process each.
+        // Split complete lines out of the buffer and forward each. Auth
+        // already happened in the listener handshake before this channel
+        // was opened (FINDING #4), so every line here is authenticated.
         while (std.mem.indexOfScalar(u8, pending.items, '\n')) |nl| {
             const line = pending.items[0..nl];
             const trimmed = std.mem.trim(u8, line, " \t\r");
 
-            if (!authenticated) {
-                if (verifyAuthLine(trimmed, state.token)) {
-                    authenticated = true;
-                    // Acknowledge so the remote CLI can proceed.
-                    _ = writeAll(state.sock_fd, "OK: authenticated\n");
-                } else {
-                    _ = writeAll(state.sock_fd, "ERROR: control_bridge auth required\n");
-                    // Drop the connection without ever forwarding a line.
-                    return;
-                }
-            } else if (trimmed.len != 0) {
-                // Forward the authenticated request line to the client,
-                // newline-terminated (the client's reader splits on '\n').
+            if (trimmed.len != 0) {
+                // Forward the request line to the client, newline-terminated
+                // (the client's reader splits on '\n').
                 try sendLine(state.mux, ch, trimmed);
             }
 
@@ -660,6 +832,36 @@ fn pumpLoop(state: *ChildState) !void {
             pending.shrinkRetainingCapacity(rest_len);
         }
     }
+}
+
+/// Write as many bytes as the non-blocking socket will accept right now.
+/// Returns the count written (may be < `bytes.len` under backpressure).
+/// Errors only on a real write failure, never on `WouldBlock`.
+fn writeSocketNonBlocking(fd: posix.fd_t, bytes: []const u8) !usize {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = posix.write(fd, bytes[off..]) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        off += n;
+    }
+    return off;
+}
+
+/// Flush queued response bytes to the socket, dropping what was written
+/// from the front of `out_buf`. Called from the pump thread when the
+/// socket reports writable (FINDING #6). Errors on a real write failure.
+fn flushOut(state: *ChildState) !void {
+    state.out_mutex.lock();
+    defer state.out_mutex.unlock();
+    if (state.out_buf.items.len == 0) return;
+    const written = try writeSocketNonBlocking(state.sock_fd, state.out_buf.items);
+    if (written == 0) return;
+    const rest = state.out_buf.items.len - written;
+    std.mem.copyForwards(u8, state.out_buf.items[0..rest], state.out_buf.items[written..]);
+    state.out_buf.shrinkRetainingCapacity(rest);
 }
 
 /// Verify an auth line against the daemon token. Accepts either

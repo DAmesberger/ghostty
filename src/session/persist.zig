@@ -329,6 +329,15 @@ pub fn decodeSnapshot(alloc: Allocator, data: []const u8) !?Snapshot {
         off += 4;
         const byte_len = std.mem.readInt(u32, data[off..][0..4], .little);
         off += 4;
+        // Validate the chunk's byte range lies fully within the scrollback
+        // section. Widen to u64 so byte_off + byte_len can't wrap a u32; a
+        // range that overflows or overruns scrollback_len means a torn/corrupt
+        // file → no persisted state (caller falls back to a fresh surface).
+        const chunk_end: u64 = @as(u64, byte_off) + @as(u64, byte_len);
+        if (byte_off > chunk_end or chunk_end > @as(u64, scrollback_len)) {
+            alloc.free(chunk_index);
+            return null;
+        }
         chunk_index[i] = .{
             .start_row = start_row,
             .row_count = row_count,
@@ -406,15 +415,26 @@ pub fn restore(
     // 2) Prepend blank history rows, then apply each scrollback chunk in
     //    place — mirroring the client reconstruct path exactly.
     if (snap.history_rows > 0 and snap.chunk_index.len > 0) {
+        // Bound history_rows BEFORE allocating: a corrupt u32 (up to ~4B)
+        // would make prependBlankPages allocate unbounded memory (one page per
+        // ~rows_per_page rows). Every serialized scrollback row occupies
+        // several bytes, so a legitimate snapshot can never have more history
+        // rows than scrollback bytes; anything larger is corrupt → fall back
+        // to a fresh surface (never a crash) instead of allocating.
+        if (snap.history_rows > snap.scrollback.len) return error.CorruptSnapshot;
         try t.screens.active.pages.prependBlankPages(snap.history_rows);
         for (snap.chunk_index) |cref| {
-            const end = cref.byte_off + cref.byte_len;
-            if (end > snap.scrollback.len) break; // torn — stop applying
+            // Checked/widened arithmetic: cref.byte_off + cref.byte_len are u32
+            // and can wrap. Compute in u64 and require the range lie fully
+            // within the scrollback buffer (byte_off <= end AND end <= len)
+            // before slicing; a torn/corrupt range → fresh surface.
+            const end: u64 = @as(u64, cref.byte_off) + @as(u64, cref.byte_len);
+            if (cref.byte_off > end or end > snap.scrollback.len) return error.CorruptSnapshot;
             page_diff.applyScrollbackChunk(
                 &t,
                 cref.start_row,
                 cref.row_count,
-                snap.scrollback[cref.byte_off..end],
+                snap.scrollback[cref.byte_off..@intCast(end)],
             );
         }
     }

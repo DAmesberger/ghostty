@@ -220,6 +220,15 @@ extension Ghostty {
             // succeeded — in that case there is nothing to free and the
             // handle counter was never incremented.
             guard let h = handle else { return }
+            // Capture the userdata box strongly so it outlives the C teardown
+            // below. `ghostty_ssh_close`/`_free` are what unregister the state
+            // listener, so a worker-thread state callback can still be mid-
+            // flight invoking the trampoline on the box until they return. If
+            // the box were released the moment deinit returns (it is a `let`
+            // on `self`, otherwise dropped here), that in-flight trampoline
+            // would dereference freed memory. `detach()` above only clears the
+            // weak back-ref; the box object itself must stay alive.
+            let box = userdataBox
             // Dispatch onto the shared serial cleanup queue rather than an
             // unordered `Task.detached`. By ARC: every `SSHChannel<_>`
             // referencing this connection has already deinit'd (because each
@@ -230,6 +239,10 @@ extension Ghostty {
             cleanupQueue.async {
                 ghostty_ssh_close(h)
                 ghostty_ssh_free(h)
+                // Keep the box alive until after the C handle is closed+freed
+                // (which unregisters the listener); only then can no further
+                // trampoline fire on it.
+                _ = box
             }
         }
 
