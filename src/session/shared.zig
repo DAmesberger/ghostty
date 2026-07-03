@@ -199,6 +199,21 @@ pub fn socketPath(alloc: Allocator) ![]const u8 {
     return try std.fs.path.join(alloc, &.{ dir, "daemon.sock" });
 }
 
+/// Root directory for daemon-side scrollback persistence (cmux first cut):
+/// `<stateDir>/state`. Each group gets a `<group_hex>/` subdir holding one
+/// `<surface_hex>.term` file per surface plus a `group.meta` file.
+pub fn persistDir(alloc: Allocator) ![]u8 {
+    const dir = try stateDir(alloc);
+    defer alloc.free(dir);
+    return try std.fs.path.join(alloc, &.{ dir, "state" });
+}
+
+/// Per-group persistence directory: `<stateDir>/state/<group_hex>`.
+pub fn groupPersistDir(alloc: Allocator, persist_root: []const u8, group: Uuid) ![]u8 {
+    const hex = formatUuid(group);
+    return try std.fs.path.join(alloc, &.{ persist_root, &hex });
+}
+
 /// Build the remote install directory path, platform-aware.
 /// - macOS (Darwin): ~/Library/Application Support/com.ghostty/bin
 /// - Linux/FreeBSD:  ~/.local/state/ghostty/bin (XDG_STATE_HOME default)
@@ -534,6 +549,7 @@ pub const SshConnectionContext = struct {
             .target = parsed.target,
             .jump = parsed.jump,
             .session_id = config.@"ssh-session",
+            .label = config.@"_ssh-label",
             .group_id = group_id,
             .surface_id = surface_id,
             .reconnect_attempts = config.@"ssh-reconnect-attempts",
@@ -557,6 +573,9 @@ pub const SshConnectionContext = struct {
         if (!isZeroUuid(self.surface_id)) {
             const hex = formatUuid(self.surface_id);
             config.@"_ssh-surface-id" = try alloc.dupe(u8, &hex);
+        }
+        if (self.label) |label| {
+            config.@"_ssh-label" = try alloc.dupe(u8, label);
         }
         config.@"ssh-reconnect-attempts" = self.reconnect_attempts;
         config.@"ssh-reconnect-backoff" = self.reconnect_backoff;
@@ -611,6 +630,27 @@ pub const AuthState = struct {
     password: ?[]const u8 = null,
     /// True if the user cancelled the password prompt.
     cancelled: bool = false,
+};
+
+/// Thread-safe decision state for the interactive remote-daemon update
+/// confirmation gate. Shared between the SSH thread (which blocks on
+/// `cond` after broadcasting `.update_confirmation_required`) and the
+/// UI thread (which signals the user's decision). Mirrors `AuthState`.
+///
+/// The gate fires when a content-hash-mismatched daemon upload would
+/// restart a remote daemon that is ALREADY RUNNING with live sessions.
+/// The user picks "Update & restart" (proceed with upload + force
+/// restart, killing sessions) or "Keep current" (reuse the running
+/// protocol-compatible daemon, no kill). The decision flows back here.
+pub const UpdateState = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    /// True once the UI thread has recorded a decision. The SSH thread
+    /// blocks on `cond` until this flips.
+    decided: bool = false,
+    /// Meaningful only when `decided` is true. true = update & restart
+    /// (proceed to upload), false = keep current (reuse running daemon).
+    approved: bool = false,
 };
 
 /// Shift an ArrayList buffer forward, discarding the first `amount` bytes.
@@ -678,6 +718,54 @@ test "sanitize label" {
     defer testing.allocator.free(value);
 
     try testing.expectEqualStrings("hello-world", value);
+}
+
+test "SshConnectionContext round-trips label through config" {
+    const testing = std.testing;
+    const Config = @import("../config.zig").Config;
+
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+
+    const ctx_in: SshConnectionContext = .{
+        .target = "user@host",
+        .session_id = "deadbeefdeadbeefdeadbeefdeadbeef",
+        .label = "my-workspace-title",
+    };
+    try ctx_in.applyToConfig(&config);
+
+    // The label must be persisted to the dedicated config field, NOT
+    // left null (the bug) or conflated with the session_id hex.
+    try testing.expect(config.@"_ssh-label" != null);
+    try testing.expectEqualStrings("my-workspace-title", config.@"_ssh-label".?);
+
+    const ctx_out = SshConnectionContext.fromConfig(&config) orelse
+        return error.FromConfigReturnedNull;
+    try testing.expect(ctx_out.label != null);
+    try testing.expectEqualStrings("my-workspace-title", ctx_out.label.?);
+
+    // Regression guard: the recovered label must be the human title,
+    // never the hex session_id that used to leak through.
+    try testing.expect(!std.mem.eql(u8, ctx_out.label.?, ctx_out.session_id.?));
+}
+
+test "SshConnectionContext omits label config when unlabeled" {
+    const testing = std.testing;
+    const Config = @import("../config.zig").Config;
+
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+
+    // No label set → daemon-generated-name (bare-ghostty) contract:
+    // applyToConfig must leave _ssh-label null so fromConfig yields a
+    // null label and Remote.zig sends "" (daemon generateReadableName).
+    const ctx_in: SshConnectionContext = .{ .target = "user@host" };
+    try ctx_in.applyToConfig(&config);
+    try testing.expect(config.@"_ssh-label" == null);
+
+    const ctx_out = SshConnectionContext.fromConfig(&config) orelse
+        return error.FromConfigReturnedNull;
+    try testing.expect(ctx_out.label == null);
 }
 
 test "normalizeOs" {

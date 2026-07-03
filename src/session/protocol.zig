@@ -42,6 +42,45 @@ pub const ConnectionState = union(enum) {
     failed: FailReason,
     disconnected: DisconnectInfo,
     password_required: PasswordPrompt,
+    update_confirmation_required: UpdateConfirmation,
+
+    /// Emitted when a remote ghostty-daemon needs a session-killing
+    /// update (its binary content hash differs from the local one) AND a
+    /// daemon is already running on the remote with live sessions at
+    /// risk. The embedder must surface a confirmation prompt and call
+    /// `ghostty_ssh_submit_update_decision(decision_token, confirm)` to
+    /// resume: confirm=true uploads + force-restarts (ending sessions),
+    /// confirm=false reuses the running protocol-compatible daemon. The
+    /// SSH setup thread blocks on the shared `update_state` cond until
+    /// the decision arrives. Mirrors `PasswordPrompt`.
+    pub const UpdateConfirmation = struct {
+        /// Typed pointer to the shared UpdateState. The GTK / C-API
+        /// handler uses this to record the decision and signal the cond.
+        update_state: ?*@import("shared.zig").UpdateState = null,
+        /// True when the remote daemon's protocol version is
+        /// INCOMPATIBLE (not just a content-hash drift). In that case
+        /// the update is mandatory: declining means disconnect, not
+        /// "keep current" — there is no usable running daemon to reuse.
+        is_mandatory: bool = false,
+        /// Best-effort count of live sessions on the remote that an
+        /// update would reset. 0 when the count couldn't be determined
+        /// (but the daemon was still detected as running).
+        session_count: u32 = 0,
+        /// The host being updated (e.g. "user@host"). Fixed buffer so it
+        /// can safely cross thread boundaries via the mailbox/broadcast.
+        host: [128]u8 = .{0} ** 128,
+        host_len: u8 = 0,
+
+        pub fn hostSlice(self: *const UpdateConfirmation) []const u8 {
+            return self.host[0..self.host_len];
+        }
+
+        pub fn setHost(self: *UpdateConfirmation, name: []const u8) void {
+            const len = @min(name.len, self.host.len);
+            @memcpy(self.host[0..len], name[0..len]);
+            self.host_len = @intCast(len);
+        }
+    };
 
     pub const PasswordPrompt = struct {
         /// True if the password is for the jump host, false for the target.
@@ -113,7 +152,11 @@ pub const ConnectionState = union(enum) {
 
 /// Protocol version for the session wire format. Clean break from v6 —
 /// new frame kinds, structured page diffs, flags byte.
-pub const protocol_version: u16 = 1;
+// v2: remote control bridge is generic — env vars renamed to
+// GHOSTTY_CONTROL_SOCKET/TOKEN and the shim is embedder-supplied at daemon
+// launch (no hardcoded cmux shim). Bumped so a new client never reuses a v1
+// daemon that injects the old env names / installs the old shim.
+pub const protocol_version: u16 = 2;
 
 /// Size of a frame header in bytes.
 /// Layout: kind(1) + flags(1) + target(2 LE) + len(4 LE) = 8 bytes.
@@ -177,6 +220,37 @@ pub const Kind = enum(u8) {
     channel_eof = 34, // Half-close: sender done writing
     channel_close = 35, // Full teardown with reason code
     channel_control = 36, // Service-specific control op
+
+    // 37/38 are reserved for future input_ack / resume frames (not yet
+    // wired). snapshot_begin takes the next truly-free value, 39.
+
+    // cmux execve self-handoff (Phase 2, GATED behind GHOSTTY_SSH_REEXEC).
+    // These are inert unless both the client local gate is on AND the running
+    // daemon advertised the capability. An OLD daemon that receives `reexec_query`
+    // (40) does not know the value, so `Header.parseFromBuf` returns
+    // error.InvalidFrameType and the connection is dropped — which is exactly
+    // why capability discovery goes through the answerable `--query-reexec`
+    // probe (its EOF→`REEXEC 0` is deterministic against a pre-feature daemon),
+    // never a raw frame to an unknown peer.
+    reexec_query = 40, // client → daemon: "can you execve-handoff?" (0-byte payload)
+    reexec_caps = 41, // daemon → client: 1-byte {1=yes,0=no}
+    reexec = 42, // client → daemon: payload = absolute path of the new binary
+
+    // Snapshot boundary marker (daemon → client). Sent immediately before a
+    // full serialized-viewport `data_out` (on attach/reattach), under the
+    // same mutex so frame ordering is preserved. The `target` field
+    // identifies the surface. On receipt the client resets that surface's
+    // terminal + VT parser to a clean baseline so the snapshot lands on a
+    // known-empty state with no possibility of desync from leftover partial
+    // state. Zero-byte payload.
+    //
+    // Backward compatibility: an old daemon never emits this frame, so an
+    // updated client never resets (unchanged behavior). An old client that
+    // does not know value 39 hits `intToEnum`'s else/error path in
+    // `Header.parseFromBuf` (error.InvalidFrameType); the daemon only emits
+    // it because the client requested an attach, so a pre-snapshot_begin
+    // client simply never has a peer that sends it.
+    snapshot_begin = 39,
 };
 
 pub const Header = struct {
@@ -1052,16 +1126,18 @@ pub const ChannelService = enum(u8) {
     file_transfer = 3,
     browser_proxy = 4,
     process_exec = 5,
-    /// cmux control reverse channel. The daemon listens on a remote-side
-    /// unix socket (path injected into the remote shell via
-    /// `CMUX_SOCKET_PATH`) and forwards each framed CLI request received
-    /// there back to the client over a daemon-originated channel of this
-    /// service. The client runs the request through its in-process socket
-    /// dispatcher (notify / notify_target / report_*) and writes the
-    /// response back. Wire id 7 — the first free slot above the
-    /// spec-defined services and below the `tcp_accepted` daemon-internal
-    /// id (which uses the reserved-range value, see services/tcp_accepted.zig).
-    cmux_control = 7,
+    /// Reverse control bridge. The daemon listens on a remote-side unix
+    /// socket (path injected into the remote shell via the embedder's
+    /// configured socket-path env var, default `CMUX_SOCKET_PATH`) and
+    /// forwards each framed CLI request received there back to the client
+    /// over a daemon-originated channel of this service. The client runs the
+    /// request through its in-process socket dispatcher (notify /
+    /// notify_target / report_*) and writes the response back. Wire id 7 —
+    /// the first free slot above the spec-defined services and below the
+    /// `tcp_accepted` daemon-internal id (which uses the reserved-range
+    /// value, see services/tcp_accepted.zig). The value is an on-wire
+    /// contract with deployed peers; keep it stable.
+    control_bridge = 7,
     custom = 255,
     _,
 };
@@ -1410,9 +1486,9 @@ test "protocol roundtrip" {
     try testing.expectEqualStrings("hello", payload);
 }
 
-test "protocol version is 1" {
+test "protocol version is 2" {
     const testing = std.testing;
-    try testing.expectEqual(@as(u16, 1), protocol_version);
+    try testing.expectEqual(@as(u16, 2), protocol_version);
 }
 
 test "header parseFromBuf/encodeToBuf roundtrip" {

@@ -433,7 +433,7 @@ test "SshChannelStreamTransport: integration round-trip via ssh localhost" {
     ssh_mod.globalInit();
     defer ssh_mod.globalDeinit();
 
-    var ssh_session = ssh_mod.SshSession.connect(alloc, "127.0.0.1", 22) catch
+    var ssh_session = ssh_mod.SshSession.connect(alloc, "127.0.0.1", 22, -1) catch
         return error.SkipZigTest;
     defer ssh_session.close();
 

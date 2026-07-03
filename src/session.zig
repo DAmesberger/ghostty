@@ -7,8 +7,12 @@ pub const services = struct {
     pub const file_transfer = @import("session/services/file_transfer.zig");
     pub const port_listener = @import("session/services/port_listener.zig");
     pub const tcp_accepted = @import("session/services/tcp_accepted.zig");
-    pub const cmux_control = @import("session/services/cmux_control.zig");
+    pub const control_bridge = @import("session/services/control_bridge.zig");
 };
+/// Embedder-specific names for the reverse control bridge (env vars, PATH
+/// shim, remote action). One source of truth shared by the daemon's env
+/// injection and the remote forwarder. See `control_bridge_config.zig`.
+pub const control_bridge_config = @import("session/control_bridge_config.zig");
 pub const layout = @import("session/layout.zig");
 pub const registry = @import("session/registry.zig");
 pub const client = @import("session/client.zig");
@@ -17,6 +21,7 @@ pub const ssh = @import("session/ssh.zig");
 pub const ssh_config = @import("session/ssh_config.zig");
 pub const remote_session = @import("session/remote_session.zig");
 pub const page_diff = @import("session/page_diff.zig");
+pub const persist = @import("session/persist.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

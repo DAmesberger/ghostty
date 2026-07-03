@@ -3865,6 +3865,13 @@ _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
 /// the correct daemon-side PTY.
 @"_ssh-surface-id": ?[]const u8 = null,
 
+/// Internal: human-readable session label chosen by the embedder
+/// (e.g. cmux workspace title). Round-tripped through the config so
+/// `SshConnectionContext.fromConfig` can recover it for `termio.Remote`,
+/// which sends it as the daemon session label. Not user-facing. When
+/// unset, the daemon generates an adjective-noun name (bare-ghostty mode).
+@"_ssh-label": ?[]const u8 = null,
+
 pub fn deinit(self: *Config) void {
     if (self._arena) |arena| arena.deinit();
     self.* = undefined;

@@ -506,6 +506,22 @@ typedef struct {
   // is null. May be NULL.
   void (*on_remote_state)(void* userdata,
                           const ghostty_ssh_state_t* state);
+  // Fired on the FIRST surface of a re-attached daemon group when the
+  // daemon's `opened` response bundles a serialized layout blob. libghostty
+  // parses the blob and hands back the group_id plus a flat array of leaf
+  // surface UUIDs (`surface_ids` points at `surface_ids_len` consecutive
+  // 16-byte raw UUIDs). All pointers are non-null and valid only for the
+  // duration of the callback — copy if you need to retain. `userdata` is
+  // the same opaque pointer set in this surface config. Fires zero or one
+  // time per surface (zero when the daemon sends no layout blob, e.g. a
+  // fresh group). Embedders use this to re-open each pre-existing surface
+  // by UUID (driving `surface_attach` reattach of the existing PTY) and to
+  // rebuild the split layout, instead of leaving the workspace with a
+  // single attached surface. Ignored when `ssh_target` is null. May be NULL.
+  void (*on_remote_layout)(void* userdata,
+                           const uint8_t* group_id,
+                           const uint8_t (*surface_ids)[16],
+                           uintptr_t surface_ids_len);
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1165,6 +1181,7 @@ typedef enum {
   GHOSTTY_SSH_STATE_STALE = 7,
   GHOSTTY_SSH_STATE_FAILED = 8,
   GHOSTTY_SSH_STATE_DISCONNECTED = 9,
+  GHOSTTY_SSH_STATE_UPDATE_CONFIRMATION_REQUIRED = 10,
 } ghostty_ssh_state_kind_e;
 
 // Source of a ghostty-daemon provision (upload) during the UPLOADING
@@ -1278,6 +1295,38 @@ typedef struct {
   const char* message;
 } ghostty_ssh_state_fail_t;
 
+// UPDATE_CONFIRMATION_REQUIRED — a remote ghostty-daemon needs a
+// session-killing update (its binary content differs from the local
+// one) AND a daemon is already running on the remote with live sessions
+// at risk. The embedder MUST surface a confirmation prompt and call
+// ghostty_ssh_submit_update_decision(ssh, decision_token, confirm) to
+// resume the connection; until then the SSH setup thread stays blocked.
+//
+//   confirm == true  → upload + force-restart (ends live sessions).
+//   confirm == false → "Keep current": reuse the running protocol-
+//                      compatible daemon, no restart. NOT permitted when
+//                      is_mandatory is true (see below) — declining a
+//                      mandatory update disconnects the connection.
+//
+// decision_token is opaque and tied to this prompt; libghostty rejects
+// stale tokens silently after a new prompt is issued.
+typedef struct {
+  // Host being updated, NUL-terminated. Valid for callback duration
+  // (stable until the next UPDATE_CONFIRMATION_REQUIRED transition).
+  const char* host;
+  // Best-effort count of live sessions an update would reset. 0 when
+  // the count couldn't be determined (daemon still detected as running).
+  uint32_t session_count;
+  // True when the running daemon's protocol is INCOMPATIBLE: the update
+  // is mandatory, so "Keep current" is not an option — declining
+  // (confirm=false) disconnects rather than reusing the daemon. When
+  // false the running daemon is protocol-compatible and can be reused.
+  bool is_mandatory;
+  // Opaque token to feed back to submit_update_decision. Stable until
+  // the next UPDATE_CONFIRMATION_REQUIRED transition.
+  uint64_t decision_token;
+} ghostty_ssh_state_update_confirmation_t;
+
 // Tagged union surfaced via on_state. Read `kind` first and ONLY
 // access the `payload` variant field matching that kind — other
 // variant fields are uninitialized.
@@ -1289,6 +1338,7 @@ struct ghostty_ssh_state_s {
     ghostty_ssh_state_reconnect_t reconnect;
     ghostty_ssh_state_disconnect_t disconnect;
     ghostty_ssh_state_fail_t fail;
+    ghostty_ssh_state_update_confirmation_t update_confirmation;
     // CONNECTING / DOWNLOADING / SETUP / CONNECTED / STALE carry no
     // additional payload.
   } payload;
@@ -1634,6 +1684,21 @@ void ghostty_ssh_submit_password(ghostty_ssh_t ssh,
 // FAILED with reason=AUTH_FAILED. Token validity rules match
 // submit_password.
 void ghostty_ssh_cancel_password(ghostty_ssh_t ssh, uint64_t auth_token);
+
+// Resolve a pending UPDATE_CONFIRMATION_REQUIRED gate. `decision_token`
+// must equal the value from the most-recent UPDATE_CONFIRMATION_REQUIRED
+// state payload; each new prompt invalidates the previous token, and a
+// stale token is a silent no-op. Safe to call from any thread.
+//
+//   confirm == true  → upload + force-restart the remote daemon (ends
+//                      the live sessions reported in session_count).
+//   confirm == false → "Keep current": reuse the running daemon without
+//                      restarting. When the prompt was is_mandatory, the
+//                      running daemon is protocol-incompatible and cannot
+//                      be reused, so confirm=false disconnects instead.
+void ghostty_ssh_submit_update_decision(ghostty_ssh_t ssh,
+                                        uint64_t decision_token,
+                                        bool confirm);
 
 // Submit a host-key decision in response to on_host_key. If accept is
 // false the connection transitions to FAILED. If accept is true and

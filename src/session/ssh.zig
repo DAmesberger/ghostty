@@ -61,8 +61,10 @@ pub const SshSession = struct {
 
     /// Connect to a host via TCP and perform SSH handshake.
     /// Times out after 30 seconds to avoid hanging indefinitely.
-    pub fn connect(alloc: Allocator, host: []const u8, port: u16) !SshSession {
-        const sock = try tcpConnect(host, port);
+    /// `cancel_fd` (-1 to disable) is polled alongside the connect socket so
+    /// a teardown can abort an in-flight dead-host connect promptly.
+    pub fn connect(alloc: Allocator, host: []const u8, port: u16, cancel_fd: posix.fd_t) !SshSession {
+        const sock = try tcpConnect(host, port, cancel_fd);
         errdefer posix.close(sock);
 
         const session = sessionInit() orelse return error.SshInitFailed;
@@ -498,6 +500,43 @@ pub const SshSession = struct {
         }
     }
 
+    /// Configure libssh2 transport-level keepalive on this session.
+    ///
+    /// This is distinct from the cmux session-protocol channel ping/pong
+    /// (which keeps the remote daemon alive). The transport keepalive emits
+    /// SSH_MSG_IGNORE / keepalive@openssh.com packets that reset the remote
+    /// sshd's idle / ClientAlive timer, preventing sshd from disconnecting
+    /// the transport (the classic ClientAliveInterval * ClientAliveCountMax
+    /// teardown). Non-blocking applications must call `keepaliveSend`
+    /// periodically to actually emit these packets.
+    ///
+    /// `want_reply` requests a server response (keepalive@openssh.com).
+    /// `interval` is the max number of seconds without I/O before a
+    /// keepalive is due (0 disables; 1 is treated as 2 by libssh2).
+    pub fn keepaliveConfig(self: *SshSession, want_reply: bool, interval: u32) void {
+        ssh2.libssh2_keepalive_config(
+            self.session,
+            if (want_reply) 1 else 0,
+            interval,
+        );
+    }
+
+    /// Send a transport-level keepalive packet if one is due. Returns the
+    /// number of seconds the caller may sleep before it needs to call this
+    /// again. On I/O error this returns 0 (call again soon) and logs; the
+    /// caller should treat that as non-fatal and NOT trigger a reconnect,
+    /// since the EOF / stale-pong paths already cover real transport loss.
+    pub fn keepaliveSend(self: *SshSession) u32 {
+        var seconds_to_next: c_int = 0;
+        const rc = ssh2.libssh2_keepalive_send(self.session, &seconds_to_next);
+        if (rc != 0) {
+            log.warn("transport keepalive send failed (rc={d})", .{rc});
+            return 0;
+        }
+        if (seconds_to_next < 0) return 0;
+        return @intCast(seconds_to_next);
+    }
+
     /// Disconnect and free all resources.
     pub fn close(self: *SshSession) void {
         // Free the TunnelState stored in the inner session's abstract pointer
@@ -855,7 +894,22 @@ fn logSshError(session: *ssh2.LIBSSH2_SESSION, prefix: []const u8) void {
 /// TCP connect timeout in milliseconds.
 const tcp_connect_timeout_ms = 30_000;
 
-fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
+/// Disable Nagle's algorithm on a TCP socket so small interactive writes
+/// (keystrokes) are not delayed by byte coalescing. Best-effort: mirrors the
+/// `setTcpNoDelay` helpers in `services/tcp_connect.zig` / `tcp_accepted.zig`.
+fn setTcpNoDelay(fd: posix.fd_t) !void {
+    // std.posix.TCP is `void` on iOS, so NODELAY is unavailable there.
+    if (comptime builtin.os.tag == .ios) return;
+    const yes: c_int = 1;
+    try posix.setsockopt(
+        fd,
+        posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&yes),
+    );
+}
+
+fn tcpConnect(host: []const u8, port: u16, cancel_fd: posix.fd_t) !posix.fd_t {
     const host_z = try std.heap.page_allocator.dupeZ(u8, host);
     defer std.heap.page_allocator.free(host_z);
 
@@ -879,6 +933,17 @@ fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
         const sock = c.socket(a.ai_family, a.ai_socktype, a.ai_protocol);
         if (sock < 0) continue;
 
+        // Disable Nagle on the SSH control socket. Single-keystroke
+        // `data_in` frames are tiny, so Nagle + the peer's delayed-ACK can
+        // hold each keystroke ~40ms before transmit, stacked on top of the
+        // base RTT — the dominant avoidable component of remote typing lag.
+        // libssh2 manages this raw socket and (unlike OpenSSH) does NOT set
+        // TCP_NODELAY itself, so we set it here. Best-effort; covers the
+        // direct target and the outer/jump-host socket for tunneled sessions.
+        setTcpNoDelay(sock) catch |err| {
+            log.warn("tcpConnect: TCP_NODELAY failed: {}", .{err});
+        };
+
         // Set non-blocking for connect with timeout.
         const flags = c.fcntl(sock, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(sock, c.F_SETFL, flags | c.O_NONBLOCK);
@@ -895,12 +960,27 @@ fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
             continue;
         }
 
-        // Wait for connect to complete with timeout.
-        var fds = [1]c.struct_pollfd{.{ .fd = sock, .events = c.POLLOUT, .revents = 0 }};
-        const poll_rc = c.poll(&fds, 1, tcp_connect_timeout_ms);
+        // Wait for connect to complete with timeout, also watching cancel_fd
+        // so a dead-host connect aborts promptly instead of blocking the full
+        // 30s (which would deadlock io_thr.join on surface teardown). When
+        // cancel_fd is -1, poll a single fd — identical to the prior behavior.
+        var fds = [2]c.struct_pollfd{
+            .{ .fd = sock, .events = c.POLLOUT, .revents = 0 },
+            .{ .fd = cancel_fd, .events = c.POLLIN, .revents = 0 },
+        };
+        const poll_rc = if (cancel_fd != -1)
+            c.poll(&fds, 2, tcp_connect_timeout_ms)
+        else
+            c.poll(&fds, 1, tcp_connect_timeout_ms);
         if (poll_rc <= 0) {
             _ = c.close(sock);
             continue;
+        }
+        if (cancel_fd != -1 and (fds[1].revents & c.POLLIN) != 0) {
+            // Teardown latched the cancel pipe — abort the connect. The
+            // `defer c.freeaddrinfo(result)` above still runs on return.
+            _ = c.close(sock);
+            return error.SshConnectCancelled;
         }
 
         // Check if connect actually succeeded.

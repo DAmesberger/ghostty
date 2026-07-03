@@ -839,7 +839,9 @@ fn renameSessionThread(rnd: anytype) void {
 
     const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch return;
     defer alloc.free(provision.path);
-    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
+    defer if (provision.reexec_target) |rt| alloc.free(rt);
+    // Auxiliary (rename/query) path: keep today's behavior, no execve handoff.
+    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned, null) catch return;
 
     const cmd = std.fmt.allocPrint(alloc, "{s} {s} --rename={s} --label={s}", .{
         provision.path,
@@ -879,7 +881,9 @@ fn detachOthersThread(dd: anytype) void {
 
     const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch return;
     defer alloc.free(provision.path);
-    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
+    defer if (provision.reexec_target) |rt| alloc.free(rt);
+    // Auxiliary (rename/query) path: keep today's behavior, no execve handoff.
+    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned, null) catch return;
 
     const cmd = std.fmt.allocPrint(alloc, "{s} {s} --detach-others={s}", .{
         provision.path,
@@ -933,7 +937,9 @@ fn killSessionThread(kd: anytype) void {
 
     const provision = session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null) catch return;
     defer alloc.free(provision.path);
-    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned) catch return;
+    defer if (provision.reexec_target) |rt| alloc.free(rt);
+    // Auxiliary (rename/query) path: keep today's behavior, no execve handoff.
+    session.client.ensureRemoteDaemon(alloc, &ctx, provision.path, provision.provisioned, null) catch return;
 
     const cmd = std.fmt.allocPrint(alloc, "{s} {s} --kill={s}", .{
         provision.path,
@@ -1195,10 +1201,12 @@ fn querySshSessions(alloc: Allocator, ssh_target: []const u8) ![]SessionQueryEnt
         };
         const remote_bin_path = provision.path;
         defer alloc.free(remote_bin_path);
+        defer if (provision.reexec_target) |rt| alloc.free(rt);
 
         log.info("session query: remote Ghostty at {s}, starting daemon...", .{remote_bin_path});
 
-        session.client.ensureRemoteDaemon(alloc, &ctx, remote_bin_path, provision.provisioned) catch |err| {
+        // Auxiliary (query) path: keep today's behavior, no execve handoff.
+        session.client.ensureRemoteDaemon(alloc, &ctx, remote_bin_path, provision.provisioned, null) catch |err| {
             log.warn("session query: ensureRemoteDaemon failed: {}", .{err});
             return error.NoActiveConnection;
         };

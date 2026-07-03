@@ -213,12 +213,12 @@ pub fn threadEnter(
             // Update the registered slot so detach/reconnect can find us by group.
             SshConnectionManager.updateSurfaceGroupId(entry, self.target_id, self.ssh_ctx.group_id);
 
-            // Send label if user explicitly set one; otherwise empty (daemon generates).
-            const label = self.ssh_ctx.label orelse
-                if (open_type == .session_attach and self.ssh_ctx.session_id != null)
-                self.ssh_ctx.session_id.?
-            else
-                "";
+            // Send the embedder-provided label (cmux workspace title) if set.
+            // Otherwise send "" so the daemon generates a readable adjective-noun
+            // name (bare-ghostty mode). The hex session_id is NOT a display name —
+            // the daemon already keys the group by group_id (derived above), so we
+            // must never send it as the label.
+            const label = self.ssh_ctx.label orelse "";
 
             const open_payload = (session.protocol.Open{
                 .open_type = open_type,
@@ -302,6 +302,25 @@ pub fn threadExit(self: *Remote, td: *termio.Termio.ThreadData) void {
     // Release connection reference (may shut down SSH thread if last ref)
     self.connection_manager.release(self.ssh_ctx.target, self.ssh_ctx.jump);
     self.conn_entry = null;
+}
+
+/// Abort an in-flight connect/reconnect on surface teardown. Called from
+/// the MAIN thread immediately before io_thr.join() (via Backend.requestStop).
+///
+/// Delegated to the manager so the whole abort runs under the manager mutex —
+/// the SAME lock `release()` holds across its entire teardown (including
+/// `destroy(entry)`). That serialization is load-bearing: during the INITIAL
+/// connect the cancel signal unblocks the IO thread, which then unwinds into
+/// `release()` (via threadEnter's errdefer) and frees the Entry. Without the
+/// lock, that free could race this abort's field writes (use-after-free).
+/// Keying by (target, jump) — not self.conn_entry — is required because
+/// conn_entry is still null during the initial connect (it is set only after
+/// setupConnection returns).
+pub fn requestStop(self: *Remote) void {
+    self.connection_manager.abortInFlightConnect(
+        self.ssh_ctx.target,
+        self.ssh_ctx.jump,
+    );
 }
 
 pub fn focusGained(

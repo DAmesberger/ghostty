@@ -23,6 +23,41 @@ extension Ghostty {
         case stale
         case failed(Failure)
         case disconnected(Disconnect)
+        case updateConfirmationRequired(UpdateConfirmation)
+
+        /// A session-killing remote-daemon update is needed and a daemon
+        /// is already running with live sessions at risk. Carries
+        /// closures that resume the blocked connection, encapsulating the
+        /// C-side `decision_token` (same pattern as `PasswordPrompt`).
+        public struct UpdateConfirmation: Sendable {
+            /// Host being updated (e.g. "user@host").
+            public let host: String
+            /// Best-effort count of live sessions an update would reset.
+            public let sessionCount: UInt32
+            /// True when the running daemon's protocol is incompatible:
+            /// declining means disconnect, not "keep current".
+            public let isMandatory: Bool
+            /// Proceed: upload + force-restart (ends the live sessions).
+            /// Safe to call from any thread; callable at most once.
+            public let updateAndRestart: @Sendable () -> Void
+            /// Keep the running daemon (no restart). For a mandatory
+            /// update this disconnects instead. Callable at most once.
+            public let keepCurrent: @Sendable () -> Void
+
+            public init(
+                host: String,
+                sessionCount: UInt32,
+                isMandatory: Bool,
+                updateAndRestart: @escaping @Sendable () -> Void,
+                keepCurrent: @escaping @Sendable () -> Void
+            ) {
+                self.host = host
+                self.sessionCount = sessionCount
+                self.isMandatory = isMandatory
+                self.updateAndRestart = updateAndRestart
+                self.keepCurrent = keepCurrent
+            }
+        }
 
         public struct PasswordPrompt: Sendable {
             /// True when the prompt is for a jump host rather than the target.
@@ -146,7 +181,8 @@ extension Ghostty {
         /// Convenience tag for cheap pattern-matching in tests + UI.
         public enum Kind: Sendable, Equatable {
             case connecting, passwordRequired, uploading, downloading,
-                 setup, connected, reconnecting, stale, failed, disconnected
+                 setup, connected, reconnecting, stale, failed, disconnected,
+                 updateConfirmationRequired
         }
 
         public var kind: Kind {
@@ -161,6 +197,7 @@ extension Ghostty {
             case .stale: return .stale
             case .failed: return .failed
             case .disconnected: return .disconnected
+            case .updateConfirmationRequired: return .updateConfirmationRequired
             }
         }
 
@@ -202,6 +239,19 @@ extension Ghostty {
                     host: host,
                     submit: { _ in },
                     cancel: {}
+                ))
+            case GHOSTTY_SSH_STATE_UPDATE_CONFIRMATION_REQUIRED:
+                // Inert on the per-surface path (no connection wrapper to
+                // bind the decision closures to). A remote `Remote` backend
+                // never drives this gate; the owning C-API connection does.
+                let u = s.payload.update_confirmation
+                let host = u.host.map { String(cString: $0) } ?? ""
+                return .updateConfirmationRequired(.init(
+                    host: host,
+                    sessionCount: u.session_count,
+                    isMandatory: u.is_mandatory,
+                    updateAndRestart: {},
+                    keepCurrent: {}
                 ))
             case GHOSTTY_SSH_STATE_UPLOADING:
                 let u = s.payload.upload

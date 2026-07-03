@@ -327,6 +327,24 @@ extension Ghostty.SSHConnection {
                     ghostty_ssh_cancel_password(h, token)
                 }
             ))
+        case GHOSTTY_SSH_STATE_UPDATE_CONFIRMATION_REQUIRED:
+            let u = state.payload.update_confirmation
+            let host = u.host.map { String(cString: $0) } ?? ""
+            let token = u.decision_token
+            let handleBits = UInt(bitPattern: connection.handle)
+            return .updateConfirmationRequired(.init(
+                host: host,
+                sessionCount: u.session_count,
+                isMandatory: u.is_mandatory,
+                updateAndRestart: {
+                    let h = ghostty_ssh_t(bitPattern: handleBits)
+                    ghostty_ssh_submit_update_decision(h, token, true)
+                },
+                keepCurrent: {
+                    let h = ghostty_ssh_t(bitPattern: handleBits)
+                    ghostty_ssh_submit_update_decision(h, token, false)
+                }
+            ))
         case GHOSTTY_SSH_STATE_UPLOADING:
             let u = state.payload.upload
             return .uploading(.init(

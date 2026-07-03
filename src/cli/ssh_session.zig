@@ -51,6 +51,14 @@ pub const Options = struct {
     /// Optional label to associate with a newly created session or rename.
     label: ?[]const u8 = null,
 
+    /// cmux Phase 2 (GATED): probe the running daemon for execve-handoff
+    /// capability (prints REEXEC 1/0). Remote-only.
+    @"query-reexec": bool = false,
+
+    /// cmux Phase 2 (GATED): ask the running daemon to execve-replace itself
+    /// with the binary at this path, preserving live shells. Remote-only.
+    reexec: ?[]const u8 = null,
+
     /// SSH target for remote execution. When set, the command connects
     /// to the remote host first and runs itself there. Supports "via"
     /// syntax for jump hosts: "user@host via bastion".
@@ -127,6 +135,8 @@ pub fn run(alloc: Allocator) !u8 {
         .session = opts.session,
         .new = opts.new,
         .label = opts.label,
+        .@"query-reexec" = opts.@"query-reexec",
+        .reexec = opts.reexec,
     }, stdout, stderr);
     try stdout.flush();
     try stderr.flush();
@@ -157,7 +167,8 @@ fn runRemote(alloc: Allocator, opts: Options) !u8 {
     const provision = try session.client.ensureRemoteGhostty(alloc, &ctx, stderr, null, null);
     const remote_bin_path = provision.path;
     defer alloc.free(remote_bin_path);
-    try session.client.ensureRemoteDaemon(alloc, &ctx, remote_bin_path, provision.provisioned);
+    defer if (provision.reexec_target) |rt| alloc.free(rt);
+    try session.client.ensureRemoteDaemon(alloc, &ctx, remote_bin_path, provision.provisioned, provision.reexec_target);
 
     // Build the remote command string.
     const cmd = try buildRemoteCommand(alloc, remote_bin_path, opts);

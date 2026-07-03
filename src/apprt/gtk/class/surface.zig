@@ -1121,6 +1121,18 @@ pub const Surface = extern struct {
                 status_buf[status.len] = 0;
                 overlay.setStatus(@ptrCast(status_buf[0..status.len :0]));
             },
+            .update_confirmation_required => {
+                // The GTK overlay has no update-confirmation UI: the GTK
+                // attach path passes `entry = null` into
+                // `ensureRemoteGhostty`, so `confirmDaemonUpdate` returns
+                // `.no_decider` and the Zig side picks the safe default
+                // (reuse for optional, disconnect for mandatory) WITHOUT
+                // emitting this state to a GTK consumer. This arm exists
+                // only to keep the switch exhaustive; render an inert
+                // status if it is ever surfaced.
+                resetOverlayDefaults(overlay);
+                overlay.setStatus("Checking remote daemon\xe2\x80\xa6");
+            },
         }
     }
 

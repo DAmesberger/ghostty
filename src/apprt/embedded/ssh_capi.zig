@@ -106,6 +106,7 @@ pub const StateKind = enum(c_int) {
     stale = 7,
     failed = 8,
     disconnected = 9,
+    update_confirmation_required = 10,
 };
 
 /// Mirror of `ghostty_ssh_provision_source_e`.
@@ -225,6 +226,19 @@ pub const StatePassword = extern struct {
     auth_token: u64,
 };
 
+/// Mirror of `ghostty_ssh_state_update_confirmation_t`.
+pub const StateUpdateConfirmation = extern struct {
+    /// Host being updated, NUL-terminated.
+    host: [*:0]const u8,
+    /// Best-effort count of live sessions an update would reset.
+    session_count: u32,
+    /// True when declining means disconnect (incompatible protocol),
+    /// false when "Keep current" can safely reuse the running daemon.
+    is_mandatory: bool,
+    /// Opaque token to feed back to submit_update_decision.
+    decision_token: u64,
+};
+
 /// Mirror of `ghostty_ssh_state_upload_t`.
 pub const StateUpload = extern struct {
     bytes_sent: u64,
@@ -264,6 +278,7 @@ pub const State = extern struct {
         reconnect: StateReconnect,
         disconnect: StateDisconnect,
         fail: StateFail,
+        update_confirmation: StateUpdateConfirmation,
     };
 };
 
@@ -497,6 +512,22 @@ pub const SshHandle = struct {
     /// double-submit doesn't double-signal the daemon's auth_state
     /// condition variable.
     current_auth_token: ?u64 = null,
+    /// Stable storage for the host string surfaced via an
+    /// UPDATE_CONFIRMATION_REQUIRED state. Same lifetime contract as
+    /// `last_password_host`: copied under `mutex` before the callback,
+    /// valid until the next UPDATE_CONFIRMATION_REQUIRED rewrites it.
+    last_update_host: [129]u8 = [_]u8{0} ** 129,
+    last_update_host_len: u8 = 0,
+    /// Per-prompt monotonic token for the update-confirmation gate.
+    /// Issued under `mutex` whenever an UPDATE_CONFIRMATION_REQUIRED
+    /// state is translated; the previous token is invalidated so a
+    /// stale submit is rejected. Skips zero (reserved sentinel).
+    next_update_token: u64 = 1,
+    /// The decision_token currently advertised on the latest
+    /// UPDATE_CONFIRMATION_REQUIRED. submit_update_decision only accepts
+    /// this exact value; cleared once consumed so a double-submit can't
+    /// double-signal the daemon's update_state cond.
+    current_update_token: ?u64 = null,
     /// In-flight worker threads spawned by ghostty_ssh_list_sessions.
     /// ghostty_ssh_free refuses to destroy the handle until this
     /// drops to 0 — the embedder must keep the handle alive at
@@ -843,6 +874,22 @@ pub const SshHandle = struct {
             self.next_auth_token +%= 1;
             self.current_auth_token = tok;
             state.payload.password.auth_token = tok;
+        } else if (state.kind == .update_confirmation_required) {
+            const conf = zig_state.update_confirmation_required;
+            const src = conf.host[0..conf.host_len];
+            const max = self.last_update_host.len - 1; // reserve NUL
+            const n = @min(src.len, max);
+            @memcpy(self.last_update_host[0..n], src[0..n]);
+            self.last_update_host[n] = 0;
+            self.last_update_host_len = @intCast(n);
+            state.payload.update_confirmation.host = @ptrCast(&self.last_update_host[0]);
+
+            // Issue a fresh decision token, invalidating any prior one.
+            if (self.next_update_token == 0) self.next_update_token = 1;
+            const tok = self.next_update_token;
+            self.next_update_token +%= 1;
+            self.current_update_token = tok;
+            state.payload.update_confirmation.decision_token = tok;
         }
         self.state_kind.store(@intFromEnum(state.kind), .release);
         self.mutex.unlock();
@@ -1178,6 +1225,16 @@ fn translateState(state: protocol.ConnectionState) State {
             // overlays the pointer before firing the embedder callback.
             .host = "",
             .auth_token = 0,
+        } } },
+        .update_confirmation_required => |u| .{ .kind = .update_confirmation_required, .payload = .{ .update_confirmation = .{
+            // Host pointer + decision_token are NEVER set here for the
+            // same dangling-stack reason as password_required; the caller
+            // (emitStateFromConnectionState) stashes the host into the
+            // handle-owned buffer and issues the token.
+            .host = "",
+            .session_count = u.session_count,
+            .is_mandatory = u.is_mandatory,
+            .decision_token = 0,
         } } },
     };
 }
@@ -1688,6 +1745,48 @@ export fn ghostty_ssh_cancel_password(ssh: ?*SshHandle, auth_token: u64) void {
     entry.auth_state.cancelled = true;
     entry.auth_state.cond.signal();
     entry.auth_state.mutex.unlock();
+}
+
+/// Implements `ghostty_ssh_submit_update_decision`. Resolves a pending
+/// UPDATE_CONFIRMATION_REQUIRED gate. Validates `decision_token` against
+/// the latest-prompt invariant under SshHandle.mutex (stale tokens are a
+/// silent no-op, same contract as submit_password), then records the
+/// user's choice in the Entry's `update_state` and signals the cond so
+/// the blocked SSH setup thread resumes.
+///
+/// `confirm == true`  → "Update & restart": proceed with upload +
+///                      force-restart (ends live sessions).
+/// `confirm == false` → "Keep current": reuse the running daemon, no
+///                      kill. (For a mandatory/incompatible update the
+///                      Zig side maps this to a disconnect instead.)
+export fn ghostty_ssh_submit_update_decision(
+    ssh: ?*SshHandle,
+    decision_token: u64,
+    confirm: bool,
+) void {
+    const h = ssh orelse return;
+    if (h.closed.load(.acquire)) return;
+    const entry = h.entry orelse {
+        log.debug("ghostty_ssh_submit_update_decision: no entry (test handle?)", .{});
+        return;
+    };
+
+    h.mutex.lock();
+    const current = h.current_update_token;
+    const matches = current != null and current.? == decision_token;
+    if (matches) h.current_update_token = null;
+    h.mutex.unlock();
+
+    if (!matches) {
+        log.debug("ghostty_ssh_submit_update_decision: stale or invalid decision_token={d}", .{decision_token});
+        return;
+    }
+
+    entry.update_state.mutex.lock();
+    entry.update_state.approved = confirm;
+    entry.update_state.decided = true;
+    entry.update_state.cond.signal();
+    entry.update_state.mutex.unlock();
 }
 
 /// Implements `ghostty_ssh_submit_host_key_decision`. No-op today:
@@ -2524,7 +2623,16 @@ export fn ghostty_ssh_list_sessions(
                     .group_id = &list_entry.group_id,
                     .label = @ptrCast(&label_buf[0]),
                     .surface_count = list_entry.surface_count,
-                    .created_at_ns = list_entry.created_at,
+                    // The daemon stores `created_at` in whole SECONDS
+                    // (`std.time.timestamp()`), but this C field and the
+                    // Swift consumer both expect NANOSECONDS. Without this
+                    // scale the embedder reads ~53 years of age. Saturating
+                    // multiply guards against overflow on absurd timestamps.
+                    .created_at_ns = std.math.mul(
+                        i64,
+                        list_entry.created_at,
+                        std.time.ns_per_s,
+                    ) catch list_entry.created_at,
                     .status = SessionStatus.fromProtocol(list_entry.status),
                     .color = list_entry.session_color,
                 };
@@ -3856,7 +3964,7 @@ test "onStateListener wires client_mux on .connected via tryOpenChannel" {
     defer ssh_mod.globalDeinit();
 
     // Connect to localhost.
-    var ssh_session = ssh_mod.SshSession.connect(alloc, "127.0.0.1", 22) catch
+    var ssh_session = ssh_mod.SshSession.connect(alloc, "127.0.0.1", 22, -1) catch
         return error.SkipZigTest;
     defer ssh_session.close();
 

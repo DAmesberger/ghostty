@@ -1,28 +1,34 @@
-//! cmux_control channel service (daemon side of the reverse control
+//! control_bridge channel service (daemon side of the reverse control
 //! channel).
 //!
-//! This is the daemon counterpart of the cmux client's
-//! `RemoteControlChannel` (see `Sources/RemoteControlChannel.swift`). It
-//! lets a `cmux` CLI invocation running INSIDE the remote shell reach the
-//! local macOS app's socket dispatcher (`notify` / `notify_target` /
-//! `report_*`) even though the remote shell cannot dial the local unix
-//! socket directly.
+//! This is the daemon counterpart of the embedder's client-side control
+//! handler (cmux's `Sources/RemoteControlChannel.swift` is the reference
+//! embedder). It lets a control CLI running INSIDE the remote shell reach the
+//! local app's socket dispatcher (`notify` / `notify_target` / `report_*`)
+//! even though the remote shell cannot dial the local unix socket directly.
+//!
+//! The embedder-specific names (the env vars below, the PATH shim) live in
+//! `control_bridge_config.zig` as one source of truth; this module only owns
+//! the transport. The wire identifiers — service id 7 and the 8-byte
+//! `ghctrl01` discriminator — are a stable on-wire contract with deployed
+//! peers and must NOT change without a protocol-version bump.
 //!
 //! Topology:
 //!   * The daemon binds a remote-side AF_UNIX listener at a per-daemon
 //!     path under a temp dir. That path is injected into every remote
-//!     shell's env as `CMUX_SOCKET_PATH`, alongside a per-daemon
-//!     `CMUX_SOCKET_PASSWORD` token (see daemon.zig `createSurface`).
-//!   * The remote `cmux` CLI connects to that unix socket and speaks the
+//!     shell's env as the configured socket-path var (default
+//!     `CMUX_SOCKET_PATH`), alongside a per-daemon auth token var (default
+//!     `CMUX_SOCKET_PASSWORD`) (see daemon.zig `createSurface`).
+//!   * The remote control CLI connects to that unix socket and speaks the
 //!     same newline-delimited line protocol it would speak to the local
 //!     socket, but it MUST first send an auth line carrying the token
 //!     (`auth <token>\n`) before any command line is forwarded.
 //!   * For each accepted unix connection the daemon opens a
 //!     daemon-originated channel toward the client over the per-connection
-//!     `Mux`, using `ChannelService.cmux_control` (wire id 7) with wire
-//!     params = the 8-byte ASCII discriminator tag `cmuxctl1` the client
+//!     `Mux`, using `ChannelService.control_bridge` (wire id 7) with wire
+//!     params = the 8-byte ASCII discriminator tag `ghctrl01` the client
 //!     expects. The client surfaces this as service id 255 (CUSTOM) and
-//!     routes it to `RemoteControlChannel` by the tag.
+//!     routes it to its control handler by the tag.
 //!   * The child channel then pumps bytes both ways: authenticated
 //!     request lines from the unix socket are framed (newline-delimited)
 //!     onto the channel, and single-line responses from the channel are
@@ -57,19 +63,19 @@ const protocol = @import("../protocol.zig");
 const channel_mux = @import("../channel_mux.zig");
 const shared = @import("../shared.zig");
 
-const log = std.log.scoped(.cmux_control_service);
+const log = std.log.scoped(.control_bridge_service);
 
-/// Service id for `cmux_control`. Matches
-/// `protocol.ChannelService.cmux_control` (wire id 7). The client maps
+/// Service id for `control_bridge`. Matches
+/// `protocol.ChannelService.control_bridge` (wire id 7). The client maps
 /// this to `GHOSTTY_CHANNEL_SERVICE_CUSTOM` (255) at the C-API bridge.
-pub const service_id: u8 = @intFromEnum(protocol.ChannelService.cmux_control);
+pub const service_id: u8 = @intFromEnum(protocol.ChannelService.control_bridge);
 
 /// 8-byte ASCII discriminator the client's `RemoteControlChannel` requires
 /// at the head of the inbound channel's wire params, so it can tell a
-/// `cmux_control` reverse channel apart from a `tcp_accepted` port-forward
+/// `control_bridge` reverse channel apart from a `tcp_accepted` port-forward
 /// accept (both arrive as service id 255). Must stay in sync with
 /// `RemoteControlChannel.paramTag`.
-pub const param_tag: []const u8 = "cmuxctl1";
+pub const param_tag: []const u8 = "ghctrl01";
 
 /// Initial credit window (in 4 KiB units) advertised on each child
 /// channel. Control traffic is tiny; a small window is plenty.
@@ -103,16 +109,16 @@ pub fn deriveSocketPath(alloc: Allocator) ![]u8 {
     var rand: [8]u8 = undefined;
     std.crypto.random.bytes(&rand);
     const hex = std.fmt.bytesToHex(rand, .lower);
-    // e.g. /tmp/cmuxctl-<16hex>.sock. `tmpDir` already guarantees the
+    // e.g. /tmp/ctlsock-<16hex>.sock. `tmpDir` already guarantees the
     // FULL path fits `sun_path`, but enforce it once more here so a
     // future change to `tmpDir` can never silently emit an over-long
     // path that `initUnix` would reject after env injection.
-    const path = try std.fmt.allocPrint(alloc, "{s}/cmuxctl-{s}.sock", .{ dir, hex });
+    const path = try std.fmt.allocPrint(alloc, "{s}/ctlsock-{s}.sock", .{ dir, hex });
     errdefer alloc.free(path);
     if (path.len > sun_path_usable_max) {
         alloc.free(path);
         // Fall back to a guaranteed-short path under /tmp.
-        return try std.fmt.allocPrint(alloc, "/tmp/cmuxctl-{s}.sock", .{hex});
+        return try std.fmt.allocPrint(alloc, "/tmp/ctlsock-{s}.sock", .{hex});
     }
     return path;
 }
@@ -132,19 +138,19 @@ pub fn deriveToken(alloc: Allocator) ![]u8 {
 /// field is 104 bytes on macOS and 108 on Linux; the NUL terminator costs
 /// one, so 103 is the portable usable maximum. We derive paths against the
 /// 103 bound so `initUnix` never rejects with `NameTooLong` after the
-/// `/cmuxctl-<16hex>.sock` suffix is appended.
+/// `/ctlsock-<16hex>.sock` suffix is appended.
 const sun_path_usable_max: usize = 103;
 
 /// The fixed-width portion of the derived path beyond the temp dir: a path
-/// separator, the `cmuxctl-` prefix, 16 lowercase hex chars (8 random
+/// separator, the `ctlsock-` prefix, 16 lowercase hex chars (8 random
 /// bytes), and the `.sock` suffix. Computed precisely so `tmpDir` can
 /// reject any dir that would overflow `sun_path` once the suffix is added.
-const socket_name_suffix_len: usize = "/cmuxctl-".len + 16 + ".sock".len;
+const socket_name_suffix_len: usize = "/ctlsock-".len + 16 + ".sock".len;
 
 /// Resolve a short temp directory for the reverse-channel socket. Prefers
 /// `$TMPDIR` (trimmed of a trailing slash), falling back to `/tmp`. The
 /// chosen dir is bounded so the FULL derived path (dir + the
-/// `/cmuxctl-<16hex>.sock` suffix) fits the `sun_path` limit; a too-long
+/// `/ctlsock-<16hex>.sock` suffix) fits the `sun_path` limit; a too-long
 /// `$TMPDIR` falls back to `/tmp` rather than producing a path `initUnix`
 /// would reject.
 fn tmpDir() []const u8 {
@@ -252,7 +258,7 @@ const PathGuard = struct {
     }
 };
 
-/// A running cmux_control listener bound to one `Mux`. Created by
+/// A running control_bridge listener bound to one `Mux`. Created by
 /// `startListener`, stopped by `Listener.stop`. The daemon owns the
 /// handle and must `stop` it before tearing down the `Mux` so no new
 /// child channels are opened during mux teardown.
@@ -301,7 +307,7 @@ pub const Listener = struct {
 };
 
 /// Bind a unix-domain listener at `socket_path` and start an accept
-/// thread that opens a daemon-originated `cmux_control` child channel for
+/// thread that opens a daemon-originated `control_bridge` child channel for
 /// each accepted connection. `token` must outlive the returned handle
 /// (the daemon owns it). On success the caller owns the returned
 /// `*Listener` and must call `stop` on it before `mux.deinit()`.
@@ -343,7 +349,7 @@ pub fn startListener(
     };
 
     self.accept_thread = std.Thread.spawn(.{}, acceptMain, .{self}) catch |err| {
-        log.warn("cmux_control: accept thread spawn failed: {}", .{err});
+        log.warn("control_bridge: accept thread spawn failed: {}", .{err});
         return error.ThreadSpawnFailed;
     };
     return self;
@@ -354,7 +360,7 @@ fn bindUnixListener(socket_path: []const u8) !posix.fd_t {
     std.fs.cwd().deleteFile(socket_path) catch {};
 
     var addr = std.net.Address.initUnix(socket_path) catch |err| {
-        log.warn("cmux_control: unix path too long: {s}", .{socket_path});
+        log.warn("control_bridge: unix path too long: {s}", .{socket_path});
         return err;
     };
 
@@ -375,7 +381,7 @@ fn bindUnixListener(socket_path: []const u8) !posix.fd_t {
 
 fn acceptMain(self: *Listener) void {
     acceptLoop(self) catch |err| {
-        log.warn("cmux_control accept loop exiting on error: {}", .{err});
+        log.warn("control_bridge accept loop exiting on error: {}", .{err});
     };
 }
 
@@ -403,13 +409,13 @@ fn acceptLoop(self: *Listener) !void {
 
         spawnChild(self, conn_fd) catch |err| {
             // Ownership of conn_fd never transferred to a child; close it.
-            log.warn("cmux_control: spawnChild failed: {}", .{err});
+            log.warn("control_bridge: spawnChild failed: {}", .{err});
             posix.close(conn_fd);
         };
     }
 }
 
-/// Open a daemon-originated `cmux_control` child channel that adopts
+/// Open a daemon-originated `control_bridge` child channel that adopts
 /// `conn_fd`. On success the fd's ownership transferred to the child
 /// service; on error the caller must close it.
 fn spawnChild(self: *Listener, conn_fd: posix.fd_t) !void {
@@ -420,7 +426,7 @@ fn spawnChild(self: *Listener, conn_fd: posix.fd_t) !void {
 
     const child_id = self.mux.openChannelFromDaemon(
         service_id,
-        param_tag, // wire params: the 8-byte cmuxctl1 discriminator
+        param_tag, // wire params: the 8-byte ghctrl01 discriminator
         service_params,
         child_window_units,
     ) catch |err| {
@@ -435,19 +441,19 @@ fn spawnChild(self: *Listener, conn_fd: posix.fd_t) !void {
             error.ResourceExhausted,
             error.OutOfMemory,
             => {
-                log.warn("cmux_control: child open rejected: {}", .{err});
+                log.warn("control_bridge: child open rejected: {}", .{err});
                 return;
             },
         }
     };
-    log.debug("cmux_control: opened child channel id={x}", .{child_id});
+    log.debug("control_bridge: opened child channel id={x}", .{child_id});
 }
 
 // =========================================================================
 // Child channel (per accepted unix connection)
 // =========================================================================
 
-/// Per-channel service state for a child `cmux_control` channel.
+/// Per-channel service state for a child `control_bridge` channel.
 const ChildState = struct {
     alloc: Allocator,
     mux: *channel_mux.Mux,
@@ -464,12 +470,12 @@ const ChildState = struct {
 
 /// Register the service in a daemon's channel-mux registry. Called once
 /// at daemon startup (by `daemon.zig`). Registering it advertises
-/// `cmux_control` in the `capabilities` frame and lets
+/// `control_bridge` in the `capabilities` frame and lets
 /// `Mux.openChannelFromDaemon` resolve daemon-originated child opens.
 pub fn register(reg: *channel_mux.Registry) !void {
     try reg.register(.{
         .id = service_id,
-        .name = "cmux_control",
+        .name = "control_bridge",
         .vtable = &vtable,
     });
 }
@@ -506,7 +512,7 @@ fn open(
     _: []u8,
 ) channel_mux.ServiceError!channel_mux.Service.OpenResult {
     if (params.len < 4) {
-        log.warn("cmux_control: child open params too short ({d})", .{params.len});
+        log.warn("control_bridge: child open params too short ({d})", .{params.len});
         return error.InvalidRequest;
     }
     const fd: posix.fd_t = @intCast(std.mem.readInt(i32, params[0..4], .little));
@@ -529,7 +535,7 @@ fn open(
     };
 
     state.pump_thread = std.Thread.spawn(.{}, pumpMain, .{state}) catch |err| {
-        log.warn("cmux_control: pump spawn failed: {}", .{err});
+        log.warn("control_bridge: pump spawn failed: {}", .{err});
         return error.ResourceExhausted;
     };
 
@@ -542,7 +548,7 @@ fn onData(state_ptr: ?*anyopaque, bytes: []const u8) channel_mux.ServiceError!vo
     var off: usize = 0;
     while (off < bytes.len) {
         const n = posix.write(state.sock_fd, bytes[off..]) catch |err| {
-            log.warn("cmux_control: write to socket failed: {}", .{err});
+            log.warn("control_bridge: write to socket failed: {}", .{err});
             return error.ServiceError;
         };
         if (n == 0) return error.ServiceError;
@@ -551,7 +557,7 @@ fn onData(state_ptr: ?*anyopaque, bytes: []const u8) channel_mux.ServiceError!vo
 }
 
 fn onControl(_: ?*anyopaque, op: u8, _: []const u8) channel_mux.ServiceError!void {
-    log.debug("cmux_control: ignoring unknown control op={d}", .{op});
+    log.debug("control_bridge: ignoring unknown control op={d}", .{op});
 }
 
 fn onEof(state_ptr: ?*anyopaque) void {
@@ -587,7 +593,7 @@ fn onClose(
 
 fn pumpMain(state: *ChildState) void {
     pumpLoop(state) catch |err| {
-        log.warn("cmux_control pump exiting on error: {}", .{err});
+        log.warn("control_bridge pump exiting on error: {}", .{err});
     };
 }
 
@@ -623,7 +629,7 @@ fn pumpLoop(state: *ChildState) !void {
 
         try pending.appendSlice(state.alloc, buf[0..n]);
         if (pending.items.len > max_line_bytes) {
-            log.warn("cmux_control: request line exceeded {d} bytes; dropping", .{max_line_bytes});
+            log.warn("control_bridge: request line exceeded {d} bytes; dropping", .{max_line_bytes});
             return;
         }
 
@@ -638,7 +644,7 @@ fn pumpLoop(state: *ChildState) !void {
                     // Acknowledge so the remote CLI can proceed.
                     _ = writeAll(state.sock_fd, "OK: authenticated\n");
                 } else {
-                    _ = writeAll(state.sock_fd, "ERROR: cmux_control auth required\n");
+                    _ = writeAll(state.sock_fd, "ERROR: control_bridge auth required\n");
                     // Drop the connection without ever forwarding a line.
                     return;
                 }
@@ -692,7 +698,7 @@ fn sendAll(mux: *channel_mux.Mux, ch: *channel_mux.Channel, bytes: []const u8) !
     while (off < bytes.len) {
         if (ch.close_signal.isSet()) return;
         const sent = mux.sendChannelData(ch, bytes[off..]) catch |err| {
-            log.warn("cmux_control pump: sendChannelData failed: {}", .{err});
+            log.warn("control_bridge pump: sendChannelData failed: {}", .{err});
             return;
         };
         if (sent == 0) {
@@ -720,7 +726,7 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) usize {
 
 const testing = std.testing;
 
-test "cmux_control encodeChildOpenParams roundtrip" {
+test "control_bridge encodeChildOpenParams roundtrip" {
     const buf = try encodeChildOpenParams(testing.allocator, 42, "secret-token");
     defer testing.allocator.free(buf);
     const fd = std.mem.readInt(i32, buf[0..4], .little);
@@ -728,13 +734,13 @@ test "cmux_control encodeChildOpenParams roundtrip" {
     try testing.expectEqualStrings("secret-token", buf[4..]);
 }
 
-test "cmux_control verifyAuthLine accepts matching token forms" {
+test "control_bridge verifyAuthLine accepts matching token forms" {
     try testing.expect(verifyAuthLine("auth s3cr3t", "s3cr3t"));
     try testing.expect(verifyAuthLine("auth.token s3cr3t", "s3cr3t"));
     try testing.expect(verifyAuthLine("auth   s3cr3t  ", "s3cr3t"));
 }
 
-test "cmux_control verifyAuthLine rejects bad token / missing prefix" {
+test "control_bridge verifyAuthLine rejects bad token / missing prefix" {
     try testing.expect(!verifyAuthLine("auth wrong", "s3cr3t"));
     try testing.expect(!verifyAuthLine("auth ", "s3cr3t"));
     try testing.expect(!verifyAuthLine("notify foo", "s3cr3t"));
@@ -742,12 +748,12 @@ test "cmux_control verifyAuthLine rejects bad token / missing prefix" {
     try testing.expect(!verifyAuthLine("auth s3cr3", "s3cr3t"));
 }
 
-test "cmux_control param_tag matches the client discriminator" {
+test "control_bridge param_tag matches the client discriminator" {
     try testing.expectEqual(@as(usize, 8), param_tag.len);
-    try testing.expectEqualStrings("cmuxctl1", param_tag);
+    try testing.expectEqualStrings("ghctrl01", param_tag);
 }
 
-test "cmux_control PathGuard: superseded owner must not unlink the live socket" {
+test "control_bridge PathGuard: superseded owner must not unlink the live socket" {
     const alloc = testing.allocator;
     var guard: PathGuard = .{};
     defer {
@@ -756,7 +762,7 @@ test "cmux_control PathGuard: superseded owner must not unlink the live socket" 
         guard.owners.deinit(alloc);
     }
 
-    const path = "/tmp/cmuxctl-deadbeef.sock";
+    const path = "/tmp/ctlsock-deadbeef.sock";
 
     // Old listener claims the path.
     const gen_old = try guard.claim(alloc, path);
@@ -776,7 +782,7 @@ test "cmux_control PathGuard: superseded owner must not unlink the live socket" 
     try testing.expectEqual(@as(u32, 0), guard.owners.count());
 }
 
-test "cmux_control PathGuard: distinct paths are independent owners" {
+test "control_bridge PathGuard: distinct paths are independent owners" {
     const alloc = testing.allocator;
     var guard: PathGuard = .{};
     defer {
@@ -785,8 +791,8 @@ test "cmux_control PathGuard: distinct paths are independent owners" {
         guard.owners.deinit(alloc);
     }
 
-    const a = "/tmp/cmuxctl-aaaa.sock";
-    const b = "/tmp/cmuxctl-bbbb.sock";
+    const a = "/tmp/ctlsock-aaaa.sock";
+    const b = "/tmp/ctlsock-bbbb.sock";
     const gen_a = try guard.claim(alloc, a);
     const gen_b = try guard.claim(alloc, b);
 
@@ -797,7 +803,7 @@ test "cmux_control PathGuard: distinct paths are independent owners" {
     try testing.expectEqual(@as(u32, 0), guard.owners.count());
 }
 
-test "cmux_control tmpDir rejects an over-long TMPDIR (full path must fit sun_path)" {
+test "control_bridge tmpDir rejects an over-long TMPDIR (full path must fit sun_path)" {
     // The fixed suffix plus a dir at the boundary must fit; one byte past
     // it must fall back to /tmp. We assert the arithmetic directly so the
     // bound can't silently regress (env mutation in tests is racy).
@@ -807,16 +813,16 @@ test "cmux_control tmpDir rejects an over-long TMPDIR (full path must fit sun_pa
     try testing.expect(max_dir_len + 1 + socket_name_suffix_len > sun_path_usable_max);
 }
 
-test "cmux_control deriveSocketPath always fits sun_path" {
+test "control_bridge deriveSocketPath always fits sun_path" {
     const alloc = testing.allocator;
     const path = try deriveSocketPath(alloc);
     defer alloc.free(path);
     try testing.expect(path.len <= sun_path_usable_max);
-    try testing.expect(std.mem.indexOf(u8, path, "cmuxctl-") != null);
+    try testing.expect(std.mem.indexOf(u8, path, "ctlsock-") != null);
     try testing.expect(std.mem.endsWith(u8, path, ".sock"));
 }
 
-test "cmux_control end-to-end: auth then forward request, response back" {
+test "control_bridge end-to-end: auth then forward request, response back" {
     const alloc = testing.allocator;
 
     var fds: [2]posix.fd_t = undefined;
@@ -875,7 +881,7 @@ test "cmux_control end-to-end: auth then forward request, response back" {
     try testing.expect(std.mem.startsWith(u8, ack_buf[0..ack_n], "OK"));
 
     // Collect frames off the mux's peer side: expect a child channel_open
-    // (daemon-direction id, params == cmuxctl1) then channel_data with the
+    // (daemon-direction id, params == ghctrl01) then channel_data with the
     // forwarded request.
     var child_id: ?u32 = null;
     var collected = std.ArrayListUnmanaged(u8).empty;

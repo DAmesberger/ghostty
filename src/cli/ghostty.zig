@@ -20,7 +20,7 @@ const show_face = @import("show_face.zig");
 const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const ssh_session = @import("ssh_session.zig");
-const cmux_notify = @import("cmux_notify.zig");
+const control_send = @import("control_send.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -74,9 +74,9 @@ pub const Action = enum {
     // Manage remote sessions over SSH.
     @"ssh-session",
 
-    // Deliver a notification (or report_* metadata) from a cmux remote
-    // session back to the local app over the reverse control channel.
-    @"cmux-notify",
+    // Forward a single command line from a remote session back to the local
+    // app over the generic reverse control bridge. Embedder-agnostic.
+    @"control-send",
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -157,7 +157,7 @@ pub const Action = enum {
             .boo => try boo.run(alloc),
             .@"new-window" => try new_window.run(alloc),
             .@"ssh-session" => try ssh_session.run(alloc),
-            .@"cmux-notify" => try cmux_notify.run(alloc),
+            .@"control-send" => try control_send.run(alloc),
         };
     }
 
@@ -198,7 +198,7 @@ pub const Action = enum {
                 .boo => boo.Options,
                 .@"new-window" => new_window.Options,
                 .@"ssh-session" => ssh_session.Options,
-                .@"cmux-notify" => cmux_notify.Options,
+                .@"control-send" => control_send.Options,
             };
         }
     }

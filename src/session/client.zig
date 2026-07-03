@@ -5,6 +5,7 @@ const posix = std.posix;
 const shared = @import("shared.zig");
 const protocol = @import("protocol.zig");
 const ssh = @import("ssh.zig");
+const control_bridge_config = @import("control_bridge_config.zig");
 
 /// Connection-pool manager type imported lazily — `attachRemoteSurface`
 /// needs the `Entry` pointer + the manager's mutex/alloc to mirror the
@@ -22,6 +23,17 @@ const c = if (builtin.os.tag == .windows) struct {} else @cImport({
 const log = std.log.scoped(.session_client);
 
 const secureZeroAndFree = shared.secureZeroAndFree;
+
+/// libssh2 transport-level keepalive interval, in seconds.
+///
+/// This must be comfortably below the remote sshd's idle-disconnect window.
+/// A direct sshd configured with the classic `ClientAliveInterval=5` /
+/// `ClientAliveCountMax=3` disconnects an unresponsive transport at 15s.
+/// Emitting a transport keepalive every 5s resets that timer well before
+/// the 3-miss teardown, so the SSH transport stays alive even when the
+/// cmux session-protocol channel ping/pong (which only the daemon answers)
+/// is not enough to satisfy sshd's ClientAlive handshake.
+pub const transport_keepalive_interval_s: u32 = 5;
 
 pub const Error = error{
     RemoteCommandFailed,
@@ -52,6 +64,10 @@ pub const SshContext = struct {
     /// Index of the next jump hop to connect (0-based). Used to resume
     /// multi-hop chains after a password prompt.
     jump_hop_index: u8 = 0,
+    /// Optional fd polled by tcpConnect alongside the connect socket so an
+    /// in-flight connect aborts promptly on surface teardown. -1 = no cancel.
+    /// Set from the Entry's cancel_pipe[0] in SshConnectionManager.acquire.
+    cancel_fd: posix.fd_t = -1,
 
     pub fn deinit(self: *SshContext) void {
         if (self.session) |*s| {
@@ -157,7 +173,7 @@ pub const SshContext = struct {
                     self.jump_session = sess;
                 } else {
                     // First hop — direct TCP connection.
-                    var sess = ssh.SshSession.connect(self.alloc, hop.host, hop.port) catch |err| {
+                    var sess = ssh.SshSession.connect(self.alloc, hop.host, hop.port, self.cancel_fd) catch |err| {
                         try stderr.print("Failed to connect to {s}: {}\n", .{ hop_trimmed, err });
                         try stderr.flush();
                         return err;
@@ -190,10 +206,14 @@ pub const SshContext = struct {
             }
 
             self.session = target_sess;
+            // Enable transport-level keepalive so the CLIENT keeps the SSH
+            // transport alive (resets sshd's ClientAlive/idle timer). The
+            // session-protocol channel ping/pong only keeps the daemon alive.
+            self.session.?.keepaliveConfig(true, transport_keepalive_interval_s);
             return .success;
         } else {
             // Direct connection (no jump host).
-            var sess = ssh.SshSession.connect(self.alloc, target.host, target.port) catch |err| {
+            var sess = ssh.SshSession.connect(self.alloc, target.host, target.port, self.cancel_fd) catch |err| {
                 try stderr.print("Failed to connect to {s}: {}\n", .{ self.ssh_target, err });
                 try stderr.flush();
                 return err;
@@ -205,6 +225,8 @@ pub const SshContext = struct {
             }
 
             self.session = sess;
+            // Enable transport-level keepalive (see jump-host branch above).
+            self.session.?.keepaliveConfig(true, transport_keepalive_interval_s);
             return .success;
         }
     }
@@ -243,7 +265,100 @@ pub const Mailbox = @import("../apprt.zig").surface.Mailbox;
 pub const ProvisionResult = struct {
     path: []const u8,
     provisioned: bool,
+    /// cmux execve self-handoff (Phase 2, GATED): when set, `ensureRemoteDaemon`
+    /// asks the RUNNING (old) daemon to execve-replace itself with the binary at
+    /// this absolute path instead of `--kill-daemon` + `--daemonize`, preserving
+    /// live shells. Non-null ONLY when the client gate is on AND the running
+    /// daemon answered `REEXEC 1`. Owned; freed by the caller.
+    reexec_target: ?[]const u8 = null,
 };
+
+/// cmux execve self-handoff client gate (default OFF). Enabled by setting
+/// `GHOSTTY_SSH_REEXEC=1` in the cmux process environment. When off, the client
+/// never injects the daemon-side flag and never prefers the execve path, so the
+/// daemon answers `REEXEC 0` and every update uses today's kill+restart.
+fn clientReexecGateOn() bool {
+    const v = posix.getenv("GHOSTTY_SSH_REEXEC") orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
+/// Probe the RUNNING daemon (via the just-uploaded `bin_path` as a CLI client)
+/// for execve-handoff capability. Returns an owned dup of `bin_path` to use as
+/// the reexec target iff the client gate is on AND the daemon prints exactly
+/// `REEXEC 1`; otherwise null (caller falls back to kill+restart).
+fn probeReexecTarget(alloc: Allocator, sess: anytype, bin_path: []const u8) ?[]const u8 {
+    if (!clientReexecGateOn()) return null;
+    const cmd = std.fmt.allocPrint(
+        alloc,
+        "{s} " ++ shared.remote_subcommand ++ " --query-reexec",
+        .{bin_path},
+    ) catch return null;
+    defer alloc.free(cmd);
+    const r = sess.exec(cmd) catch return null;
+    defer alloc.free(r.stdout);
+    defer alloc.free(r.stderr);
+    if (r.exit_code != 0) return null;
+    const trimmed = std.mem.trim(u8, r.stdout, " \t\r\n");
+    if (!std.mem.eql(u8, trimmed, "REEXEC 1")) return null;
+    return alloc.dupe(u8, bin_path) catch null;
+}
+
+/// Outcome of the interactive remote-daemon update-confirmation gate.
+pub const UpdateDecision = enum {
+    /// User chose "Update & restart": proceed with upload + force-restart.
+    update,
+    /// User chose "Keep current": reuse the running daemon, no kill.
+    keep_current,
+    /// No interactive embedder was available to answer the prompt
+    /// (GTK picker / CLI / null entry). Caller picks a safe default per
+    /// context (reuse for optional, disconnect for mandatory).
+    no_decider,
+};
+
+/// Surface the update-confirmation gate to the embedder and BLOCK until
+/// the user decides. Mirrors the password-required async gate: emit a
+/// `.update_confirmation_required` state carrying a pointer to the
+/// Entry's shared `update_state`, then wait on its condition variable
+/// until the C-API submit (or GTK handler) records `decided`.
+///
+/// Returns `.no_decider` immediately when there is no `entry` (no
+/// listener fan-out / no C-API submit path) so the caller falls back to
+/// a safe default rather than blocking forever.
+fn confirmDaemonUpdate(
+    mailbox: ?*Mailbox,
+    entry: ?*SshConnectionManager.Entry,
+    host: []const u8,
+    session_count: u32,
+    is_mandatory: bool,
+) UpdateDecision {
+    const e = entry orelse return .no_decider;
+
+    // Reset the gate state before publishing the prompt so a stale
+    // decision from a prior gate can't satisfy this wait.
+    e.update_state.mutex.lock();
+    e.update_state.decided = false;
+    e.update_state.approved = false;
+    e.update_state.mutex.unlock();
+
+    var conf: protocol.ConnectionState.UpdateConfirmation = .{
+        .update_state = @ptrCast(&e.update_state),
+        .is_mandatory = is_mandatory,
+        .session_count = session_count,
+    };
+    conf.setHost(host);
+    pushAttachState(mailbox, e, .{ .update_confirmation_required = conf });
+
+    // Block until the embedder records a decision (C-API
+    // submit_update_decision / GTK handler).
+    e.update_state.mutex.lock();
+    while (!e.update_state.decided) {
+        e.update_state.cond.wait(&e.update_state.mutex);
+    }
+    const approved = e.update_state.approved;
+    e.update_state.mutex.unlock();
+
+    return if (approved) .update else .keep_current;
+}
 
 /// Ensure a compatible ghostty-daemon exists on the remote host.
 ///
@@ -308,10 +423,74 @@ pub fn ensureRemoteGhostty(
             return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
         }
         log.info(
-            "remote binary at {s} content-hash differs from local — re-uploading",
+            "remote binary at {s} content-hash differs from local — update needed",
             .{daemon_path},
         );
+
+        // Content-hash mismatch but protocol is COMPATIBLE. If a daemon
+        // is already running with live sessions, uploading + force-
+        // restarting would kill them. Gate behind a user confirmation
+        // (mirrors the password-required async gate). If the user keeps
+        // the current daemon, reuse it (provisioned=false ⇒ no kill);
+        // the running daemon speaks a compatible protocol so the session
+        // survives.
+        if (probeRunningDaemonSessionCount(alloc, sess, daemon_path)) |session_count| {
+            const decision = confirmDaemonUpdate(
+                mailbox,
+                entry,
+                ctx.ssh_target,
+                session_count,
+                false, // not mandatory — protocol is compatible
+            );
+            switch (decision) {
+                .keep_current => {
+                    log.info("user declined daemon update — reusing running daemon at {s}", .{daemon_path});
+                    return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
+                },
+                .update => {
+                    log.info("user approved daemon update — re-uploading {s}", .{daemon_path});
+                    // Fall through to the upload path below (provisioned=true).
+                },
+                .no_decider => {
+                    // No interactive embedder (GTK picker / CLI). Preserve
+                    // live sessions by default: reuse the running daemon.
+                    log.info("no decider for daemon update gate — reusing running daemon at {s}", .{daemon_path});
+                    return .{ .path = try alloc.dupe(u8, daemon_path), .provisioned = false };
+                },
+            }
+        }
+        // No daemon running (or zero sessions) — upload silently.
         // Fall through to the upload path below.
+    } else {
+        // Either no deployed binary, or one whose protocol version is
+        // INCOMPATIBLE. If a daemon is running from that stale binary it
+        // speaks an unusable protocol, so the update is MANDATORY. We
+        // still warn (declining = disconnect, since there's no
+        // compatible daemon to reuse). A fresh remote with no running
+        // daemon uploads silently as before.
+        if (probeRunningDaemonSessionCount(alloc, sess, daemon_path)) |session_count| {
+            const decision = confirmDaemonUpdate(
+                mailbox,
+                entry,
+                ctx.ssh_target,
+                session_count,
+                true, // mandatory — incompatible protocol
+            );
+            switch (decision) {
+                .update => {
+                    log.info("user approved mandatory daemon update", .{});
+                    // Fall through to the upload path below.
+                },
+                .keep_current, .no_decider => {
+                    // Mandatory update declined (or no decider): the
+                    // running daemon is protocol-incompatible and cannot
+                    // be reused, so abort the connection rather than
+                    // silently force-restarting.
+                    log.info("mandatory daemon update declined — disconnecting", .{});
+                    return error.RemoteUpdateDeclined;
+                },
+            }
+        }
     }
 
     // Need to provision — install as ghostty-daemon.
@@ -333,7 +512,9 @@ pub fn ensureRemoteGhostty(
         defer alloc.free(local_daemon);
 
         if (uploadGhostty(alloc, sess, dest, local_daemon, remote_home, remote_os, stderr, mailbox, .local_daemon, entry)) {
-            return .{ .path = dest, .provisioned = true };
+            // cmux execve self-handoff: while the OLD daemon is still running,
+            // probe whether it can hand off in-place to the just-uploaded binary.
+            return .{ .path = dest, .provisioned = true, .reexec_target = probeReexecTarget(alloc, sess, dest) };
         } else |_| {
             // Local daemon upload failed (e.g., file not found, or
             // arch mismatch on the legacy untagged path) — fall
@@ -352,7 +533,8 @@ pub fn ensureRemoteGhostty(
     try stderr.flush();
 
     try downloadAndInstallDaemon(alloc, sess, dest, remote_home, remote_os, norm_os, norm_arch, stderr, mailbox, entry);
-    return .{ .path = dest, .provisioned = true };
+    // cmux execve self-handoff: probe the running daemon for in-place handoff.
+    return .{ .path = dest, .provisioned = true, .reexec_target = probeReexecTarget(alloc, sess, dest) };
 }
 
 /// Find a bundled-or-built daemon binary suitable for the given
@@ -372,7 +554,7 @@ pub fn ensureRemoteGhostty(
 ///   3. `<exe-dir>/ghostty-daemon` — adjacent to the running exe,
 ///      same shape as the legacy bundling. Preserved for backwards
 ///      compatibility.
-///   4. `CMUX_GHOSTTY_DAEMON_PATH` env var — ultimate override for
+///   4. `GHOSTTY_DAEMON_PATH` env var — ultimate override for
 ///      pointing at an arbitrary daemon binary on the host
 ///      filesystem (e.g. a freshly-built `zig-out/bin/ghostty-daemon`
 ///      during dev iteration). Lowest priority so a bundled binary
@@ -424,7 +606,7 @@ fn findLocalDaemon(
         alloc.free(adjacent);
     }
     // 4. Env var escape hatch
-    if (std.posix.getenv("CMUX_GHOSTTY_DAEMON_PATH")) |env_path| {
+    if (std.posix.getenv("GHOSTTY_DAEMON_PATH")) |env_path| {
         if (env_path.len > 0 and fileExists(env_path)) {
             return try alloc.dupe(u8, env_path);
         }
@@ -565,6 +747,54 @@ fn probeDeployedBinary(
     }
 
     return true;
+}
+
+/// Best-effort probe of a RUNNING remote daemon: returns the number of
+/// live sessions currently registered with the daemon, or `null` if the
+/// daemon is not running / unreachable.
+///
+/// Uses `<binary> +ssh-session --list`, which connects to the daemon's
+/// unix socket and prints one line per session (see `daemon.listSessions`
+/// — each session is `gid|label|N surfaces (M alive)|created|status`).
+/// If the daemon isn't running, the socket connect fails and `--list`
+/// prints nothing, so an empty result is treated as "no running daemon"
+/// (return null) and the caller proceeds without prompting.
+///
+/// This deliberately gates the session-killing update prompt: a hash
+/// mismatch on a remote with NO running daemon is uploaded silently as
+/// before (no sessions to lose); a mismatch on a remote WITH live
+/// sessions surfaces the confirmation gate.
+fn probeRunningDaemonSessionCount(
+    alloc: Allocator,
+    sess: *ssh.SshSession,
+    binary_path: []const u8,
+) ?u32 {
+    const list_cmd = std.fmt.allocPrint(
+        alloc,
+        "{s} " ++ shared.remote_subcommand ++ " --list",
+        .{binary_path},
+    ) catch return null;
+    defer alloc.free(list_cmd);
+
+    const result = sess.exec(list_cmd) catch return null;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    if (result.exit_code != 0) return null;
+
+    // Count non-empty lines. Empty output ⇒ daemon not running (the
+    // socket connect failed and listSessions returned early) OR the
+    // daemon is up with zero sessions; either way there is nothing to
+    // protect, so treat both as "no running daemon" (null).
+    var count: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        count += 1;
+    }
+    if (count == 0) return null;
+    return count;
 }
 
 /// Download a pre-built daemon binary from GitHub releases and install
@@ -766,18 +996,80 @@ fn resolveRemoteInfo(alloc: Allocator, sess: *ssh.SshSession) !RemoteInfo {
     return .{ .home = home_owned, .os = os_owned, .arch = arch_owned };
 }
 
+/// Build an inline env-var prefix for the remote daemon launch command that
+/// carries an embedder-supplied control shim, sourced from THIS process's
+/// environment (the embedder, e.g. cmux, sets `GHOSTTY_REMOTE_SHIM_*` before
+/// opening connections). The forked remote daemon inherits these vars and
+/// installs the shim on the session PATH (see `daemon.installEmbedderShim`).
+/// Returns an empty string when no shim is configured, so non-embedder callers
+/// (and the GTK/CLI paths) are unaffected. Caller owns the returned slice.
+fn buildShimEnvPrefix(alloc: Allocator) ![]u8 {
+    const name = posix.getenv(control_bridge_config.env_shim_name) orelse
+        return alloc.dupe(u8, "");
+    const body = posix.getenv(control_bridge_config.env_shim_body_b64) orelse
+        return alloc.dupe(u8, "");
+    if (name.len == 0 or body.len == 0) return alloc.dupe(u8, "");
+    const mode = posix.getenv(control_bridge_config.env_shim_mode) orelse "755";
+
+    // Values are single-quoted for the remote shell. The body is base64 (safe
+    // chars only); guard the embedder-controlled name/mode against a quote that
+    // would break the inline quoting (the daemon also validates the name).
+    if (std.mem.indexOfScalar(u8, name, '\'') != null or
+        std.mem.indexOfScalar(u8, mode, '\'') != null)
+    {
+        return alloc.dupe(u8, "");
+    }
+
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}='{s}' {s}='{s}' {s}='{s}' ",
+        .{
+            control_bridge_config.env_shim_name,     name,
+            control_bridge_config.env_shim_body_b64, body,
+            control_bridge_config.env_shim_mode,     mode,
+        },
+    );
+}
+
 /// Launch the remote session daemon via ghostty's --daemonize flag.
 /// If `force_restart` is true, kills any existing daemon first (used
 /// when the binary was re-provisioned with a new protocol version).
+///
+/// cmux execve self-handoff (Phase 2, GATED): when `reexec_target` is non-null
+/// (client gate on AND running daemon answered `REEXEC 1`), first ask the
+/// running daemon to execve-replace itself with that binary — preserving live
+/// shells. The `--kill-daemon` step is then skipped on a successful handoff,
+/// but the trailing `--daemonize` net ALWAYS runs: on a healthy handoff it is a
+/// no-op (the carried listener answers `canConnect`); on a successor that
+/// crashed during adoption it is the only recovery (fork fresh = today).
 pub fn ensureRemoteDaemon(
     alloc: Allocator,
     ctx: *const SshContext,
     remote_bin_path: []const u8,
     force_restart: bool,
+    reexec_target: ?[]const u8,
 ) !void {
     var sess = ctx.session orelse return error.RemoteCommandFailed;
 
-    if (force_restart) {
+    var reexec_ok = false;
+    if (reexec_target) |newbin| {
+        const reexec_cmd = try std.fmt.allocPrint(
+            alloc,
+            "{s} " ++ shared.remote_subcommand ++ " --reexec {s}",
+            .{ remote_bin_path, newbin },
+        );
+        defer alloc.free(reexec_cmd);
+        const r = sess.exec(reexec_cmd) catch null;
+        if (r) |res| {
+            defer alloc.free(res.stdout);
+            defer alloc.free(res.stderr);
+            // exit 0 = EOF without a preceding `.err` (handoff launched).
+            reexec_ok = res.exit_code == 0;
+        }
+        log.info("reexec handoff requested newbin={s} ok={}", .{ newbin, reexec_ok });
+    }
+
+    if (!reexec_ok and force_restart) {
         // Kill any existing daemon — the old one may be running old code
         // in memory even after the binary was re-uploaded.
         const kill_cmd = try std.fmt.allocPrint(
@@ -793,10 +1085,19 @@ pub fn ensureRemoteDaemon(
         }
     }
 
+    // Prefix the launch with any embedder control-shim env (empty when none),
+    // so the forked daemon inherits + installs the shim on the session PATH.
+    const shim_prefix = try buildShimEnvPrefix(alloc);
+    defer alloc.free(shim_prefix);
+
+    // When the client gate is on, birth new daemons reexec-capable so the NEXT
+    // update can hand off in-place. Ungated daemons answer `REEXEC 0`.
+    const reexec_prefix: []const u8 = if (clientReexecGateOn()) "GHOSTTY_SSH_REEXEC=1 " else "";
+
     const cmd = try std.fmt.allocPrint(
         alloc,
-        "{s} " ++ shared.remote_subcommand ++ " --daemonize",
-        .{remote_bin_path},
+        "{s}{s}{s} " ++ shared.remote_subcommand ++ " --daemonize",
+        .{ reexec_prefix, shim_prefix, remote_bin_path },
     );
     defer alloc.free(cmd);
 
@@ -1087,11 +1388,15 @@ pub fn attachRemoteSurface(
         return err;
     };
     const remote_bin_path = provision.path;
+    // cmux execve self-handoff: the reexec target (when present) is only needed
+    // for the ensureRemoteDaemon call below; free it on every path afterward.
+    defer if (provision.reexec_target) |rt| alloc.free(rt);
 
     // Only force-restart the daemon if the binary was re-provisioned
     // (version mismatch). Otherwise reuse the running daemon to
-    // preserve existing sessions.
-    ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, provision.provisioned) catch |err| {
+    // preserve existing sessions. When a reexec target is set, prefer an
+    // in-place execve handoff (preserves live shells across the update).
+    ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, provision.provisioned, provision.reexec_target) catch |err| {
         alloc.free(remote_bin_path);
         pushAttachState(mailbox, entry, .{ .failed = .helper_failed });
         return err;

@@ -37,6 +37,14 @@ pub const SurfaceSlot = struct {
     /// True after prependBlankPages has been called for this surface.
     /// Prevents duplicate prepends on reconnect.
     history_prepended: bool = false,
+    /// Set when a `snapshot_begin` frame is received for this surface (the
+    /// daemon is about to send a full-viewport snapshot). On the NEXT
+    /// `data_out` for this surface the client resets the terminal + VT parser
+    /// to a clean baseline before applying the snapshot, then clears this
+    /// flag. Guarantees the snapshot lands on a known-empty state with no
+    /// desync from leftover partial state. Old daemons never send
+    /// snapshot_begin, so this stays false and behavior is unchanged.
+    pending_snapshot_reset: bool = false,
 };
 
 /// A group of surfaces sharing the same remote session (group_id).
@@ -206,12 +214,26 @@ pub const Entry = struct {
     // Reconnect IPC pipe (write end signaled from GTK thread, read end polled by SSH thread)
     reconnect_pipe: [2]posix.fd_t = .{ -1, -1 },
 
+    /// Always-present cancel pipe. Created in acquire() so it exists for the
+    /// FIRST tcpConnect — before quit_pipe/reconnect_pipe are created in
+    /// attachRemoteSurface. The read end (cancel_pipe[0]) is wired into
+    /// ctx.cancel_fd and polled by tcpConnect; the write end is latched by
+    /// Remote.requestStop on surface teardown so a dead-host connect aborts
+    /// promptly instead of blocking io_thr.join. Closed in release()/deinit().
+    cancel_pipe: [2]posix.fd_t = .{ -1, -1 },
+
     // Atomic flags for manual reconnect / cancel (set from GTK thread, read by SSH thread)
     reconnect_requested: std.atomic.Value(bool) = .{ .raw = false },
     cancel_reconnect: std.atomic.Value(bool) = .{ .raw = false },
 
     // Authentication state (for password prompts)
     auth_state: AuthState = .{},
+
+    // Remote-daemon update-confirmation gate state. The SSH setup
+    // thread blocks on this when a session-killing daemon update needs
+    // user approval; the UI thread (or C-API submit) records the
+    // decision and signals the cond. Mirrors `auth_state`.
+    update_state: UpdateState = .{},
 
     // Session list query state (set by requester, collected by SSH thread)
     session_list: SessionListState = .{},
@@ -233,6 +255,7 @@ pub const Entry = struct {
     last_state: ?session.protocol.ConnectionState = null,
 
     pub const AuthState = session.shared.AuthState;
+    pub const UpdateState = session.shared.UpdateState;
 
     /// A connection-state subscriber registered via
     /// `registerStateListener`. `ctx` is the caller's identity (also
@@ -270,6 +293,8 @@ pub fn deinit(self: *SshConnectionManager) void {
         self.alloc.free(kv.key_ptr.*);
         const entry = kv.value_ptr.*;
         if (entry.remote_bin_path.len > 0) self.alloc.free(entry.remote_bin_path);
+        if (entry.cancel_pipe[0] != -1) posix.close(entry.cancel_pipe[0]);
+        if (entry.cancel_pipe[1] != -1) posix.close(entry.cancel_pipe[1]);
         if (entry.channel) |*ch| ch.close();
         for (entry.write_queue.items) |req| {
             entry.alloc.free(req.data);
@@ -329,16 +354,29 @@ pub fn acquire(
         return entry;
     }
 
+    // Always-present cancel pipe — created here so it exists for the FIRST
+    // tcpConnect (quit_pipe/reconnect_pipe are only created later in
+    // attachRemoteSurface). Its read end feeds ctx.cancel_fd so a teardown
+    // can abort an in-flight connect.
+    const cancel_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(cancel_pipe[0]);
+        posix.close(cancel_pipe[1]);
+    }
+
     const entry = try self.alloc.create(Entry);
+    errdefer self.alloc.destroy(entry);
     entry.* = .{
         .alloc = self.alloc,
         .ctx = .{
             .alloc = self.alloc,
             .ssh_target = ssh_target,
             .jump = jump,
+            .cancel_fd = cancel_pipe[0],
         },
         .remote_bin_path = &.{},
         .ref_count = 1,
+        .cancel_pipe = cancel_pipe,
         .sessions = std.AutoArrayHashMap(Uuid, *Session).init(self.alloc),
     };
     try self.connections.put(key, entry);
@@ -600,6 +638,14 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
             if (entry.reconnect_pipe[1] != -1) posix.close(entry.reconnect_pipe[1]);
         }
 
+        // Close the always-present cancel pipe. It exists even when the SSH
+        // thread was never spawned (e.g. the initial connect was aborted), so
+        // close it unconditionally here. tcpConnect only polls cancel_pipe[0]
+        // and requestStop only writes cancel_pipe[1] — neither closes — so
+        // release owns the close and there is no double-close.
+        if (entry.cancel_pipe[0] != -1) posix.close(entry.cancel_pipe[0]);
+        if (entry.cancel_pipe[1] != -1) posix.close(entry.cancel_pipe[1]);
+
         // Clean up remaining write queue
         for (entry.write_queue.items) |req| {
             entry.alloc.free(req.data);
@@ -623,6 +669,55 @@ pub fn release(self: *SshConnectionManager, ssh_target: []const u8, jump: ?[]con
         const removed = self.connections.fetchOrderedRemove(key);
         if (removed) |r| self.alloc.free(r.key);
     }
+}
+
+/// Abort an in-flight initial-connect / reconnect for the connection keyed by
+/// (ssh_target, jump), if this is the LAST reference. Called from the MAIN
+/// thread during surface teardown (via Remote.requestStop) immediately before
+/// io_thr.join(), so a dead-host connect aborts instead of hanging the join.
+///
+/// The whole body runs under `mutex` — the SAME lock `release()` holds for its
+/// entire teardown (including `destroy(entry)`). That serialization is
+/// load-bearing: the cancel signals below unblock the IO thread, which then
+/// unwinds into `release()` and frees the Entry. Holding `mutex` guarantees
+/// `release()` cannot free the Entry until we finish touching its fields,
+/// closing the use-after-free window. Lock order is `mutex` → `auth_state.mutex`
+/// (no path takes them in the reverse order), so this is deadlock-free.
+pub fn abortInFlightConnect(
+    self: *SshConnectionManager,
+    ssh_target: []const u8,
+    jump: ?[]const u8,
+) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    const key = makeKey(self.alloc, ssh_target, jump) catch return;
+    defer self.alloc.free(key);
+
+    const entry = self.connections.get(key) orelse return;
+
+    // Only the last reference may latch a cancel — a shared (ref_count>1) live
+    // connection must keep working for the surviving sibling.
+    if (entry.ref_count > 1) return;
+
+    // Latch the always-present cancel pipe (created in acquire): aborts an
+    // in-flight tcpConnect on the IO thread (initial connect) OR the SSH
+    // thread (reconnect). Write-only here; release()/deinit own the close.
+    if (entry.cancel_pipe[1] != -1)
+        _ = posix.write(entry.cancel_pipe[1], "c") catch {};
+
+    // Make the reconnect loop bail promptly to its quit-parked wait. Inert in
+    // steady state: the main SSH poll does not watch reconnect_pipe, so this
+    // byte is simply drained on the next reconnect or closed at release.
+    entry.cancel_reconnect.store(true, .release);
+    if (entry.reconnect_pipe[1] != -1)
+        _ = posix.write(entry.reconnect_pipe[1], "c") catch {};
+
+    // Unblock a password-prompt cond wait (not poll-interruptible).
+    entry.auth_state.mutex.lock();
+    entry.auth_state.cancelled = true;
+    entry.auth_state.cond.signal();
+    entry.auth_state.mutex.unlock();
 }
 
 // SSH thread — exclusively owns all libssh2 calls for one connection.
@@ -661,6 +756,14 @@ pub fn sshThreadMain(entry: *Entry) void {
     var last_keepalive_sent: i128 = now_init;
     entry.last_keepalive_received = now_init;
     entry.keepalive_active = false;
+
+    // Transport-level keepalive (libssh2). Distinct from the cmux
+    // session-protocol channel ping/pong above: this emits SSH transport
+    // keepalives that reset the remote sshd's ClientAlive/idle timer so
+    // sshd does not tear the transport down (the 15s = 5s*3 ClientAlive
+    // disconnect that manifested as an EOF-driven reconnect flicker).
+    // Due immediately on the first loop so we never start behind.
+    var next_transport_keepalive_at: i128 = now_init;
 
     while (true) {
         // 1. Process SSH transport (needed for tunneled sessions).
@@ -712,8 +815,18 @@ pub fn sshThreadMain(entry: *Entry) void {
                 const reconnect_now = std.time.nanoTimestamp();
                 last_keepalive_sent = reconnect_now;
                 entry.last_keepalive_received = reconnect_now;
+                next_transport_keepalive_at = reconnect_now;
                 sess = &entry.ctx.session.?;
                 channel = &entry.channel.?;
+                // Discard any partial frame bytes left over from the OLD
+                // channel. The reopened channel is a fresh stream starting at
+                // frame offset 0; concatenating the stale tail with the new
+                // bytes mis-aligns the (sync-markerless) frame parser, which
+                // silently consumes/drops real `.data_out` terminal output
+                // mid-UTF-8 → permanent scrambling (U+FFFD) until it happens
+                // to realign. reopenSurfaces re-sends the attach, so the stale
+                // tail carries nothing we need.
+                frame_buf.clearRetainingCapacity();
                 broadcastConnectionState(entry, .connected);
                 continue;
             }
@@ -767,6 +880,24 @@ pub fn sshThreadMain(entry: *Entry) void {
             last_keepalive_sent = now;
         }
 
+        // 4b. Transport-level keepalive: emit an SSH transport keepalive
+        //     (keepalive@openssh.com, want_reply=1) when due so the remote
+        //     sshd's ClientAlive/idle timer is reset and it does not tear
+        //     the transport down. keepaliveSend returns the seconds until
+        //     the next one is due; we schedule off that. A transient send
+        //     error is non-fatal (keepaliveSend logs and returns 0) — we do
+        //     NOT trigger attemptReconnect here, since the channel EOF and
+        //     stale-pong paths already cover genuine transport loss.
+        if (now >= next_transport_keepalive_at) {
+            entry.libssh2_mutex.lock();
+            const seconds_to_next = sess.keepaliveSend();
+            entry.libssh2_mutex.unlock();
+            // Clamp the reschedule so a stale/garbage value can't push the
+            // next keepalive past the 15s sshd disconnect window.
+            const next_s: u32 = @min(seconds_to_next, session.client.transport_keepalive_interval_s);
+            next_transport_keepalive_at = now + @as(i128, next_s) * std.time.ns_per_s;
+        }
+
         if (entry.keepalive_active and
             now - entry.last_keepalive_received > session.protocol.keepalive_stale_ns)
         {
@@ -779,10 +910,16 @@ pub fn sshThreadMain(entry: *Entry) void {
                 const reconnect_now = std.time.nanoTimestamp();
                 last_keepalive_sent = reconnect_now;
                 entry.last_keepalive_received = reconnect_now;
+                next_transport_keepalive_at = reconnect_now;
 
                 // Update local references (session/channel may have changed)
                 sess = &entry.ctx.session.?;
                 channel = &entry.channel.?;
+
+                // Discard stale partial-frame bytes from the old channel — see
+                // the EOF reconnect path above; carrying them across the reopen
+                // desyncs the frame parser and scrambles terminal output.
+                frame_buf.clearRetainingCapacity();
 
                 // Notify surfaces that we're back
                 broadcastConnectionState(entry, .connected);
@@ -801,9 +938,15 @@ pub fn sshThreadMain(entry: *Entry) void {
         entry.libssh2_mutex.unlock();
         if (sess_needs_write) pollfds[0].events |= posix.POLL.OUT;
 
-        // 6. Compute poll timeout: wake up in time to send the next ping
+        // 6. Compute poll timeout: wake up in time to send the next
+        //    session-protocol ping AND the next transport-level keepalive,
+        //    whichever is sooner. Missing the transport keepalive deadline
+        //    is what lets sshd disconnect the transport, so it must gate the
+        //    poll timeout too.
         const elapsed_since_send = now - last_keepalive_sent;
-        const remaining_ns = session.protocol.keepalive_interval_ns - elapsed_since_send;
+        const remaining_ping_ns = session.protocol.keepalive_interval_ns - elapsed_since_send;
+        const remaining_transport_ns = next_transport_keepalive_at - now;
+        const remaining_ns = @min(remaining_ping_ns, remaining_transport_ns);
         const timeout_ms: i32 = if (remaining_ns <= 0)
             1
         else
@@ -1076,7 +1219,10 @@ fn attemptReconnect(entry: *Entry) bool {
 }
 
 /// Re-open sessions for registered surfaces using their stable IDs after reconnect.
-/// Sends one open per session (group), using the first surface in each.
+/// Sends one `surface_attach` Open per surface in each session (group) — NOT just
+/// the first surface. Each surface re-enters the daemon's viewers list keyed by its
+/// own target_id and receives its own snapshot, so every pane of a split group is
+/// resynced. The shared group_id ties them to the same remote session.
 fn reopenSurfaces(entry: *Entry) void {
     entry.surfaces_mutex.lock();
     defer entry.surfaces_mutex.unlock();
@@ -1091,26 +1237,46 @@ fn reopenSurfaces(entry: *Entry) void {
             surf.history_prepended = false;
         }
 
-        const s = sess.surfaces.items[0];
+        // Re-attach EVERY surface in the group, each with its own surface_id,
+        // target_id, label, and LIVE grid size. Without this, surfaces[1+] of a
+        // split group never re-enter the daemon viewers list and get nothing
+        // after reconnect.
+        for (sess.surfaces.items) |s| {
+            // Re-open at the surface's CURRENT grid size, not a hardcoded 24x80.
+            // A stale 24x80 resizes the remote PTY on every reconnect, so a wider
+            // TUI then redraws column-misaligned against an 80-col PTY and corrupts
+            // output (compounding any frame-desync scramble). Read the live size
+            // from the surface terminal under its renderer lock (the same lock
+            // dispatchFrame takes); fall back to 24x80 only if unreadable.
+            var attach_rows: u16 = 24;
+            var attach_cols: u16 = 80;
+            {
+                s.io.renderer_state.mutex.lock();
+                defer s.io.renderer_state.mutex.unlock();
+                const t = s.io.renderer_state.terminal;
+                if (t.rows > 0 and t.cols > 0) {
+                    attach_rows = @intCast(t.rows);
+                    attach_cols = @intCast(t.cols);
+                }
+            }
 
-        const open_payload = (session.protocol.Open{
-            .open_type = .session_attach,
-            .resize = .{ .rows = 24, .cols = 80, .width_px = 0, .height_px = 0 },
-            .surface_id = s.surface_id,
-            .group_id = sess.group_id,
-            .max_scrollback = entry.scrollback_limit,
-            .label = s.label orelse "reconnected",
-        }).encode(entry.alloc) catch continue;
-        defer entry.alloc.free(open_payload);
-        sendFrame(&entry.channel.?, .open, s.target_id, open_payload) catch {
-            log.warn("reconnect: failed to re-open session target={d}", .{s.target_id});
-            // Notify all surfaces in this session
-            for (sess.surfaces.items) |surf| {
-                _ = surf.surface_mailbox.push(.{
+            const open_payload = (session.protocol.Open{
+                .open_type = .surface_attach,
+                .resize = .{ .rows = attach_rows, .cols = attach_cols, .width_px = 0, .height_px = 0 },
+                .surface_id = s.surface_id,
+                .group_id = sess.group_id,
+                .max_scrollback = entry.scrollback_limit,
+                .label = s.label orelse "reconnected",
+            }).encode(entry.alloc) catch continue;
+            defer entry.alloc.free(open_payload);
+            sendFrame(&entry.channel.?, .open, s.target_id, open_payload) catch {
+                log.warn("reconnect: failed to re-open surface target={d}", .{s.target_id});
+                // Notify just this surface — the others are attached independently.
+                _ = s.surface_mailbox.push(.{
                     .child_exited = .{ .exit_code = 1, .runtime_ms = 0 },
                 }, .{ .forever = {} });
-            }
-        };
+            };
+        }
     }
 }
 
@@ -1155,7 +1321,7 @@ pub fn tryOpenChannel(entry: *Entry) ?ssh.Channel {
     } else |_| {}
 
     // Daemon might be dead — try starting without killing existing one first
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false) catch return null;
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false, null) catch return null;
 
     return session.client.openClientMuxChannel(alloc, &entry.ctx, remote_bin_path) catch null;
 }
@@ -1197,7 +1363,7 @@ pub fn tryReopenTerminalChannel(entry: *Entry) ?ssh.Channel {
     } else |_| {}
 
     // Daemon might be dead — try starting without killing the existing one.
-    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false) catch return null;
+    session.client.ensureRemoteDaemon(alloc, &entry.ctx, remote_bin_path, false, null) catch return null;
 
     return session.client.openMultiplexChannel(alloc, &entry.ctx, remote_bin_path) catch null;
 }
@@ -1313,6 +1479,15 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
         };
         const kind = header.kind;
         const frame_target = header.target;
+        // Defense-in-depth: a header whose len exceeds max_payload is a desync
+        // (the frame format has no sync marker, so a garbage byte can parse as
+        // a plausible kind with a bogus 4-byte len). Trusting it would either
+        // stall forever waiting for gigabytes (the `break` below) or over-
+        // consume real output. Treat it as a desync — drop one byte and rescan.
+        if (header.len > session.protocol.max_payload) {
+            shiftBuffer(frame_buf, 1);
+            continue;
+        }
         const total = session.protocol.header_size + header.len;
         if (frame_buf.items.len < total) break;
 
@@ -1410,7 +1585,30 @@ fn processFrames(frame_buf: *std.ArrayList(u8), entry: *Entry) void {
 
 fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, payload: []const u8) void {
     switch (kind) {
+        .snapshot_begin => {
+            // The daemon is about to send a full-viewport snapshot for this
+            // target. Mark the surface so the NEXT data_out resets the
+            // terminal + VT parser to a clean baseline before applying the
+            // snapshot. We persist this on the slot (not the by-value `s`
+            // copy) so it survives to the following frame. Caller holds
+            // surfaces_mutex, so findSurfaceSlotPtr is safe here.
+            if (findSurfaceSlotPtr(entry, s.target_id)) |slot| {
+                slot.pending_snapshot_reset = true;
+            }
+        },
         .data_out => {
+            // If a snapshot_begin preceded this data_out, reset the terminal
+            // and VT parsing state to a clean baseline first so the snapshot
+            // lands on a known-empty terminal (no desync). resetForSnapshot
+            // acquires renderer_state.mutex itself, so it must run before we
+            // take any lock here. Clear the flag so subsequent live data_out
+            // frames are applied normally.
+            if (findSurfaceSlotPtr(entry, s.target_id)) |slot| {
+                if (slot.pending_snapshot_reset) {
+                    slot.pending_snapshot_reset = false;
+                    s.io.resetForSnapshot();
+                }
+            }
             // Suppress write-back responses (DA, DSR, OSC colors, etc.) during
             // remote data processing. The daemon already responded to queries.
             s.io.terminal_stream.handler.suppress_responses = true;
@@ -1448,20 +1646,17 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
             opened_msg.remote_opened.color = parsed.color;
             _ = s.surface_mailbox.push(opened_msg, .{ .forever = {} });
 
-            // Pre-allocate blank history pages for scrollback restore.
-            // Guard with history_prepended to prevent duplicate prepends on reconnect.
-            if (parsed.history_rows > 0) {
-                const already = findSurfaceSlotPtr(entry, s.target_id);
-                if (already == null or !already.?.history_prepended) {
-                    s.io.renderer_state.mutex.lock();
-                    defer s.io.renderer_state.mutex.unlock();
-                    const t = s.io.renderer_state.terminal;
-                    t.screens.active.pages.prependBlankPages(parsed.history_rows) catch |err| {
-                        log.warn("failed to prepend history pages: {}", .{err});
-                    };
-                    if (already) |slot| slot.history_prepended = true;
-                }
-            }
+            // NOTE: blank history pages for scrollback restore are NOT
+            // prepended here. The daemon sends `opened` BEFORE the
+            // `snapshot_begin`+`data_out` pair, and that `data_out` runs
+            // `resetForSnapshot()` → `terminal.fullReset()` →
+            // `Screen.reset()` → `pages.reset()`, which DROPS every page —
+            // including any we prepended here. The following
+            // `scrollback_response` chunks would then land on a terminal with
+            // no history rows and scramble the screen. So the prepend is
+            // deferred to the `.scrollback_response` handler below, which runs
+            // AFTER the snapshot reset, on a clean terminal. (`history_rows`
+            // is re-derived there from `total_history_rows`.)
 
             // If layout blob is included, send it to surface for tree recreation.
             // Bundle group_id/surface_id in the message to avoid a race:
@@ -1506,6 +1701,24 @@ fn dispatchFrame(entry: *Entry, kind: session.protocol.Kind, s: SurfaceSlot, pay
             s.io.renderer_state.mutex.lock();
             defer s.io.renderer_state.mutex.unlock();
             const t = s.io.renderer_state.terminal;
+
+            // Pre-allocate the blank history pages on the FIRST chunk, here —
+            // AFTER the snapshot's `data_out` already ran `fullReset()`. Doing
+            // this in the `.opened` handler instead places the blank pages
+            // BEFORE that reset, which drops them and scrambles the restored
+            // screen (see the note in the `.opened` handler). Guard with
+            // `history_prepended` (reset per-surface on reconnect in
+            // `reopenSurfaces`) so we prepend exactly once per attach.
+            // `surfaces_mutex` is held by the caller, so findSurfaceSlotPtr is
+            // safe.
+            if (findSurfaceSlotPtr(entry, s.target_id)) |slot| {
+                if (!slot.history_prepended and resp.total_history_rows > 0) {
+                    t.screens.active.pages.prependBlankPages(resp.total_history_rows) catch |err| {
+                        log.warn("failed to prepend history pages: {}", .{err});
+                    };
+                    slot.history_prepended = true;
+                }
+            }
 
             page_diff.applyScrollbackChunk(
                 t,

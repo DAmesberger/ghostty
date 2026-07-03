@@ -835,6 +835,14 @@ pub fn deinit(self: *Surface) void {
     {
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
+
+        // Abort any in-flight SSH connect/reconnect BEFORE joining. A dead
+        // host otherwise blocks the IO thread in tcpConnect (up to 30s) or
+        // the reconnect backoff forever, and stop.notify() above cannot
+        // wake an IO thread that never reached its libxev event loop. No-op
+        // for exec and for an already-connected remote.
+        self.io.requestStop();
+
         self.io_thr.join();
     }
 

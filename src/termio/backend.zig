@@ -117,6 +117,16 @@ pub const Backend = union(Kind) {
             ),
         }
     }
+
+    /// Abort any in-flight connect/reconnect so a teardown join doesn't
+    /// block. Called from the MAIN thread before io_thr.join(). No-op for
+    /// exec; remote aborts a stuck SSH connect (e.g. a dead host).
+    pub fn requestStop(self: *Backend) void {
+        switch (self.*) {
+            .exec => {},
+            .remote => |*remote| remote.requestStop(),
+        }
+    }
 };
 
 /// Termio thread data. See termio.ThreadData for docs.

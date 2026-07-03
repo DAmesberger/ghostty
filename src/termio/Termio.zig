@@ -391,6 +391,13 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
+/// Abort any in-flight backend connect/reconnect so a teardown join does
+/// not block. Called from the MAIN thread before io_thr.join(). No-op for
+/// the exec backend; the remote backend aborts a stuck SSH connect.
+pub fn requestStop(self: *Termio) void {
+    self.backend.requestStop();
+}
+
 /// Send a message to the the mailbox. Depending on the mailbox type in
 /// use this may process now or it may just enqueue and process later.
 ///
@@ -681,6 +688,41 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.processOutputLocked(buf);
+}
+
+/// Reset the terminal and VT parsing state to a clean slate so that a
+/// fresh daemon snapshot (a full serialized viewport) is applied to a known
+/// baseline instead of being layered on top of whatever partial/stale state
+/// the previous connection left behind. This is the no-desync guarantee:
+/// every reconnect snapshot lands on an identical, fully-reset terminal.
+///
+/// This MUST be a direct field reset rather than feeding an in-band `ESC c`
+/// (RIS) into the stream: `nextSlice` drains the stale utf8decoder and
+/// escape-parser state using the INCOMING bytes first (see stream.zig
+/// nextSliceCapped), so an in-band RIS could itself be consumed as the tail
+/// of a half-decoded UTF-8 sequence or a partial escape and never reach the
+/// terminal. Resetting the fields directly is the only way to guarantee a
+/// clean baseline regardless of what bytes were mid-flight.
+///
+/// Caller contract: this acquires renderer_state.mutex itself; do NOT hold
+/// it when calling.
+pub fn resetForSnapshot(self: *Termio) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    // Reset the escape-sequence parser to ground and clear any partially
+    // accumulated parameters / intermediates so the first byte of the
+    // snapshot is parsed fresh.
+    self.terminal_stream.parser.state = .ground;
+    self.terminal_stream.parser.clear();
+
+    // Reset the UTF-8 decoder so any half-decoded multibyte sequence left
+    // over from the previous connection is discarded.
+    self.terminal_stream.utf8decoder = .{};
+
+    // Reset the terminal itself (screen, cursor, modes, charsets, scroll
+    // region, etc.) to power-on defaults.
+    self.terminal.fullReset();
 }
 
 /// Process output from readdata but the lock is already held.

@@ -319,6 +319,29 @@ pub const App = struct {
                 },
             },
 
+            // A re-attached daemon group bundles a serialized layout blob
+            // with its `opened` response. The GTK apprt rebuilds the split
+            // tree from `pending_layout_restore` itself; the embedded apprt
+            // (cmux) instead parses the blob here and hands the embedder a
+            // flat list of leaf surface UUIDs via `on_remote_layout` so it
+            // can re-open each pre-existing PTY by UUID. The blob lives on
+            // the core surface only for the duration of this action (see
+            // `Surface.zig`'s `layout_restore` message handler), so read it
+            // synchronously here before returning to the generic action
+            // callback. cmux returns `true` from that callback, so the
+            // generic path is a no-op for `restore_layout`.
+            .restore_layout => switch (target) {
+                .app => {},
+                .surface => |core_surface| {
+                    if (core_surface.pending_layout_restore) |blob| {
+                        core_surface.rt_surface.remoteLayout(
+                            core_surface.pending_layout_group_id,
+                            blob,
+                        );
+                    }
+                },
+            },
+
             else => {},
         }
     }
@@ -438,6 +461,22 @@ pub const Surface = struct {
         *const ssh_capi.State,
     ) callconv(.c) void = null,
 
+    /// Stored copy of the embedder's `on_remote_layout` callback (if any).
+    /// Invoked from the `restore_layout` action path on the FIRST surface
+    /// of a re-attached group: the daemon's `opened` response bundles a
+    /// serialized layout blob describing every surface (and the split
+    /// tree) that belonged to the group. The embedded apprt parses the
+    /// blob and hands the embedder a flat array of leaf surface UUIDs so
+    /// cmux can re-open each pre-existing PTY by UUID (driving
+    /// `surface_attach` reattach) and rebuild the split layout — instead
+    /// of leaving the workspace with a single attached surface.
+    on_remote_layout_cb: ?*const fn (
+        ?*anyopaque,
+        *const [16]u8, // group_id
+        [*]const [16]u8, // surface_ids
+        usize, // surface_ids count
+    ) callconv(.c) void = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -545,6 +584,24 @@ pub const Surface = struct {
             ?*anyopaque,
             *const ssh_capi.State,
         ) callconv(.c) void = null,
+
+        /// Callback fired on the FIRST surface of a re-attached daemon
+        /// group when the `opened` response includes a serialized layout
+        /// blob. The embedded apprt parses the blob and passes the group
+        /// id plus a flat array of leaf surface UUIDs (all 16-byte raw
+        /// `session.shared.Uuid`). Both pointers are only valid for the
+        /// duration of the callback — copy if you need to retain. The
+        /// embedder re-opens each surface by UUID to reattach the existing
+        /// PTYs (driving `surface_attach`) and rebuild the split layout.
+        /// Userdata is the same opaque pointer passed in `Options.userdata`.
+        /// Fires zero or one time per surface. Ignored when `ssh_target`
+        /// is null or the daemon sends no layout blob.
+        on_remote_layout: ?*const fn (
+            ?*anyopaque,
+            *const [16]u8,
+            [*]const [16]u8,
+            usize,
+        ) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -554,6 +611,7 @@ pub const Surface = struct {
             .userdata = opts.userdata,
             .on_remote_opened_cb = opts.on_remote_opened,
             .on_remote_state_cb = opts.on_remote_state,
+            .on_remote_layout_cb = opts.on_remote_layout,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -906,6 +964,51 @@ pub const Surface = struct {
     ) void {
         const cb = self.on_remote_opened_cb orelse return;
         cb(self.userdata, &group_id, &surface_id);
+    }
+
+    /// Parse the daemon's serialized layout blob (bundled with the
+    /// `opened` response for a re-attached group) into a flat array of
+    /// leaf surface UUIDs and forward it to the embedder via the
+    /// `on_remote_layout` callback. Called from the embedded
+    /// `restore_layout` action path, which routes here instead of
+    /// surfacing the raw blob to the generic action callback. No-op when
+    /// the embedder did not register a callback, when the blob is empty,
+    /// or when the blob contains no leaf surfaces. The temporary UUID
+    /// array is stack/heap-allocated only for the callback's duration.
+    pub fn remoteLayout(
+        self: *Surface,
+        group_id: session.shared.Uuid,
+        blob: []const u8,
+    ) void {
+        const cb = self.on_remote_layout_cb orelse return;
+        if (blob.len == 0) return;
+
+        const alloc = self.app.core_app.alloc;
+        var parsed = session.layout.deserialize(alloc, blob) catch |err| {
+            log.warn("remoteLayout: failed to parse layout blob err={}", .{err});
+            return;
+        };
+        defer parsed.deinit(alloc);
+
+        // Flatten every leaf surface UUID across all tabs in node order.
+        // cmux currently restores into a single tab/split tree, so the
+        // flat list is sufficient for the common one-tab case and the
+        // multi-pane split case. Skip the all-zero surface ids the daemon
+        // may emit for never-opened placeholders.
+        var ids = std.ArrayList(session.shared.Uuid).empty;
+        defer ids.deinit(alloc);
+        for (parsed.tabs) |tab| {
+            for (tab.nodes) |node| switch (node) {
+                .leaf => |leaf| {
+                    if (session.shared.isZeroUuid(leaf.surface_id)) continue;
+                    ids.append(alloc, leaf.surface_id) catch return;
+                },
+                .split => {},
+            };
+        }
+
+        if (ids.items.len == 0) return;
+        cb(self.userdata, &group_id, ids.items.ptr, ids.items.len);
     }
 
     /// Forward this surface's `Remote` backend connection-state
