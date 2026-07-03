@@ -300,52 +300,6 @@ extension Ghostty {
             return channel
         }
 
-        /// Attach (or re-attach) a terminal surface over this connection.
-        /// Pass `nil` for either UUID to let libghostty generate one.
-        public func attachSurface(
-            groupID: UUID?,
-            surfaceID: UUID?,
-            size: TerminalSize,
-            label: String
-        ) throws -> SSHChannel<TerminalService> {
-            let channel = SSHChannel<TerminalService>(service: TerminalService(), connection: self)
-            let channelBox = ChannelBox()
-            channelBox.attach(channel)
-            channel.userdataBox = channelBox
-
-            let cHandle: ghostty_channel_t? = label.withCString { labelPtr in
-                Self.withOptionalUUIDBytes(groupID) { groupPtr in
-                    Self.withOptionalUUIDBytes(surfaceID) { surfacePtr in
-                        var cbs = ghostty_channel_callbacks_t(
-                            on_opened: SSHConnection.cOnChannelOpened,
-                            on_data: SSHConnection.cOnChannelData,
-                            on_window_credit: SSHConnection.cOnChannelWindowCredit,
-                            on_eof: SSHConnection.cOnChannelEOF,
-                            on_close: SSHConnection.cOnChannelClose,
-                            userdata: Unmanaged.passUnretained(channelBox).toOpaque()
-                        )
-                        return ghostty_ssh_attach_surface(
-                            requireHandle(),
-                            groupPtr,
-                            surfacePtr,
-                            size.rows,
-                            size.cols,
-                            size.widthPx,
-                            size.heightPx,
-                            labelPtr,
-                            &cbs
-                        )
-                    }
-                }
-            }
-            guard let h = cHandle else {
-                channelBox.detach()
-                throw SSHError.channelOpenFailed
-            }
-            channel.handle = h
-            return channel
-        }
-
         public func listSessions() async throws -> [SessionListEntry] {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[SessionListEntry], Swift.Error>) in
                 let collector = SessionListCollector(continuation: cont)
@@ -385,21 +339,6 @@ extension Ghostty {
             withUnsafeBytes(of: &bytes) { raw in
                 let ptr = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
                 ghostty_ssh_kill_session(requireHandle(), ptr)
-            }
-        }
-
-        // MARK: Helpers
-
-        /// Run `body` with a pointer to the 16 raw bytes of `uuid`, or
-        /// `nil` when `uuid` is nil.
-        static func withOptionalUUIDBytes<R>(
-            _ uuid: UUID?,
-            _ body: (UnsafePointer<UInt8>?) -> R
-        ) -> R {
-            guard let u = uuid else { return body(nil) }
-            var bytes = u.uuid
-            return withUnsafeBytes(of: &bytes) { raw in
-                body(raw.baseAddress!.assumingMemoryBound(to: UInt8.self))
             }
         }
 

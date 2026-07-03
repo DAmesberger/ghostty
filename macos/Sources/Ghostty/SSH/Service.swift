@@ -28,16 +28,6 @@ extension Ghostty {
         func encodeParams() throws -> Data
     }
 
-    /// A remote interactive terminal. Use `SSHConnection.attachSurface` rather
-    /// than `openChannel(TerminalService())` for new terminal sessions — the
-    /// attach helper drives the legacy session-protocol open path that survives
-    /// reconnects by `(groupID, surfaceID)`.
-    public struct TerminalService: ChannelService {
-        public init() {}
-        public var cService: ghostty_channel_service_e { GHOSTTY_CHANNEL_SERVICE_TERMINAL }
-        public func encodeParams() throws -> Data { Data() }
-    }
-
     /// Open a raw TCP connection through the remote host.
     ///
     /// Wire format (matches `src/session/services/tcp_connect.zig`):

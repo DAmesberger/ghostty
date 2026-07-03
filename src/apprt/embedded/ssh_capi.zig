@@ -36,13 +36,6 @@
 //!
 //! Still gated on a follow-up:
 //!
-//!   * `ghostty_ssh_attach_surface` would call the shared helper
-//!     `session.client.attachRemoteSurface` (which now backs the
-//!     GTK terminal-surface path too) from a worker thread, but
-//!     the worker-thread spawn plus the subsequent frame-dispatch
-//!     routing to the channel callbacks both land alongside the
-//!     production transport (task #23). For now it returns a handle
-//!     that immediately reports `on_close(SERVICE_ERROR)`.
 //!   * `ghostty_ssh_submit_host_key_decision` is a no-op today —
 //!     the underlying libssh2 host-key check (src/session/ssh.zig
 //!     verifyHostKey) auto-accepts unknown keys via TOFU and never
@@ -1004,26 +997,6 @@ pub const ChannelHandle = struct {
     /// real callbacks. 0 = not an inbound channel / not yet set.
     inbound_peer_window: u16 = 0,
 
-    /// For terminal channels (service == .terminal): target_id allocated
-    /// from `SshConnectionManager.allocateTarget` and used as the frame
-    /// `target` field in all subsequent reads/writes for this surface.
-    /// Set by AttachWorker once registration succeeds. 0 means "not yet
-    /// registered or never a terminal channel".
-    capi_target_id: u16 = 0,
-    /// The Entry this terminal channel is registered on. Borrowed from
-    /// the parent SshHandle; the manager-release ordering on close
-    /// guarantees the pointer outlives any callback fired through it.
-    capi_entry: ?*SshConnectionManager.Entry = null,
-    /// Group_id that the AttachWorker passed in the `Open` frame. Used
-    /// by `ghostty_channel_close` to decide between session-level
-    /// (`.detach`) vs surface-level (`.surface`) close on a grouped
-    /// terminal channel, mirroring `Remote.threadExit`.
-    capi_group_id: protocol.Uuid = protocol.zero_uuid,
-    /// Surface UUID supplied at attach time (or generated). Stored so
-    /// `ghostty_channel_close` can address the `.surface` close frame
-    /// at the right surface within a session.
-    capi_surface_id: protocol.Uuid = protocol.zero_uuid,
-
     pub const ChannelState = enum(u32) {
         opening = 0,
         open = 1,
@@ -1882,17 +1855,6 @@ export fn ghostty_ssh_close(ssh: ?*SshHandle) void {
     h.mutex.unlock();
 
     for (snapshot.items) |ch| {
-        // Terminal channels: unregister from the CAPI surface registry
-        // before firing on_close so the SSH I/O thread (still running
-        // under the Entry's ref) can't dispatch a late frame to a
-        // closed handle.
-        if (ch.service == .terminal) {
-            if (ch.capi_entry) |entry| {
-                if (ch.capi_target_id != 0) {
-                    SshConnectionManager.unregisterCAPISurface(entry, ch.capi_target_id);
-                }
-            }
-        }
         ch.emitClose(.daemon_shutdown, null);
     }
 
@@ -2041,12 +2003,10 @@ export fn ghostty_ssh_open_channel(
 }
 
 /// Implements `ghostty_channel_write`. Routes to
-/// `ClientMux.writeChannel` for non-terminal channels (credit-bounded
-/// — 0 means "no credit, wait for on_window_credit"), or to the
-/// session-protocol `data_in` write queue for terminal channels (no
-/// credit accounting, returns `len` on success). SIZE_MAX signals a
-/// terminal error: a closed channel, a channel that never reached a
-/// live mux, or an unknown channel id.
+/// `ClientMux.writeChannel` (credit-bounded — 0 means "no credit,
+/// wait for on_window_credit"). SIZE_MAX signals a terminal error: a
+/// closed channel, a channel that never reached a live mux, or an
+/// unknown channel id.
 export fn ghostty_channel_write(
     channel: ?*ChannelHandle,
     bytes: ?*const anyopaque,
@@ -2061,20 +2021,6 @@ export fn ghostty_channel_write(
     else
         return std.math.maxInt(usize);
 
-    // Terminal channels ride the session protocol, not the channel mux.
-    if (ch.service == .terminal) {
-        const entry = ch.capi_entry orelse return std.math.maxInt(usize);
-        if (ch.capi_target_id == 0) return std.math.maxInt(usize);
-        // M6 input-side diagnostic: log every write so we can see if
-        // user keystrokes ever reach the libghostty channel layer
-        // (output works, input was reported broken — pinpoints where
-        // the chain breaks: cat-pump, master-fd loop, bridge.send,
-        // libghostty enqueue, or daemon-side dispatch).
-        log.info("channel_write target={d} len={d}", .{ ch.capi_target_id, len });
-        SshConnectionManager.enqueueWrite(entry, .data_in, ch.capi_target_id, slice);
-        return len;
-    }
-
     // No mux / never opened → terminal error.
     const mux = ch.client_mux orelse return std.math.maxInt(usize);
     if (ch.channel_id == protocol.invalid_channel_id) return std.math.maxInt(usize);
@@ -2088,16 +2034,11 @@ export fn ghostty_channel_write(
     };
 }
 
-/// Implements `ghostty_channel_eof`. Routes to `ClientMux.channelEof`
-/// for non-terminal channels; no-op for terminal channels (the
-/// session protocol does not have a per-surface half-close — the
-/// embedder closes the channel via `ghostty_channel_close` instead).
+/// Implements `ghostty_channel_eof`. Routes to `ClientMux.channelEof`.
 export fn ghostty_channel_eof(channel: ?*ChannelHandle) void {
     const ch = channel orelse return;
     if (ch.closed.load(.acquire)) return;
     ch.state.store(@intFromEnum(ChannelHandle.ChannelState.local_eof), .release);
-
-    if (ch.service == .terminal) return;
 
     const mux = ch.client_mux orelse return;
     if (ch.channel_id == protocol.invalid_channel_id) return;
@@ -2106,66 +2047,17 @@ export fn ghostty_channel_eof(channel: ?*ChannelHandle) void {
     };
 }
 
-/// Implements `ghostty_channel_close`. For non-terminal channels:
-/// sends a `channel_close` frame via `ClientMux.channelClose` (which
-/// does NOT fire the mux's on_close — the embedder initiated this).
-/// For terminal channels: unregisters the CAPI surface and enqueues
-/// a session-protocol `close` frame (`.surface` for grouped surfaces,
-/// `.detach` for standalone). Then fires the embedder's on_close
-/// locally via emitClose so the C API contract ("close triggers an
-/// on_close callback") still holds. emitClose is idempotent, so a
-/// racing daemon-side close is harmless.
+/// Implements `ghostty_channel_close`. Sends a `channel_close` frame
+/// via `ClientMux.channelClose` (which does NOT fire the mux's
+/// on_close — the embedder initiated this), then fires the embedder's
+/// on_close locally via emitClose so the C API contract ("close
+/// triggers an on_close callback") still holds. emitClose is
+/// idempotent, so a racing daemon-side close is harmless.
 export fn ghostty_channel_close(
     channel: ?*ChannelHandle,
     reason: ChannelCloseReason,
 ) void {
     const ch = channel orelse return;
-
-    if (ch.service == .terminal) {
-        if (ch.capi_entry) |entry| {
-            // Unregister BEFORE sending the close frame so any
-            // late `eof`/`data_out` we race past the unregister
-            // is dropped rather than dispatched to a freed handle.
-            if (ch.capi_target_id != 0) {
-                SshConnectionManager.unregisterCAPISurface(entry, ch.capi_target_id);
-
-                // Mirror Remote.threadExit: grouped surfaces send
-                // close(surface) so the daemon kills just this
-                // surface's PTY; standalone surfaces send
-                // close(detach) so the daemon-side session stays
-                // alive for reattach.
-                const has_group = !session_shared.isZeroUuid(ch.capi_group_id);
-                if (has_group) {
-                    const payload = (protocol.Close{
-                        .mode = .surface,
-                        .id = ch.capi_surface_id,
-                    }).encode(entry.alloc) catch {
-                        // Fall back to a 1-byte close(detach) so the
-                        // daemon at least sees an end-of-life signal.
-                        SshConnectionManager.enqueueWrite(
-                            entry,
-                            .close,
-                            ch.capi_target_id,
-                            &.{@intFromEnum(protocol.CloseMode.detach)},
-                        );
-                        ch.emitClose(reason, null);
-                        return;
-                    };
-                    defer entry.alloc.free(payload);
-                    SshConnectionManager.enqueueWrite(entry, .close, ch.capi_target_id, payload);
-                } else {
-                    SshConnectionManager.enqueueWrite(
-                        entry,
-                        .close,
-                        ch.capi_target_id,
-                        &.{@intFromEnum(protocol.CloseMode.detach)},
-                    );
-                }
-            }
-        }
-        ch.emitClose(reason, null);
-        return;
-    }
 
     if (ch.client_mux) |mux| {
         if (ch.channel_id != protocol.invalid_channel_id) {
@@ -2223,15 +2115,6 @@ export fn ghostty_channel_set_callbacks(
 export fn ghostty_channel_free(channel: ?*ChannelHandle) void {
     const ch = channel orelse return;
     if (!ch.closed.load(.acquire)) {
-        // Terminal channels: unregister from the CAPI surface registry
-        // so dispatchCAPIFrame can no longer reach this handle.
-        if (ch.service == .terminal) {
-            if (ch.capi_entry) |entry| {
-                if (ch.capi_target_id != 0) {
-                    SshConnectionManager.unregisterCAPISurface(entry, ch.capi_target_id);
-                }
-            }
-        }
         // channelClose removes the channel from the mux's registry
         // (so no further bridge callback can reach this handle) and
         // does not fire the mux on_close; emitClose delivers the
@@ -2244,312 +2127,6 @@ export fn ghostty_channel_free(channel: ?*ChannelHandle) void {
         ch.emitClose(.normal, null);
     }
     ch.deinit();
-}
-
-/// Worker that runs the post-`.ready` part of the surface-attach
-/// flow off the embedder's thread: it waits for the connection
-/// state to settle, allocates a target_id, registers a CAPI surface
-/// on the Entry, and enqueues the `Open` frame that asks the daemon
-/// to create or attach the remote PTY. Subsequent `opened` /
-/// `data_out` / `eof` frames are routed to this handle's callbacks
-/// by `dispatchCAPIFrame` in `SshConnectionManager.processFrames`.
-const AttachWorker = struct {
-    handle: *SshHandle,
-    manager: *SshConnectionManager,
-    entry: *SshConnectionManager.Entry,
-    channel: *ChannelHandle,
-    rows: u16,
-    cols: u16,
-    width_px: u16,
-    height_px: u16,
-    /// Embedder-supplied group/surface ids (may be zero — meaning
-    /// "let the daemon assign"). Owned by the worker.
-    group_id: session_shared.Uuid,
-    surface_id: session_shared.Uuid,
-    /// Owned copy of the label string; freed in `run`.
-    label: []u8,
-
-    fn run(self: *AttachWorker) void {
-        const handle = self.handle;
-        const entry = self.entry;
-        const channel = self.channel;
-        defer {
-            // UAF discipline: capture alloc BEFORE fetchSub so we
-            // don't dereference handle/self afterwards.
-            const alloc = handle.alloc;
-            // Free owned label + self struct.
-            alloc.free(self.label);
-            _ = handle.active_workers.fetchSub(1, .acq_rel);
-            alloc.destroy(self);
-        }
-
-        // Park until the SSH thread is up and the channel is live.
-        // The SetupWorker (M1) transitions conn_state to `.ready`
-        // when the connection finishes setup; we block here so any
-        // attach issued before `.connected` still drives a real Open
-        // frame instead of silently failing.
-        while (true) {
-            if (handle.closed.load(.acquire) or
-                channel.closed.load(.acquire))
-            {
-                return;
-            }
-            const cs = entry.conn_state.load(.acquire);
-            if (cs == .ready) break;
-            if (cs == .failed) {
-                channel.emitClose(.service_error, null);
-                return;
-            }
-            std.Thread.sleep(2_000_000); // 2ms
-        }
-
-        // Allocate target id and register the CAPI surface BEFORE
-        // sending the Open frame so the dispatch path can route the
-        // daemon's `opened` reply back to us as soon as it arrives.
-        const target_id = self.manager.allocateTarget(entry);
-        const surface_cbs = SshConnectionManager.CAPISurfaceCallbacks{
-            .ctx = channel,
-            .on_data = capiOnData,
-            .on_opened = capiOnOpened,
-            .on_exit = capiOnExit,
-        };
-        SshConnectionManager.registerCAPISurface(entry, .{
-            .target_id = target_id,
-            .group_id = self.group_id,
-            .surface_id = self.surface_id,
-            .callbacks = surface_cbs,
-        }) catch |err| {
-            log.warn("attach_surface: registerCAPISurface failed: {}", .{err});
-            channel.emitClose(.service_error, null);
-            return;
-        };
-
-        // Stash routing state on the channel so subsequent
-        // ghostty_channel_write / _eof / _close calls can address
-        // the right target_id + frame kind without re-deriving.
-        channel.capi_target_id = target_id;
-        channel.capi_entry = entry;
-        channel.capi_group_id = self.group_id;
-        channel.capi_surface_id = self.surface_id;
-
-        // Build the Open frame. The four open_type variants:
-        //   - session_attach + group_id != zero    → attach existing session
-        //   - session_new + group_id zero          → create fresh session
-        //   - surface_attach + group_id != zero    → reattach surface in group
-        //   - surface_new + group_id != zero       → add new surface to group
-        // Surface-level forms require a non-zero group_id; for the
-        // simple "create a new remote shell" case we use session_new.
-        const has_group = !session_shared.isZeroUuid(self.group_id);
-        const has_surface = !session_shared.isZeroUuid(self.surface_id);
-        const open_type: protocol.OpenType = if (has_group)
-            (if (has_surface) .surface_attach else .surface_new)
-        else
-            .session_new;
-
-        const open_payload = (protocol.Open{
-            .open_type = open_type,
-            .resize = .{
-                .rows = self.rows,
-                .cols = self.cols,
-                .width_px = self.width_px,
-                .height_px = self.height_px,
-            },
-            .group_id = self.group_id,
-            .surface_id = self.surface_id,
-            .max_scrollback = entry.scrollback_limit,
-            .label = self.label,
-        }).encode(entry.alloc) catch |err| {
-            log.warn("attach_surface: Open.encode failed: {}", .{err});
-            SshConnectionManager.unregisterCAPISurface(entry, target_id);
-            channel.emitClose(.service_error, null);
-            return;
-        };
-        defer entry.alloc.free(open_payload);
-
-        // M6 instrumentation: log every Open we send so the daemon-side
-        // diagnosis can cross-reference against an early `.eof` response.
-        log.info("attach_surface: Open enqueue target={d} type={s} group_zero={} surface_zero={} rows={d} cols={d} scrollback={d} label_len={d} payload_len={d}", .{
-            target_id,
-            @tagName(open_type),
-            session_shared.isZeroUuid(self.group_id),
-            session_shared.isZeroUuid(self.surface_id),
-            self.rows,
-            self.cols,
-            entry.scrollback_limit,
-            self.label.len,
-            open_payload.len,
-        });
-
-        // enqueueWrite duplicates the payload; free is safe after.
-        SshConnectionManager.enqueueWrite(entry, .open, target_id, open_payload);
-
-        // Mark the channel as `open` so subsequent writes are accepted.
-        // The daemon will reply with `opened` shortly; capiOnOpened
-        // surfaces that to the embedder via on_opened.
-        channel.state.store(@intFromEnum(ChannelHandle.ChannelState.open), .release);
-    }
-
-    /// `CAPISurfaceCallbacks.on_data` bridge: forward daemon-side
-    /// `data_out` payloads to the channel's `on_data` callback.
-    fn capiOnData(ctx: ?*anyopaque, bytes: []const u8) void {
-        const ch: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
-        if (ch.closed.load(.acquire)) return;
-        ch.mutex.lock();
-        const cb = ch.callbacks.on_data;
-        const ud = ch.callbacks.userdata;
-        ch.mutex.unlock();
-        if (cb) |f| {
-            const ptr: ?*const anyopaque = if (bytes.len == 0) null else bytes.ptr;
-            f(ud, ptr, bytes.len);
-        }
-    }
-
-    /// `CAPISurfaceCallbacks.on_opened` bridge: fire the channel's
-    /// `on_opened` so embedders observe the daemon-authoritative
-    /// surface/group ids and history depth. The C `on_opened`
-    /// signature passes UUIDs through the `service_ack` opaque
-    /// pointer + length; embedders that care unpack a small fixed
-    /// header (16 + 16 + 4 = 36 bytes).
-    fn capiOnOpened(
-        ctx: ?*anyopaque,
-        group_id: *const [16]u8,
-        surface_id: *const [16]u8,
-        history_rows: u32,
-    ) void {
-        const ch: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
-        if (ch.closed.load(.acquire)) return;
-
-        // Stash the daemon-authoritative ids on the channel so close
-        // can address the right surface/session.
-        ch.mutex.lock();
-        @memcpy(&ch.capi_group_id, group_id);
-        @memcpy(&ch.capi_surface_id, surface_id);
-        const cb = ch.callbacks.on_opened;
-        const ud = ch.callbacks.userdata;
-        ch.mutex.unlock();
-
-        if (cb) |f| {
-            // Pack the small "service_ack" the embedder can decode.
-            var ack_buf: [16 + 16 + 4]u8 = undefined;
-            @memcpy(ack_buf[0..16], group_id);
-            @memcpy(ack_buf[16..32], surface_id);
-            std.mem.writeInt(u32, ack_buf[32..36], history_rows, .little);
-            f(ud, &ack_buf[0], ack_buf.len, 0);
-        }
-    }
-
-    /// `CAPISurfaceCallbacks.on_exit` bridge: the remote PTY died,
-    /// so close the channel from this side.
-    fn capiOnExit(ctx: ?*anyopaque, exit_code: i32) void {
-        _ = exit_code;
-        const ch: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
-        if (ch.capi_entry) |entry| {
-            SshConnectionManager.unregisterCAPISurface(entry, ch.capi_target_id);
-        }
-        ch.emitClose(.normal, null);
-    }
-};
-
-fn spawnAttachWorker(worker: *AttachWorker) bool {
-    _ = worker.handle.active_workers.fetchAdd(1, .acq_rel);
-    const thread = std.Thread.spawn(.{}, AttachWorker.run, .{worker}) catch {
-        _ = worker.handle.active_workers.fetchSub(1, .acq_rel);
-        return false;
-    };
-    thread.setName("ssh-capi-attach") catch {};
-    thread.detach();
-    return true;
-}
-
-/// Implements `ghostty_ssh_attach_surface`. Terminal channels are
-/// sugar over the legacy session-protocol frames; the channel handle
-/// shape is identical to non-terminal channels for embedder
-/// uniformity (per the design doc).
-///
-/// Allocates a `ChannelHandle` and spawns an AttachWorker that drives
-/// the post-`.ready` attach flow (allocateTarget → registerCAPISurface
-/// → enqueue Open frame) on a background thread. Daemon-side
-/// `opened` / `data_out` / `eof` frames route back through the CAPI
-/// fast-path in `processFrames`.
-export fn ghostty_ssh_attach_surface(
-    ssh: ?*SshHandle,
-    group_id: ?[*]const u8,
-    surface_id: ?[*]const u8,
-    rows: u16,
-    cols: u16,
-    width_px: u32,
-    height_px: u32,
-    label: ?[*:0]const u8,
-    callbacks: ?*const ChannelCallbacks,
-) ?*ChannelHandle {
-    const h = ssh orelse return null;
-    const cbs = callbacks orelse return null;
-    if (h.closed.load(.acquire)) return null;
-
-    const ch = ChannelHandle.init(h.alloc, h, .terminal, cbs) catch |err| {
-        log.warn("ghostty_ssh_attach_surface: alloc failed: {}", .{err});
-        return null;
-    };
-
-    // No manager / entry means this is a test handle (or a malformed
-    // open). The pre-M1 contract was to fire on_close(SERVICE_ERROR)
-    // immediately so embedders observe a clean edge; preserve that.
-    const mgr = h.manager orelse {
-        ch.emitClose(.service_error, null);
-        return ch;
-    };
-    const entry = h.entry orelse {
-        ch.emitClose(.service_error, null);
-        return ch;
-    };
-
-    // Copy the label so the worker has an owned slice. C strings
-    // passed across the FFI boundary are borrowed for the duration of
-    // this call only.
-    const label_span: []const u8 = if (label) |p| std.mem.span(p) else "";
-    const owned_label = h.alloc.dupe(u8, label_span) catch {
-        ch.emitClose(.service_error, null);
-        return ch;
-    };
-    errdefer h.alloc.free(owned_label);
-
-    var gid: session_shared.Uuid = session_shared.zero_uuid;
-    var sid: session_shared.Uuid = session_shared.zero_uuid;
-    if (group_id) |p| @memcpy(&gid, p[0..protocol.uuid_size]);
-    if (surface_id) |p| @memcpy(&sid, p[0..protocol.uuid_size]);
-
-    // Clamp pixel dims to u16; the wire-level Resize is packed u16s.
-    const w_px: u16 = if (width_px > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(width_px);
-    const h_px: u16 = if (height_px > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(height_px);
-
-    const worker = h.alloc.create(AttachWorker) catch {
-        h.alloc.free(owned_label);
-        ch.emitClose(.service_error, null);
-        return ch;
-    };
-    worker.* = .{
-        .handle = h,
-        .manager = mgr,
-        .entry = entry,
-        .channel = ch,
-        .rows = rows,
-        .cols = cols,
-        .width_px = w_px,
-        .height_px = h_px,
-        .group_id = gid,
-        .surface_id = sid,
-        .label = owned_label,
-    };
-
-    if (!spawnAttachWorker(worker)) {
-        log.warn("ghostty_ssh_attach_surface: thread spawn failed", .{});
-        h.alloc.free(owned_label);
-        h.alloc.destroy(worker);
-        ch.emitClose(.service_error, null);
-        return ch;
-    }
-
-    return ch;
 }
 
 /// Implements `ghostty_ssh_list_sessions`. Spawns a worker thread
@@ -2845,78 +2422,6 @@ test "ghostty_ssh_open_channel synthesizes a close until mux wires" {
 
     // After the stub close, free still works.
     ghostty_channel_free(ch);
-}
-
-test "ghostty_ssh_attach_surface — stub round-trip and initial state" {
-    // Phase 6B.1 Part 3 stub-path coverage. With no real CoreApp
-    // (app=null), ghostty_ssh_open emits the synchronous CONNECTING
-    // transition, attach_surface allocates the terminal channel
-    // handle, and the synthetic on_close(SERVICE_ERROR) keeps the
-    // edge observable until the channel-mux follow-up lands.
-    var cap: Capture = .{};
-    const cfg = Config{
-        .target = "alice@example.com",
-        .jump = null,
-        .identity_file = null,
-        .keepalive_interval_ms = 0,
-        .max_reconnect_attempts = 5,
-        .reconnect_interval_ms = 1000,
-        .host_key_policy = .tofu,
-        .scrollback_limit_bytes = 0,
-    };
-    const ssh_cbs = cap.cbs();
-    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
-    defer ghostty_ssh_free(handle);
-
-    try testing.expectEqual(@as(?StateKind, .connecting), cap.last_state_kind);
-
-    var ch_cap: Capture = .{};
-    const ch_cbs = ch_cap.chCbs();
-    const ch = ghostty_ssh_attach_surface(
-        handle,
-        null, // group_id
-        null, // surface_id
-        24, // rows
-        80, // cols
-        640, // width_px
-        480, // height_px
-        "test-session", // label
-        &ch_cbs,
-    );
-    try testing.expect(ch != null);
-    try testing.expectEqual(@as(?ChannelCloseReason, .service_error), ch_cap.last_close_reason);
-
-    // Channel handle must be release-safe after the synthetic close.
-    ghostty_channel_free(ch);
-}
-
-test "ghostty_ssh_attach_surface — rejects null callbacks" {
-    var cap: Capture = .{};
-    const cfg = Config{
-        .target = "alice@example.com",
-        .jump = null,
-        .identity_file = null,
-        .keepalive_interval_ms = 0,
-        .max_reconnect_attempts = 5,
-        .reconnect_interval_ms = 1000,
-        .host_key_policy = .tofu,
-        .scrollback_limit_bytes = 0,
-    };
-    const ssh_cbs = cap.cbs();
-    const handle = ghostty_ssh_open(null, &cfg, &ssh_cbs).?;
-    defer ghostty_ssh_free(handle);
-
-    try testing.expect(ghostty_ssh_attach_surface(
-        handle,
-        null,
-        null,
-        24,
-        80,
-        640,
-        480,
-        null,
-        null,
-    ) == null);
 }
 
 test "ghostty_channel_write returns SIZE_MAX on the stubbed mux path" {

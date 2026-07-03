@@ -419,18 +419,4 @@ extension Ghostty {
         }
     }
 
-    /// Logical terminal size used by `SSHConnection.attachSurface`.
-    public struct TerminalSize: Sendable {
-        public let rows: UInt16
-        public let cols: UInt16
-        public let widthPx: UInt32
-        public let heightPx: UInt32
-
-        public init(rows: UInt16, cols: UInt16, widthPx: UInt32 = 0, heightPx: UInt32 = 0) {
-            self.rows = rows
-            self.cols = cols
-            self.widthPx = widthPx
-            self.heightPx = heightPx
-        }
-    }
 }

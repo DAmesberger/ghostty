@@ -1785,40 +1785,6 @@ void ghostty_channel_free(ghostty_channel_t channel);
 void ghostty_channel_set_callbacks(ghostty_channel_t channel,
                                    const ghostty_channel_callbacks_t* callbacks);
 
-// Attach a terminal surface over the SSH connection. Sugar over
-// ghostty_ssh_open_channel(..., TERMINAL, ...) — internally drives
-// the legacy session-protocol "open" / "data_in" / "data_out" frames
-// but presents the same channel callback shape. group_id and
-// surface_id are 16-byte UUIDs; pass NULL to let libghostty generate
-// one (a "new" session) or pass the bytes of an existing pair to
-// re-attach. `label` is a NUL-terminated UTF-8 name shown in the
-// remote daemon's session list.
-//
-// Reconnect semantics: terminal channels SURVIVE the underlying SSH
-// drop. The embedder sees on_close(reason=TRANSPORT) followed by an
-// automatic on_opened once the daemon re-attaches by (group_id,
-// surface_id). Non-terminal channels are NOT auto-reopened.
-//
-// Callback timing while the client-mux + worker-thread spawn are
-// still in flight: today this entry point allocates the channel
-// handle and fires on_close(SERVICE_ERROR) SYNCHRONOUSLY before
-// returning. Once the full transport lands, on_opened / on_data /
-// on_close all fire from libghostty worker threads per the global
-// "callbacks on worker threads" contract; the synchronous-close
-// stub is observed only on the current pre-transport build. The
-// embedder's free path must therefore be safe to reach from inside
-// on_close.
-ghostty_channel_t ghostty_ssh_attach_surface(
-    ghostty_ssh_t ssh,
-    const uint8_t* group_id,   // 16 bytes or NULL
-    const uint8_t* surface_id, // 16 bytes or NULL
-    uint16_t rows,
-    uint16_t cols,
-    uint32_t width_px,
-    uint32_t height_px,
-    const char* label,
-    const ghostty_channel_callbacks_t* callbacks);
-
 // Query the daemon for the list of running sessions. The callback fires
 // once per entry, on a libghostty worker thread, then once more with
 // entry=NULL to signal completion. Returns true if the query was

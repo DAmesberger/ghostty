@@ -75,8 +75,8 @@ extension Ghostty {
 
         // MARK: Internal storage
 
-        /// Backing C handle. Stamped in by `SSHConnection.openChannel` /
-        /// `attachSurface` after the wrapper is wired up but before it
+        /// Backing C handle. Stamped in by `SSHConnection.openChannel`
+        /// after the wrapper is wired up but before it
         /// returns to the embedder. Read via the `requireHandle` helper —
         /// the only path that observes nil is the brief window inside
         /// `openChannel` itself, where nothing public can touch the wrapper.
