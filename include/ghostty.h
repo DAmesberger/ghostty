@@ -1457,6 +1457,11 @@ typedef struct {
 //   handle is invalid and the embedder MUST call ghostty_channel_free.
 //   reason indicates whether the close was clean or forced; `message`
 //   is a UTF-8 NUL-terminated string (may be empty).
+// on_control: a service `channel_control` frame. `op` is the
+//   service-defined opcode; `op_payload` is valid only for the
+//   callback's duration (memcpy if needed) and may be NULL/0. May be
+//   NULL for services with no client-visible control ops. First
+//   consumer: file_transfer progress (op=1) / final (op=2).
 typedef struct {
   void (*on_opened)(void* userdata,
                     const void* service_ack,
@@ -1468,6 +1473,10 @@ typedef struct {
   void (*on_close)(void* userdata,
                    ghostty_channel_close_reason_e reason,
                    const char* message);
+  void (*on_control)(void* userdata,
+                     uint8_t op,
+                     const void* op_payload,
+                     size_t op_payload_len);
   void* userdata;
 } ghostty_channel_callbacks_t;
 

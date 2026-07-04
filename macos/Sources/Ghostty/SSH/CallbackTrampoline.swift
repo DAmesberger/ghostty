@@ -161,6 +161,7 @@ struct TypeErasedChannelEvent: Sendable {
     enum Payload: Sendable {
         case opened(serviceAck: Data, initialPeerWindow: UInt32)
         case windowCredit(UInt32)
+        case control(op: UInt8, payload: Data)
         case eof
         case closed(reason: ghostty_channel_close_reason_e, message: String?)
     }
@@ -171,6 +172,8 @@ struct TypeErasedChannelEvent: Sendable {
             return .opened(serviceAck: ack, initialPeerWindow: win)
         case .windowCredit(let n):
             return .windowCredit(n)
+        case .control(let op, let payload):
+            return .control(op: op, payload: payload)
         case .eof:
             return .eof
         case .closed(let reason, let message):
@@ -449,6 +452,24 @@ extension Ghostty.SSHConnection {
         // Memcpy NOW — the buffer is invalid the moment we return.
         let data = Data(bytes: p, count: len)
         box.yieldOutput(data)
+    }
+
+    static let cOnChannelControl: @convention(c) (
+        UnsafeMutableRawPointer?,
+        UInt8,
+        UnsafeRawPointer?,
+        Int
+    ) -> Void = { userdata, op, payloadPtr, len in
+        guard let ud = userdata else { return }
+        let box = Unmanaged<ChannelBox>.fromOpaque(ud).takeUnretainedValue()
+        // Memcpy NOW — the buffer is invalid the moment we return.
+        let data: Data
+        if let p = payloadPtr, len > 0 {
+            data = Data(bytes: p, count: len)
+        } else {
+            data = Data()
+        }
+        box.yieldEvent(TypeErasedChannelEvent(payload: .control(op: op, payload: data)))
     }
 
     static let cOnChannelWindowCredit: @convention(c) (

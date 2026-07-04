@@ -41,6 +41,12 @@ extension Ghostty {
             case opened(serviceAck: Data, initialPeerWindow: UInt32)
             /// Outbound credit was granted by the peer.
             case windowCredit(UInt32)
+            /// A service `channel_control` frame. `op` is the
+            /// service-defined opcode; `payload` is a copy owned by the
+            /// event. Currently emitted by the `file_transfer` service:
+            /// op=1 progress (`[8] offset LE`, `[32] partial sha256`),
+            /// op=2 final (`[32] sha256`, `[1] status`).
+            case control(op: UInt8, payload: Data)
             /// The peer half-closed; no further `output` data will arrive.
             case eof
             /// Terminal — the channel is dead. `wasTransport` is true when the

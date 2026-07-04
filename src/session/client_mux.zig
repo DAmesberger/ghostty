@@ -71,6 +71,11 @@ pub const ClientMux = struct {
         /// Channel torn down. After this returns the channel id is
         /// invalid; the embedder must drop its handle.
         on_close: *const fn (ctx: ?*anyopaque, reason: protocol.ChannelCloseReason, message: []const u8) void,
+        /// A service `channel_control` frame arrived. `op` is the
+        /// service-defined opcode; `op_payload` is borrowed for the call.
+        /// Optional — services with no client-visible control ops leave
+        /// it null (the frame is then logged and dropped).
+        on_control: ?*const fn (ctx: ?*anyopaque, op: u8, op_payload: []const u8) void = null,
     };
 
     /// Handler for daemon-originated `channel_open` frames. If set on
@@ -518,15 +523,26 @@ pub const ClientMux = struct {
         self.alloc.destroy(ch);
     }
 
-    fn handleControl(_: *ClientMux, payload: []const u8) void {
+    fn handleControl(self: *ClientMux, payload: []const u8) void {
         const ctrl = protocol.ChannelControl.parse(payload) catch return;
-        // The client-side channel model has no service vtable, so there
-        // is no per-op handler. Control ops that the embedder cares
-        // about (port_listener status, etc.) are a future addition;
-        // until then, log and drop.
-        log.debug("client: ignoring channel_control op={d} channel_id={d}", .{
-            ctrl.op, ctrl.channel_id,
-        });
+        self.mutex.lock();
+        const ch = self.channels.get(ctrl.channel_id) orelse {
+            self.mutex.unlock();
+            log.debug("client: channel_control for unknown channel_id={d} op={d}", .{
+                ctrl.channel_id, ctrl.op,
+            });
+            return;
+        };
+        const cbs = ch.client_callbacks;
+        const ctx = ch.client_ctx;
+        self.mutex.unlock();
+
+        // Fire outside the lock — the callback may re-enter the mux.
+        // Services with no client-visible control ops leave on_control
+        // null, in which case the frame is silently consumed.
+        if (cbs) |c| {
+            if (c.on_control) |f| f(ctx, ctrl.op, ctrl.op_payload);
+        }
     }
 
     /// Inbound `channel_open` on the client side. Daemon-originated

@@ -281,6 +281,7 @@ extension Ghostty {
                     on_window_credit: SSHConnection.cOnChannelWindowCredit,
                     on_eof: SSHConnection.cOnChannelEOF,
                     on_close: SSHConnection.cOnChannelClose,
+                    on_control: SSHConnection.cOnChannelControl,
                     userdata: Unmanaged.passUnretained(channelBox).toOpaque()
                 )
                 return ghostty_ssh_open_channel(
@@ -426,6 +427,7 @@ extension Ghostty {
                 on_window_credit: Ghostty.SSHConnection.cOnChannelWindowCredit,
                 on_eof: Ghostty.SSHConnection.cOnChannelEOF,
                 on_close: Ghostty.SSHConnection.cOnChannelClose,
+                on_control: Ghostty.SSHConnection.cOnChannelControl,
                 userdata: Unmanaged.passUnretained(channelBox).toOpaque()
             )
             ghostty_channel_set_callbacks(h, &cbs)

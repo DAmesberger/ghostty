@@ -338,6 +338,17 @@ pub const ChannelCallbacks = extern struct {
         reason: ChannelCloseReason,
         message: ?[*:0]const u8,
     ) callconv(.c) void,
+    /// A service `channel_control` frame arrived. `op` is the
+    /// service-defined opcode; `op_payload`/`op_payload_len` are borrowed
+    /// for the callback's duration. Null for services with no
+    /// client-visible control ops (e.g. the file_transfer progress/final
+    /// frames are the first consumer).
+    on_control: ?*const fn (
+        userdata: ?*anyopaque,
+        op: u8,
+        op_payload: ?*const anyopaque,
+        op_payload_len: usize,
+    ) callconv(.c) void = null,
     userdata: ?*anyopaque,
 };
 
@@ -1085,6 +1096,18 @@ pub const ChannelHandle = struct {
         }
     }
 
+    fn muxOnControl(ctx: ?*anyopaque, op: u8, op_payload: []const u8) void {
+        const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        const cb = self.callbacks.on_control;
+        const ud = self.callbacks.userdata;
+        self.mutex.unlock();
+        if (cb) |f| {
+            const ptr: ?*const anyopaque = if (op_payload.len == 0) null else op_payload.ptr;
+            f(ud, op, ptr, op_payload.len);
+        }
+    }
+
     fn muxOnCredit(ctx: ?*anyopaque, credit_bytes: u32) void {
         const self: *ChannelHandle = @ptrCast(@alignCast(ctx.?));
         self.mutex.lock();
@@ -1132,6 +1155,7 @@ pub const ChannelHandle = struct {
         .on_credit = muxOnCredit,
         .on_eof = muxOnEof,
         .on_close = muxOnClose,
+        .on_control = muxOnControl,
     };
 };
 
